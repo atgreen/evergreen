@@ -411,7 +411,7 @@ pub use ordinary_call::{
     emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll,
     emit_framed_ordinary_function_with_self_call_facts,
     emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_guarded_call,
-    emit_framed_ordinary_tail_call, emit_framed_ordinary_two_calls,
+    emit_framed_ordinary_tail_call, emit_framed_ordinary_two_calls, set_lean_entry_overflow,
 };
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(crate) use ordinary_primitives::packed_u8_adapter;
@@ -1064,6 +1064,10 @@ pub struct FramedCode {
     /// Distinct ordinary Lisp ABI entry; never a legacy or managed adapter.
     /// Installation also requires validated runtime admission and ownership.
     pub ordinary_entry: Option<usize>,
+    /// The ordinary entry preceded by its own stack check, for lean named
+    /// callers that pass the callee in RAX and check no stack themselves
+    /// (bliss-gg3i1.7.15.10.1). Falls through into `ordinary_entry`.
+    pub ordinary_lean_entry: Option<usize>,
     /// A `&key` ordinary entry's body entry, past binding: the ordinary ABI
     /// with the bound parameter values as its fixed arguments. Only the
     /// managed activation, which has bound them itself, enters here.
@@ -8170,8 +8174,28 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_bound_entry = None;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut ordinary_lean_entry = None;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let mut ordinary_lean_stack_fixup = None;
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let ordinary_lean_entry = None;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let ordinary_entry = if let Some(options) = ordinary {
         jump_to_shared_body(&mut a, block_label[&entry]); // legacy entry skips new prologue
+        let lean_overflow = ordinary_call::lean_entry_overflow();
+        if lean_overflow != 0 {
+            // Lean named callers enter here, with the callee in RAX
+            // (bliss-gg3i1.7.15.10.1). The overflow stub sits before the
+            // entry so that the check falls through into the ordinary entry.
+            let overflow = a.label();
+            a.bind(overflow);
+            mov_imm64(&mut a, 11, lean_overflow as i64);
+            a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+            ordinary_lean_entry = Some(a.here());
+            ordinary_lean_stack_fixup = Some(ordinary_call::emit_lean_entry_prologue(
+                &mut a, overflow,
+            ));
+        }
         let offset = a.here();
         let accepted = a.label();
         if let Some(OrdinaryArgumentBinding::Keywords(keywords)) = options.binding {
@@ -11295,6 +11319,10 @@ fn emit_framed_inner(
         for patch in &mut ordinary_self_stack_fixups {
             *patch = branch_relax::offset(map, *patch)?;
         }
+        if let Some(patch) = &mut ordinary_lean_stack_fixup {
+            *patch = branch_relax::offset(map, *patch)?;
+        }
+        ordinary_lean_entry = branch_relax::optional(map, ordinary_lean_entry)?;
         if let Some((_, _, _, data, bytes, start, end)) = &mut shared_diagnostic {
             let data_end =
                 branch_relax::offset(map, data.checked_add(*bytes).ok_or(EmitError::BadBranch)?)?;
@@ -11452,6 +11480,18 @@ fn emit_framed_inner(
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_stack_required = None;
 
+    // A bound that does not fit the lean entry's sign-extended imm32 drops
+    // the lean entry; its callers keep the descriptor admission.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let ordinary_lean_entry = match (ordinary_lean_stack_fixup, ordinary_stack_required) {
+        (Some(offset), Some(bound)) if i32::try_from(bound).is_ok() => {
+            code.get_mut(offset..offset + 4)
+                .ok_or(EmitError::BadBranch)?
+                .copy_from_slice(&(bound as u32).to_le_bytes());
+            ordinary_lean_entry
+        }
+        _ => None,
+    };
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     for offset in ordinary_self_stack_fixups {
         let bound = ordinary_stack_required.ok_or(EmitError::BadBranch)? as u64;
@@ -11487,6 +11527,7 @@ fn emit_framed_inner(
     Ok(FramedCode {
         frame_entry: (!ordinary_call_mode).then_some(0),
         ordinary_entry,
+        ordinary_lean_entry,
         ordinary_bound_entry,
         ordinary_checks_params,
         ordinary_stack_required,

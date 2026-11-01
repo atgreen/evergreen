@@ -1118,6 +1118,7 @@ mod retained_guard_chain_tests {
                         descriptor_slot: 1,
                         heat_slot: 1,
                         revision_address: 1,
+                        function_cell: 0,
                     },
                 )
             })

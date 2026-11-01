@@ -73,7 +73,16 @@ pub struct LispExecutionContext {
     active_native_control: AtomicU64,
     /// Stable notification slot; its first word is the generated poll ABI.
     poll_slot: &'static crate::execution_poll::PollSlot,
+    /// Process-unique, never-reused, nonzero identity of this execution as an
+    /// owner of generated code (bliss-gg3i1.7.15.10.1). Native threads and
+    /// fibers draw `execution_id` from separate counters, and a context's
+    /// address can be reused after it retires, so neither can name a code
+    /// owner. A function object's entry word is callable only by the
+    /// execution whose key it records.
+    code_owner: u64,
 }
+
+static NEXT_CODE_OWNER: AtomicU64 = AtomicU64::new(1);
 
 /// Byte offsets generated code uses. These are the ABI: the emitters bake them,
 /// so they are asserted against the real layout in the tests below rather than
@@ -91,6 +100,8 @@ pub mod offsets {
     pub const ACTIVE_NATIVE_CONTROL: usize = 32;
     /// Pointer to the process-lifetime execution poll slot.
     pub const POLL_SLOT: usize = 40;
+    /// `code_owner`
+    pub const CODE_OWNER: usize = 48;
 }
 
 impl LispExecutionContext {
@@ -102,7 +113,13 @@ impl LispExecutionContext {
             yield_requested: AtomicU64::new(0),
             active_native_control: AtomicU64::new(0),
             poll_slot: crate::execution_poll::register(carrier_id),
+            code_owner: NEXT_CODE_OWNER.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    /// This execution's unique code-owner key; see the field.
+    pub fn code_owner(&self) -> u64 {
+        self.code_owner
     }
 
     pub fn kind(&self) -> ExecutionKind {
@@ -302,6 +319,13 @@ mod tests {
             &ctx.poll_slot as *const _ as usize - base,
             offsets::POLL_SLOT
         );
+        assert_eq!(
+            &ctx.code_owner as *const _ as usize - base,
+            offsets::CODE_OWNER
+        );
+        let other = LispExecutionContext::new(ExecutionKind::NativeThread, 7, 3);
+        assert_ne!(ctx.code_owner(), 0);
+        assert_ne!(ctx.code_owner(), other.code_owner());
     }
 
     #[test]

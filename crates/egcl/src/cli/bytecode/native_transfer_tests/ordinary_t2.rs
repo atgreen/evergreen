@@ -2756,7 +2756,7 @@ fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
     let NativeCodeStorage::Mapped(mapped) = &caller._storage else {
         unreachable!()
     };
-    assert_eq!(mapped.value_maps_for_test().iter().count(), 2);
+    assert_eq!(mapped.value_maps_for_test().iter().count(), 3);
     let args = [11, 22, 33].map(EgclVal::from_fixnum);
     for iteration in 0..3 {
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test();

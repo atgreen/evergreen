@@ -176,6 +176,8 @@ pub fn alloc_interpreted(
         (*d).flags = 0.into();
         (*d).definition_index = definition.as_symbol_index();
         (*d).closure_state = 0.into();
+        (*d).entry = 0.into();
+        (*d).entry_owner = 0.into();
 
         EgclVal::from_heap_ptr(header)
     }
@@ -209,6 +211,8 @@ pub fn alloc_closure_instance(prototype: EgclVal, state: usize) -> EgclVal {
         (*d).flags = FLAG_CLOSURE_INSTANCE.into();
         (*d).definition_index = (*p).definition_index;
         (*d).closure_state = state.into();
+        (*d).entry = 0.into();
+        (*d).entry_owner = 0.into();
         EgclVal::from_heap_ptr(header)
     }
 }
@@ -285,7 +289,79 @@ pub unsafe fn redefine(f: EgclVal, lambda_list: EgclVal, body: EgclVal, env: Egc
             .store(native_entries_pointer(), Ordering::Release);
         (*d).tier.store(0, Ordering::Release);
         (*d).flags.fetch_and(OBJECT_FLAGS, Ordering::AcqRel);
+        // The old body's code must not be entered through this object.
+        (*d).entry_owner.store(0, Ordering::Release);
+        (*d).entry.store(0, Ordering::Release);
     }
+}
+
+/// Byte offset of the native entry word from a tagged function pointer.
+pub const ENTRY_TAGGED_OFFSET: i32 = core::mem::offset_of!(FunctionData, entry) as i32
+    - crate::value::TAG_HEAP_OBJECT as i32;
+/// Byte offset of the entry owner key from a tagged function pointer.
+pub const ENTRY_OWNER_TAGGED_OFFSET: i32 = core::mem::offset_of!(FunctionData, entry_owner)
+    as i32
+    - crate::value::TAG_HEAP_OBJECT as i32;
+/// Byte offset of the header's type-id byte from a tagged heap pointer.
+pub const TYPE_ID_TAGGED_OFFSET: i32 = 7 - crate::value::TAG_HEAP_OBJECT as i32;
+
+/// Claim `f`'s entry word for the execution `owner` and point it at `entry`.
+/// Returns false, changing nothing, when another execution owns it.
+///
+/// Protocol (bliss-gg3i1.7.15.10.1). Generated callers load `entry` and THEN
+/// compare `entry_owner` with their own key, entering only on a match. A
+/// claim is made by the owning execution itself: the owner key is set before
+/// the entry, so its own later loads see the entry. A release (from any
+/// thread) clears the owner before the entry, so a caller that loads a
+/// cleared entry also sees a cleared owner. Writers serialize under the call
+/// table lock. A non-owner never enters, so code is entered only by the
+/// execution that retains it.
+///
+/// # Safety
+/// `f` must be a live interpreted-function object, `owner` the calling
+/// execution's nonzero code-owner key, and `entry` an ordinary entry that
+/// execution retains while this claim stands.
+pub unsafe fn claim_entry(f: EgclVal, owner: u64, entry: usize) -> bool {
+    debug_assert_ne!(owner, 0);
+    let d = unsafe { data(f) };
+    let current = unsafe { &(*d).entry_owner };
+    if current
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+        && current.load(Ordering::Acquire) != owner
+    {
+        return false;
+    }
+    unsafe { (*d).entry.store(entry, Ordering::Release) };
+    true
+}
+
+/// Release `owner`'s claim on `f`'s entry word, if it still holds one.
+///
+/// # Safety
+/// `f` must be a live interpreted-function object.
+pub unsafe fn release_entry(f: EgclVal, owner: u64) {
+    if owner == 0 {
+        return;
+    }
+    let d = unsafe { data(f) };
+    if unsafe { &(*d).entry_owner }
+        .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        unsafe { (*d).entry.store(0, Ordering::Release) };
+    }
+}
+
+/// The current `(entry, entry_owner)` words of `f` (diagnostics and tests).
+pub fn entry_word(f: EgclVal) -> Option<(usize, u64)> {
+    is_interpreted_function(f).then(|| unsafe {
+        let d = data(f);
+        (
+            (*d).entry.load(Ordering::Acquire),
+            (*d).entry_owner.load(Ordering::Acquire),
+        )
+    })
 }
 
 /// The parsed lambda list cell.
@@ -451,10 +527,14 @@ mod tests {
         assert!(std::ptr::eq(native_entries(*function).unwrap(), &ENTRIES));
         let fresh = alloc_interpreted(NIL, NIL, NIL, NIL);
         assert!(std::ptr::eq(native_entries(fresh).unwrap(), &ENTRIES));
-        assert_eq!(std::mem::size_of::<FunctionData>(), 72);
+        assert_eq!(std::mem::size_of::<FunctionData>(), 88);
         assert_eq!(std::mem::offset_of!(FunctionData, native_entries), 48);
         assert_eq!(std::mem::offset_of!(FunctionData, definition_index), 60);
         assert_eq!(std::mem::offset_of!(FunctionData, closure_state), 64);
+        assert_eq!(std::mem::offset_of!(FunctionData, entry), 72);
+        assert_eq!(std::mem::offset_of!(FunctionData, entry_owner), 80);
+        assert_eq!(ENTRY_TAGGED_OFFSET, 70);
+        assert_eq!(ENTRY_OWNER_TAGGED_OFFSET, 78);
     }
 
     #[test]

@@ -355,6 +355,8 @@ pub(super) struct TransferCode {
     code_len: usize,
     frame_entry: Option<usize>,
     pub(super) ordinary_entry: Option<usize>,
+    /// `ordinary_entry` preceded by its stack check (bliss-gg3i1.7.15.10.1).
+    ordinary_lean_entry: Option<usize>,
     ordinary_stack_required: Option<usize>,
     /// A `&key` entry's body entry past binding; see `run_activation`.
     ordinary_bound_entry: Option<usize>,
@@ -952,7 +954,45 @@ pub(super) fn take_ordinary_lexical_leaf_hits_for_test() -> usize {
     ordinary_closure_context::HITS.with(|hits| hits.replace(0))
 }
 
+/// Whether ordinary code gets lean entries and lean named callers
+/// (bliss-gg3i1.7.15.10.1). `EGCL_LEAN_CALLS=0` keeps the descriptor
+/// admission for every call, for comparison. Enabling also installs the
+/// process-lifetime overflow veneer that lean entries jump to.
+pub(super) fn lean_calls_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if std::env::var("EGCL_LEAN_CALLS").is_ok_and(|value| value == "0") {
+            return false;
+        }
+        let Some(veneer) = JitBuffer::new(
+            &egcl_compiler::t2::native_transfer::emit_ordinary_entry_veneer(
+                ordinary_calls::lean_overflow,
+                0,
+            ),
+        ) else {
+            return false;
+        };
+        // Process lifetime: every lean entry ever emitted jumps here.
+        let veneer = Box::leak(Box::new(veneer));
+        egcl_compiler::t2::emit::set_lean_entry_overflow(veneer.as_ptr() as u64);
+        true
+    })
+}
+
 impl TransferCode {
+    #[cfg(test)]
+    pub(super) fn code_bytes_for_test(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.code.as_ptr(), self.code_len) }
+    }
+
+    /// Absolute address of the lean entry, when this code has one.
+    pub(super) fn ordinary_lean_entry_address(&self) -> Option<usize> {
+        let offset = self
+            .ordinary_lean_entry
+            .filter(|offset| *offset < self.code_len)?;
+        (self.code.as_ptr() as usize).checked_add(offset)
+    }
+
     pub(super) fn needs_callable_identity(&self) -> bool {
         self.ordinary_entry.is_some() && (self.has_deopt || !self.body.self_call_sites.is_empty())
     }

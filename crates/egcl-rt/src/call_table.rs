@@ -118,6 +118,67 @@ pub struct CallCell {
     cold_register: usize,
     cold_slice: usize,
     revision: AtomicU64,
+    /// The function object whose entry word this cell's published ordinary
+    /// descriptor also occupies, if any (bliss-gg3i1.7.15.10.1). Changed only
+    /// under the table lock, together with `ordinary_entry`.
+    entry_claim: Mutex<Option<EntryClaim>>,
+}
+
+/// A function object's entry word, claimed for one execution's published
+/// ordinary code. It mirrors exactly the descriptor its cell publishes: any
+/// change to that publication (redefinition, tier change, deoptimization,
+/// a broad invalidation, the cell's retirement) releases it first.
+pub struct EntryClaim {
+    function: crate::value::EgclVal,
+    owner: u64,
+    /// Keeps the pinned function object, which the claim writes, alive.
+    _root: Arc<crate::gc::CrossThreadRoot<crate::value::EgclVal>>,
+}
+
+impl EntryClaim {
+    /// # Safety
+    /// `root` must retain `function`, a pinned interpreted-function object.
+    pub unsafe fn new(
+        function: crate::value::EgclVal,
+        owner: u64,
+        root: Arc<crate::gc::CrossThreadRoot<crate::value::EgclVal>>,
+    ) -> Self {
+        Self {
+            function,
+            owner,
+            _root: root,
+        }
+    }
+
+    pub fn function(&self) -> crate::value::EgclVal {
+        self.function
+    }
+
+    /// Release the word now; dropping the result releases nothing more.
+    fn released(self) -> Self {
+        unsafe { crate::function::release_entry(self.function, self.owner) };
+        self.disarmed()
+    }
+
+    /// A claim that was never installed must not release a word on drop.
+    fn disarmed(mut self) -> Self {
+        self.owner = 0;
+        self
+    }
+}
+
+impl Drop for EntryClaim {
+    fn drop(&mut self) {
+        // The root keeps the pinned object live and at this address.
+        unsafe { crate::function::release_entry(self.function, self.owner) };
+    }
+}
+
+/// A claim request accompanying an ordinary publication.
+pub struct EntryClaimRequest {
+    pub claim: EntryClaim,
+    /// The code's lean entry: the ordinary entry preceded by its stack check.
+    pub entry: usize,
 }
 
 impl CallCell {
@@ -133,7 +194,28 @@ impl CallCell {
             cold_register,
             cold_slice,
             revision: AtomicU64::new(0),
+            entry_claim: Mutex::new(None),
         }
+    }
+
+    /// The function whose entry word this cell currently claims (tests).
+    pub fn entry_claim_function(&self) -> Option<crate::value::EgclVal> {
+        self.entry_claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(EntryClaim::function)
+    }
+
+    /// Release this cell's claim. The caller drops the returned claim after
+    /// leaving the table lock, since dropping may release a GC root.
+    fn take_entry_claim(&self) -> Option<EntryClaim> {
+        let claim = self
+            .entry_claim
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        claim.map(EntryClaim::released)
     }
 
     /// Install the permanent native contract alongside the migrating checked
@@ -208,7 +290,9 @@ impl CallCell {
         self.register_entry.load(Ordering::Acquire) == self.cold_register
     }
 
-    fn invalidate(&self, revision: u64) {
+    fn invalidate(&self, revision: u64) -> Option<EntryClaim> {
+        // The entry word mirrors the descriptor: retract it first.
+        let claim = self.take_entry_claim();
         // A caller that already loaded the old descriptor must reject it even
         // before the dedicated entry slot is cleared.
         self.revision.store(revision, Ordering::Release);
@@ -218,6 +302,7 @@ impl CallCell {
         self.register_entry
             .store(self.cold_register, Ordering::Release);
         self.slice_entry.store(self.cold_slice, Ordering::Release);
+        claim
     }
 }
 
@@ -259,13 +344,16 @@ impl Table {
         })
     }
 
-    fn invalidate(&mut self, ordinal: usize) {
+    fn invalidate(&mut self, ordinal: usize, released: &mut Released) {
         INVALIDATION_EPOCH.fetch_add(1, Ordering::AcqRel);
         let binding = &mut self.bindings[ordinal];
         binding.revision = binding.revision.wrapping_add(1);
         binding.cells.retain(|weak| {
             if let Some(cell) = weak.upgrade() {
-                cell.invalidate(binding.revision);
+                released.claims.extend(cell.invalidate(binding.revision));
+                // A cell's last reference can be this temporary one; its
+                // retirement then releases a claim and a root. Defer both.
+                released.cells.push(cell);
                 true
             } else {
                 false
@@ -273,8 +361,10 @@ impl Table {
         });
     }
 
+    #[cfg(test)]
     fn publish_ordinary(&self, cell: &CallCell, descriptor: &OrdinaryEntryDescriptor) -> bool {
-        self.publish_ordinary_with_heat(cell, descriptor, 0)
+        let mut released = Released::default();
+        self.publish_ordinary_with_heat(cell, descriptor, 0, None, &mut released)
     }
 
     fn publish_ordinary_with_heat(
@@ -282,16 +372,36 @@ impl Table {
         cell: &CallCell,
         descriptor: &OrdinaryEntryDescriptor,
         heat: usize,
+        claim: Option<EntryClaimRequest>,
+        released: &mut Released,
     ) -> bool {
         if !descriptor.is_compatible()
             || self.bindings[cell.ordinal].revision != descriptor.revision
         {
+            released
+                .claims
+                .extend(claim.map(|request| request.claim.disarmed()));
             return false;
         }
+        // The entry word mirrors this descriptor: retract the old claim
+        // before replacing what it mirrored.
+        released.claims.extend(cell.take_entry_claim());
         cell.ordinary_heat.store(heat, Ordering::Release);
         cell.ordinary_entry
             .store(descriptor as *const _ as usize, Ordering::Release);
         ORDINARY_EPOCH.fetch_add(1, Ordering::AcqRel);
+        if let Some(EntryClaimRequest { claim, entry }) = claim {
+            // A claim held by another execution stays; this execution keeps
+            // the descriptor path for that function.
+            if unsafe { crate::function::claim_entry(claim.function, claim.owner, entry) } {
+                *cell
+                    .entry_claim
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(claim);
+            } else {
+                released.claims.push(claim.disarmed());
+            }
+        }
         true
     }
 
@@ -306,6 +416,14 @@ impl Table {
 }
 
 static TABLE: OnceLock<Mutex<Table>> = OnceLock::new();
+
+/// Claims and cells retired under the table lock. Dropping them can release a
+/// GC root, so callers drop this only after unlocking the table.
+#[derive(Default)]
+struct Released {
+    claims: Vec<EntryClaim>,
+    cells: Vec<Arc<CallCell>>,
+}
 
 /// Bumped after every change to any cell's published ordinary entry. A
 /// directory that saw no change since its last sweep has nothing to retire.
@@ -392,22 +510,29 @@ pub fn publish(cell: &CallCell, revision: u64, registers: usize, slice: usize) -
 /// until every segment that could have loaded it has retired. Its entry address
 /// must implement the declared ABI and its metadata must have been validated.
 pub unsafe fn publish_ordinary(cell: &CallCell, descriptor: &OrdinaryEntryDescriptor) -> bool {
-    TABLE
+    let mut released = Released::default();
+    let published = TABLE
         .get()
         .expect("registered cell")
         .lock()
         .unwrap()
-        .publish_ordinary(cell, descriptor)
+        .publish_ordinary_with_heat(cell, descriptor, 0, None, &mut released);
+    drop(released);
+    published
 }
 
 pub fn invalidate(symbol: u32) {
     // Even a name no cell has resolved yet: callable caches key on this.
     INVALIDATION_EPOCH.fetch_add(1, Ordering::AcqRel);
     let Some(table) = TABLE.get() else { return };
-    let mut table = table.lock().unwrap();
-    if let Some(&ordinal) = table.by_symbol.get(&symbol) {
-        table.invalidate(ordinal);
+    let mut released = Released::default();
+    {
+        let mut table = table.lock().unwrap();
+        if let Some(&ordinal) = table.by_symbol.get(&symbol) {
+            table.invalidate(ordinal, &mut released);
+        }
     }
+    drop(released);
 }
 
 /// Publish retained profiling metadata atomically with the descriptor's
@@ -421,11 +546,34 @@ pub unsafe fn publish_ordinary_with_heat(
     descriptor: &OrdinaryEntryDescriptor,
     heat: usize,
 ) -> bool {
-    TABLE
+    unsafe { publish_ordinary_claiming_entry(cell, descriptor, heat, None) }
+}
+
+/// Publish as `publish_ordinary_with_heat` does and, when it succeeds, also
+/// point the claimed function object's entry word at this code's lean entry
+/// (bliss-gg3i1.7.15.10.1). The claim lasts exactly as long as this
+/// publication: invalidating or replacing it releases the word first. A word
+/// another execution owns is left alone; this execution's callers then keep
+/// the descriptor path for that function.
+///
+/// # Safety
+/// As for `publish_ordinary_with_heat`. The claim must be for the calling
+/// execution, name the exact function this descriptor's code implements, and
+/// its entry must be that code's lean entry, retained with the descriptor.
+pub unsafe fn publish_ordinary_claiming_entry(
+    cell: &CallCell,
+    descriptor: &OrdinaryEntryDescriptor,
+    heat: usize,
+    claim: Option<EntryClaimRequest>,
+) -> bool {
+    let mut released = Released::default();
+    let published = TABLE
         .get_or_init(Default::default)
         .lock()
         .unwrap()
-        .publish_ordinary_with_heat(cell, descriptor, heat)
+        .publish_ordinary_with_heat(cell, descriptor, heat, claim, &mut released);
+    drop(released);
+    published
 }
 
 /// Existing broad native-code invalidations also redirect callable slots.
@@ -433,10 +581,14 @@ pub unsafe fn publish_ordinary_with_heat(
 pub fn invalidate_all() {
     INVALIDATION_EPOCH.fetch_add(1, Ordering::AcqRel);
     let Some(table) = TABLE.get() else { return };
-    let mut table = table.lock().unwrap();
-    for ordinal in 0..table.bindings.len() {
-        table.invalidate(ordinal);
+    let mut released = Released::default();
+    {
+        let mut table = table.lock().unwrap();
+        for ordinal in 0..table.bindings.len() {
+            table.invalidate(ordinal, &mut released);
+        }
     }
+    drop(released);
 }
 
 #[cfg(test)]
@@ -491,7 +643,7 @@ mod tests {
             unsafe { &*cell.checked_entry_address(false) }.load(Ordering::Acquire),
             11
         );
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert_eq!(unsafe { &*address }.load(Ordering::Acquire), 0);
         assert!(!table.publish_ordinary(&cell, &old));
         let replacement = ordinary_descriptor(1);
@@ -574,7 +726,7 @@ mod tests {
         let cells = &table.bindings[ordinal].cells;
         assert!(cells.len() <= 4, "dead cells kept: {}", cells.len());
         assert!(cells.iter().any(|weak| weak.as_ptr() == Arc::as_ptr(&live)));
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert_eq!(live.revision.load(Ordering::Acquire), 1);
     }
 
@@ -639,7 +791,7 @@ mod tests {
         for symbol in 100..10000 {
             table.ordinal(symbol);
         }
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         for (cell, address) in [&first, &second].into_iter().zip(addresses) {
             assert_eq!(cell.revision_address(), address);
             assert_eq!(unsafe { &*address }.load(Ordering::Acquire), 1);
@@ -650,7 +802,7 @@ mod tests {
             assert!(!table.publish_ordinary(cell, &old));
         }
         drop(second);
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert_eq!(unsafe { &*addresses[0] }.load(Ordering::Acquire), 2);
         assert_eq!(table.bindings[ordinal].cells.len(), 1);
     }
@@ -665,7 +817,7 @@ mod tests {
         assert!(cell.is_cold());
         assert!(table.publish(&cell, 0, 21, 22));
         assert!(!cell.is_cold());
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert!(cell.is_cold());
         assert!(!table.publish(&cell, 0, 41, 42));
         for (slice, native, checked) in [(false, 31, 11), (true, 32, 12)] {
@@ -707,7 +859,7 @@ mod tests {
         assert_eq!(table.ordinal(42), ordinal);
         assert_eq!(cell.entry_address(false), address);
         assert_eq!(cell.register_entry.load(Ordering::Acquire), 21);
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert!(cell.is_cold());
         assert_eq!(cell.slice_entry.load(Ordering::Acquire), 12);
         assert!(
@@ -729,10 +881,10 @@ mod tests {
             .extend([Arc::downgrade(&first), Arc::downgrade(&second)]);
         assert!(table.publish(&first, 0, 5, 6));
         assert!(table.publish(&second, 0, 7, 8));
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert!(first.is_cold() && second.is_cold());
         drop(second);
-        table.invalidate(ordinal);
+        table.invalidate(ordinal, &mut Released::default());
         assert_eq!(table.bindings[ordinal].cells.len(), 1);
     }
 }

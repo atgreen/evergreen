@@ -62,6 +62,7 @@ fn global_value_read_compiles_through_the_ordinary_abi() {
             descriptor_slot: 1,
             revision_address: 1,
             heat_slot: 0,
+            function_cell: 0,
         },
     )];
     let result = emit_framed_ordinary_function(
@@ -182,6 +183,7 @@ fn semantic_store_keeps_its_continuation_and_discards_the_primary() {
                 descriptor_slot: 1,
                 revision_address: 1,
                 heat_slot: 0,
+                function_cell: 0,
             },
         )
     });

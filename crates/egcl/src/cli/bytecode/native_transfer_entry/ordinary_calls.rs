@@ -418,6 +418,70 @@ pub(super) unsafe extern "C" fn keyword_decline(
     }
 }
 
+/// A lean entry's stack check failed (bliss-gg3i1.7.15.10.1): the callee's
+/// frame does not fit below the caller. The request's closure word is the
+/// callee the lean caller passed in RAX. Complete the call through the
+/// rooted runtime, exactly as a failed caller-side admission completes it
+/// through `cold_call`; that path signals stack exhaustion when it applies.
+pub(in crate::cli::bytecode) unsafe extern "C" fn lean_overflow(
+    request: *mut u8,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    let request = request.cast::<OrdinaryArityRequest>();
+    #[cfg(test)]
+    LEAN_OVERFLOWS.with(|count| count.set(count.get() + 1));
+    unsafe {
+        with_entry_roots(request, || {
+            root_publication::published(image, || {
+                let execution = egcl_rt::thread::current_execution_context_for_native()
+                    .expect("ordinary lean entry owns an execution");
+                let control = (*execution).active_native_control() as *mut NativeRecursiveControl;
+                let result = guard_c2i(|| {
+                    if native_error_pending() {
+                        return Ok(NIL);
+                    }
+                    if !egcl_rt::function::is_interpreted_function((*request).closure) {
+                        return Err(invalid_capture());
+                    }
+                    let count = (*request).nargs;
+                    let registers = &(&(*request).register_args)[..count.min(3)];
+                    let overflow = if count > 3 {
+                        std::slice::from_raw_parts((*request).overflow_args, count - 3)
+                    } else {
+                        &[]
+                    };
+                    egcl_rt::rooted!(args = EntryArgs::from_parts(registers, overflow));
+                    let mut poll = NativeOutcome {
+                        value: NIL,
+                        exit: NativeExit::Returned,
+                    };
+                    poll_or_transfer_unpublished(std::ptr::null_mut(), &mut poll);
+                    if poll.exit != NativeExit::Returned {
+                        return Ok(NIL);
+                    }
+                    let env = NATIVE_ENV.with(Cell::get);
+                    if env.is_null() {
+                        return Err(invalid_capture());
+                    }
+                    // The request stays rooted; reread the callee after polling.
+                    apply_function((*request).closure, args.as_slice(), &mut *env)
+                });
+                refresh_control(control);
+                finish(result, out);
+            });
+        });
+    }
+}
+
+#[cfg(test)]
+static LEAN_OVERFLOWS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_lean_overflows_for_test() -> usize {
+    LEAN_OVERFLOWS.with(|count| count.replace(0))
+}
+
 /// Finish a precise guard continuation through the ordinary tuple protocol.
 pub(super) unsafe extern "C" fn guard(
     request: *mut u8,

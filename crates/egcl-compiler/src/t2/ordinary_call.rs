@@ -18,6 +18,54 @@ pub struct OrdinaryCallTarget {
     pub revision_address: u64,
     /// Atomic pointer to retained profiling metadata; zero disables profiling.
     pub heat_slot: u64,
+    /// Address of the target symbol's global function cell (its pinned
+    /// SymbolData + 24), or zero. Nonzero selects the lean named call
+    /// (bliss-gg3i1.7.15.10.1): load the cell, check for an interpreted
+    /// function whose entry word this execution owns, and call that entry.
+    /// Every other callee takes the descriptor admission below.
+    pub function_cell: u64,
+}
+
+/// The veneer a lean entry's stack check jumps to on overflow, or zero when
+/// ordinary code gets no lean entry. Set once by the runtime; the veneer
+/// receives an ordinary call (arguments, RCX count, RAX callable) whose
+/// callee frame does not fit, and completes it through the rooted runtime.
+static LEAN_ENTRY_OVERFLOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Install the process-lifetime lean-entry overflow veneer.
+pub fn set_lean_entry_overflow(veneer: u64) {
+    LEAN_ENTRY_OVERFLOW.store(veneer, std::sync::atomic::Ordering::Release);
+}
+
+pub(super) fn lean_entry_overflow() -> u64 {
+    LEAN_ENTRY_OVERFLOW.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Emit the lean entry (bliss-gg3i1.7.15.10.1): the callee-side stack check
+/// a lean named caller no longer makes, falling through into the ordinary
+/// entry that must immediately follow. Only R10/R11 change; every incoming
+/// argument, RCX and RAX reach the ordinary entry or the overflow veneer
+/// intact. Returns the offset of the imm32 to patch with the stack bound.
+pub(super) fn emit_lean_entry_prologue(a: &mut Asm, overflow: egcl_rt::asm::Label) -> usize {
+    load_mem64_disp(
+        a,
+        11,
+        13,
+        egcl_rt::exec_context::offsets::ACTIVE_NATIVE_CONTROL as i32,
+    );
+    mov_rr(a, 10, 4); // r10 = entry RSP
+    a.extend_from_slice(&[0x49, 0x81, 0xea]); // sub r10, imm32
+    let fixup = a.here();
+    a.extend_from_slice(&0u32.to_le_bytes());
+    unsigned_branch(a, false, overflow); // borrow: the frame cannot fit
+    cmp_mem64_disp8(
+        a,
+        10,
+        11,
+        std::mem::offset_of!(NativeRecursiveControl, stack_limit) as u8,
+    );
+    unsigned_branch(a, true, overflow); // lowest frame address <= limit
+    fixup
 }
 
 /// Process-wide atomic cells, independent of each target's cell revision.
@@ -1014,6 +1062,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
         descriptor_slot: 0,
         revision_address: 0,
         heat_slot: 0,
+        function_cell: 0,
     };
     super::emit_framed_inner(
         f,
@@ -1060,7 +1109,7 @@ pub(super) fn reserve_ordinary_stack(a: &mut Asm, mut bytes: usize) {
     }
 }
 
-fn unsigned_branch(a: &mut Asm, inclusive: bool, target: egcl_rt::asm::Label) {
+pub(super) fn unsigned_branch(a: &mut Asm, inclusive: bool, target: egcl_rt::asm::Label) {
     let at = a.here();
     a.jcc(Cc::E, target);
     // Shared Cc deliberately only models portable signed conditions. x86
@@ -1185,6 +1234,11 @@ impl OrdinaryCallEmission<'_> {
             compare_zero_memory(a, 11, 0, true);
             a.jcc(Cc::Ne, cold);
         }
+        let lean_return = if !self.direct_self && self.target.function_cell != 0 {
+            emit_lean_named_call(a, &self, data, base, overflow, emit_epilogue, done)
+        } else {
+            None
+        };
         // Ordinary machine frames are bounded by their exact stack budget.
         // The legacy depth counter bounds Rust/native reentry only.
 
@@ -1460,8 +1514,98 @@ impl OrdinaryCallEmission<'_> {
         };
         retire(a, 64);
         a.bind(done);
-        Ok(direct.into_iter().chain(std::iter::once(slow)).collect())
+        Ok(lean_return
+            .into_iter()
+            .chain(direct)
+            .chain(std::iter::once(slow))
+            .collect())
     }
+}
+
+/// The lean named call (bliss-gg3i1.7.15.10.1). Arguments are already in the
+/// outgoing area and every caller-side admission that remains (control, poll,
+/// multiple values) has passed. Load the target's function cell, and call the
+/// entry word when the cell holds an interpreted function whose entry this
+/// execution owns; the callee's lean entry checks the stack. Anything else
+/// falls through to the descriptor admission that follows, with RDI still the
+/// control pointer.
+///
+/// GC: from the cell load to the call there is no call, poll or allocation,
+/// so RAX (the callee) needs no value-map coverage; the object is pinned in
+/// any case and reachable from the symbol. The callee receives it in RAX.
+fn emit_lean_named_call(
+    a: &mut Asm,
+    emission: &OrdinaryCallEmission<'_>,
+    data: &InstData,
+    base: u32,
+    overflow: i32,
+    emit_epilogue: &dyn Fn(&mut Asm),
+    done: egcl_rt::asm::Label,
+) -> Option<CallReturn> {
+    use egcl_rt::function::{ENTRY_OWNER_TAGGED_OFFSET, ENTRY_TAGGED_OFFSET, TYPE_ID_TAGGED_OFFSET};
+    let legacy = a.label();
+    a.extend_from_slice(&[0x48, 0xa1]); // movabs rax, [function cell]
+    a.extend_from_slice(&emission.target.function_cell.to_le_bytes());
+    a.extend_from_slice(&[0x4c, 0x8d, 0x50]); // lea r10, [rax - heap tag]
+    a.push((-(egcl_rt::value::TAG_HEAP_OBJECT as i8)) as u8);
+    a.extend_from_slice(&[0x41, 0xf6, 0xc2, egcl_rt::value::TAG_MASK as u8]); // test r10b, 7
+    a.jcc(Cc::Ne, legacy);
+    a.extend_from_slice(&[
+        0x80,
+        0x78,
+        TYPE_ID_TAGGED_OFFSET as u8,
+        egcl_rt::object::type_id::FUNCTION_INTERPRETED,
+    ]); // cmp byte [rax + type id], FUNCTION_INTERPRETED
+    a.jcc(Cc::Ne, legacy);
+    // Entry first, then owner: see `egcl_rt::function::claim_entry`.
+    load_mem64_disp(a, 11, RAX, ENTRY_TAGGED_OFFSET);
+    load_mem64_disp(
+        a,
+        10,
+        13,
+        egcl_rt::exec_context::offsets::CODE_OWNER as i32,
+    );
+    cmp_mem64_disp8(a, 10, RAX, ENTRY_OWNER_TAGGED_OFFSET as u8);
+    a.jcc(Cc::Ne, legacy);
+    // Arguments move exactly as the descriptor path below moves them; only
+    // RAX differs. The callee checks its own stack, including overflow words.
+    let lean = if emission.tail {
+        // As the descriptor tail: nothing is live in this frame any more,
+        // and the callee's lean entry checks the stack at the caller's RSP.
+        if overflow != 0 {
+            load_home(a, 10, FramedHome::Stack(base + 3), 0);
+            a.extend_from_slice(&[0x4c, 0x89, 0x55, 0x10]); // [rbp+16]=arg4 (r10)
+        }
+        for (index, reg) in [7, 6, 2].into_iter().take(data.args.len()).enumerate() {
+            load_home(a, reg, FramedHome::Stack(base + index as u32), 0);
+        }
+        mov_imm64(a, 1, data.args.len() as i64);
+        emit_epilogue(a);
+        a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11, RAX = callee
+        None
+    } else {
+        if overflow != 0 {
+            reserve_ordinary_stack(a, overflow as usize);
+            for index in 3..data.args.len() {
+                load_home(a, 10, FramedHome::Stack(base + index as u32), overflow);
+                store_to_rsp(a, 10, ((index - 3) * 8) as i32);
+            }
+        }
+        for (index, reg) in [7, 6, 2].into_iter().take(data.args.len()).enumerate() {
+            load_home(a, reg, FramedHome::Stack(base + index as u32), overflow);
+        }
+        mov_imm64(a, 1, data.args.len() as i64);
+        a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, RAX = callee
+        let lean = CallReturn {
+            return_offset: a.here(),
+            stack_adjust: overflow as u32,
+        };
+        retire(a, overflow as u32);
+        a.jmp(done);
+        Some(lean)
+    };
+    a.bind(legacy);
+    lean
 }
 
 #[cfg(test)]

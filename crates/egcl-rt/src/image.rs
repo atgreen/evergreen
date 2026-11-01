@@ -182,7 +182,10 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Version 18 grows interpreted function objects by a raw closure-state word and
 // keys the host section's bytecode-closure captures by function object rather
 // than by a per-instance symbol. Older function bodies are too short to read.
-const FORMAT_VERSION: u32 = 18;
+// Version 19 grows interpreted function objects by a native entry word and its
+// owner key (bliss-gg3i1.7.15.10.1); both are saved as zero and re-derived when
+// the restored process publishes code. Older function bodies are too short.
+const FORMAT_VERSION: u32 = 19;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

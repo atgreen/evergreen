@@ -70,8 +70,8 @@ fn fixture(env: &mut Env) -> (u32, Rc<NativeCode>, Rc<NativeCode>, u32) {
         );
         assert_eq!(
             mapped.value_maps_for_test().iter().count(),
-            2,
-            "non-tail CALL retains direct and cold maps"
+            3,
+            "non-tail CALL retains lean, direct and cold maps"
         );
     }
     let args = [11, 22, 33, 44].map(EgclVal::from_fixnum);

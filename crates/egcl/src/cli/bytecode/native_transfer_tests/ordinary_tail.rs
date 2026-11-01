@@ -44,8 +44,8 @@ fn install_terminal_caller(
     assert!(mapped.ordinary_entry.is_some());
     assert_eq!(
         mapped.value_maps_for_test().iter().count(),
-        2,
-        "terminal CALL retains both admitted and cold continuation maps"
+        3,
+        "terminal CALL retains lean, admitted and cold continuation maps"
     );
     result
 }
@@ -511,8 +511,8 @@ fn ordinary_tail_descendant_overflow_preserves_suspended_caller_roots() {
     };
     assert_eq!(
         mapped.value_maps_for_test().iter().count(),
-        2,
-        "capacity fallback retains direct and cold CALL maps"
+        3,
+        "capacity fallback retains lean, direct and cold CALL maps"
     );
     for site in mapped.value_maps_for_test().iter() {
         let Some(egcl_compiler::t2::x64_calls::NativeCallValues::Frame(values)) =

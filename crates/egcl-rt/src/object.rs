@@ -558,6 +558,17 @@ pub struct FunctionData {
     /// releases it through the registered hook when the object dies, and an
     /// image snapshot stores 0 (bliss-gg3i1.7.15.3).
     pub closure_state: core::sync::atomic::AtomicUsize,
+    /// Native entry word (bliss-gg3i1.7.15.10.1): the address of this exact
+    /// object's ordinary Lisp entry in the code of the execution named by
+    /// `entry_owner`, or 0. Untraced and process-local; an image stores 0.
+    /// Generated named calls load it from the callee and enter it only after
+    /// `entry_owner` matches their own execution's code-owner key. See
+    /// `function::claim_entry` for the publication protocol.
+    pub entry: core::sync::atomic::AtomicUsize,
+    /// Code-owner key (`exec_context::offsets::CODE_OWNER`) of the execution
+    /// whose code `entry` names, or 0 when no execution owns it.
+    pub entry_owner: core::sync::atomic::AtomicU64,
+    // TODO(bliss-gg3i1.7.15 heap environments): `closure_env` follows here.
 }
 
 // ── Cons cell ──────────────────────────────────────────────────────

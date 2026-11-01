@@ -1689,6 +1689,15 @@ const FUNCTION_CLOSURE_STATE_OFFSET: usize =
     core::mem::offset_of!(crate::object::FunctionData, closure_state)
         - core::mem::size_of::<ObjectHeader>();
 
+/// Body offset of an interpreted function's process-local native entry word
+/// and its owner key, which follows it (bliss-gg3i1.7.15.10.1).
+const FUNCTION_ENTRY_OFFSET: usize = core::mem::offset_of!(crate::object::FunctionData, entry)
+    - core::mem::size_of::<ObjectHeader>();
+const _: () = assert!(
+    core::mem::offset_of!(crate::object::FunctionData, entry_owner)
+        == core::mem::offset_of!(crate::object::FunctionData, entry) + 8
+);
+
 /// Visit only the heap reference words of an interpreted function, leaving its
 /// off-heap captures to the remembered-capture scanner (bliss-gg3i1.7.9).
 ///
@@ -8637,6 +8646,9 @@ pub unsafe fn snapshot_heap_regions(
                 // host registry re-attaches it on restore.
                 let state = body_offset + FUNCTION_CLOSURE_STATE_OFFSET;
                 region.bytes[state..state + 8].fill(0);
+                // Entry and owner name this process's code and execution.
+                let entry = body_offset + FUNCTION_ENTRY_OFFSET;
+                region.bytes[entry..entry + 16].fill(0);
             }
             unsafe {
                 trace_object(body as *mut u8, kind, len, |slot| {
@@ -8793,6 +8805,9 @@ fn serialize_heap_objects_matching(mut retain: impl FnMut(*const u8) -> bool) ->
             out.extend_from_slice(data);
             let state = start + FUNCTION_CLOSURE_STATE_OFFSET;
             out[state..state + 8].fill(0);
+            // Nor its process-local native entry word and owner key.
+            let entry = start + FUNCTION_ENTRY_OFFSET;
+            out[entry..entry + 16].fill(0);
         } else {
             out.extend_from_slice(data);
         }
