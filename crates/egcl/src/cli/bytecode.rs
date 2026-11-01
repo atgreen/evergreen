@@ -7558,6 +7558,20 @@ impl<'e> Lowerer<'e> {
                     egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
                     *clause_body = arena_cons(*let_form, NIL);
                     Some(slot)
+                } else if self.captured_names.contains(&var_key) {
+                    // A closure captures the clause variable, and the driver
+                    // stores the condition in a frame slot: bind it from a
+                    // hidden slot with LET, which handles a captured variable
+                    // (bliss-gg3i1.7.17).
+                    egcl_rt::rooted!(hidden = super::gensym_symbol("HANDLER-CASE-CONDITION"));
+                    let slot = self.alloc_slot(&var_name(*hidden));
+                    let let_sym = super::resolve_sym("LET").ok_or(Bail)?;
+                    egcl_rt::rooted!(binding = vec_to_list(&[var, *hidden]));
+                    egcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
+                    egcl_rt::rooted!(let_body = arena_cons(*bindings, body));
+                    egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
+                    *clause_body = arena_cons(*let_form, NIL);
+                    Some(slot)
                 } else {
                     Some(self.alloc_slot(&var_key))
                 }
@@ -8125,8 +8139,39 @@ impl<'e> Lowerer<'e> {
         let saved_next_local = self.next_local;
         self.enter_scope();
         let slot_base = self.next_local;
+        // TakeValuesToLocals fills consecutive frame slots, so a variable a
+        // closure captures cannot be one: its slot gets a hidden name and the
+        // body runs inside `(let ((VAR hidden) ...) . body)`, which binds VAR
+        // as LET does any captured variable. This used to bail the whole
+        // function (`function:closure-captures-slot`; SBCL's QQ-TEMPLATE-1,
+        // bliss-gg3i1.7.17).
+        let captured_decl_special = body_declared_special(body);
+        // Symbols are immediates: nothing here needs a root.
+        let mut captured_vars: Vec<(EgclVal, EgclVal)> = Vec::new();
         for i in 0..vars.len() {
-            self.alloc_slot(&var_name(vars[i]));
+            let name = var_name(vars[i]);
+            if self.captured_names.contains(&name)
+                && !is_special_name(&name)
+                && !captured_decl_special.contains(&name)
+            {
+                let hidden = super::gensym_symbol("MVB-CAPTURED");
+                self.alloc_slot(&var_name(hidden));
+                captured_vars.push((vars[i], hidden));
+            } else {
+                self.alloc_slot(&name);
+            }
+        }
+        if !captured_vars.is_empty() {
+            let let_sym = super::resolve_sym("LET").ok_or(Bail)?;
+            egcl_rt::rooted!(bindings = Vec::with_capacity(captured_vars.len()));
+            for &(var, hidden) in captured_vars.iter() {
+                let binding = vec_to_list(&[var, hidden]);
+                bindings.push(binding);
+            }
+            egcl_rt::rooted!(binding_list = vec_to_list(&bindings));
+            egcl_rt::rooted!(let_body = arena_cons(*binding_list, body));
+            egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
+            body = arena_cons(*let_form, NIL);
         }
         self.emit(Instr::TakeValuesToLocals {
             nvars: vars.len() as u16,
@@ -9408,6 +9453,7 @@ fn compile_local_function(
     lo.portable = portable;
     lo.local_fns = local_fns.clone();
     lo.captured_names = compute_captured_names(fbody);
+    lo.captured_names.extend(forced_boxing());
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -9506,6 +9552,7 @@ fn compile_capturing_local(
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(fbody);
+    lo.captured_names.extend(forced_boxing());
     lo.has_env = true;
     lo.closure_fns = callable.clone();
     lo.local_fns = local_fns.clone();
@@ -11634,6 +11681,35 @@ static BOX_REQUEST: egcl_rt::execution_local::ExecutionLocal<
     egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashSet::new()))
 };
 
+/// Names the enclosing compile attempt is forcing into heap bindings, for the
+/// local functions it lowers along the way (bliss-gg3i1.7.17).
+static FORCED_BOXING: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<String>>,
+> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashSet::new()))
+};
+
+fn forced_boxing() -> Vec<String> {
+    FORCED_BOXING.with(|forced| forced.borrow().iter().cloned().collect())
+}
+
+/// Install a compile attempt's forced names until it returns, restoring the
+/// enclosing attempt's.
+struct ForcedBoxingScope(std::collections::HashSet<String>);
+
+impl ForcedBoxingScope {
+    fn enter(forced: &std::collections::HashSet<String>) -> Self {
+        Self(FORCED_BOXING.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), forced.clone())))
+    }
+}
+
+impl Drop for ForcedBoxingScope {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        FORCED_BOXING.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
 fn request_boxing(names: impl IntoIterator<Item = String>) {
     BOX_REQUEST.with(|r| r.borrow_mut().extend(names));
 }
@@ -11704,6 +11780,9 @@ fn compile_function_in(
         }
         let requested = take_box_request();
         if requested.is_empty() || requested.is_subset(&forced) {
+            if !requested.is_empty() && std::env::var_os("EGCL_BOX_RETRY_TRACE").is_some() {
+                eprintln!("[box-retry] still slot-bound after boxing: {requested:?}");
+            }
             return None;
         }
         forced.extend(requested);
@@ -11878,6 +11957,10 @@ fn compile_function_forcing_boxed(
     for forced in forced_boxed {
         lo.captured_names.insert(forced.clone());
     }
+    // Nested local functions compiled during this attempt box the same names:
+    // a macro-revealed capture of a local function's own parameter or LET
+    // variable is requested here too, and only reaches that body this way.
+    let _forced_scope = ForcedBoxingScope::enter(forced_boxed);
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
     lo.loop_finish_tag = loop_finish_tag.map(str::to_owned);
@@ -12420,6 +12503,9 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
         }
         let requested = take_box_request();
         if requested.is_empty() || requested.is_subset(&forced) {
+            if !requested.is_empty() && std::env::var_os("EGCL_BOX_RETRY_TRACE").is_some() {
+                eprintln!("[box-retry] still slot-bound after boxing: {requested:?}");
+            }
             return None;
         }
         forced_symbols.extend(
@@ -12444,6 +12530,7 @@ fn compile_thunk_forcing_boxed(
     lo.portable = portable;
     lo.captured_names = compute_captured_names(arena_cons(*form, NIL));
     lo.captured_names.extend(forced.iter().cloned());
+    let _forced_scope = ForcedBoxingScope::enter(forced);
     if lo.lower_expr(*form).is_err() {
         return None;
     }
