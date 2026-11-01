@@ -198,6 +198,8 @@ use egcl_rt::stack::StackMapEntry;
 use egcl_rt::value::{EgclVal, NIL, T};
 use egcl_rt::{CodeInfo, Frame, FrameType};
 
+#[cfg(test)]
+use super::FrameWrite;
 use super::{
     DynBind, Env, EnvFrame, FrameCell, HandlerCluster, HandlerEntry, HandlerImpl, RestartEntry,
     RestartFunction, SharedCell, apply_function, arena_cons, arena_str, condition_matches_handler,
@@ -839,6 +841,13 @@ impl PrivateHostPressure {
 
 static PRIVATE_HOST_PRESSURE: PrivateHostPressure = PrivateHostPressure::new();
 
+/// Live host bytes for the private-closure pressure ledger, excluding the
+/// minor collector's write logs (see `remembered_captures::bookkeeping_bytes`).
+fn private_host_live_bytes() -> usize {
+    egcl_rt::host_memory::live_bytes()
+        .saturating_sub(super::remembered_captures::bookkeeping_bytes())
+}
+
 #[cfg(test)]
 mod private_host_pressure_tests;
 
@@ -854,7 +863,7 @@ fn note_private_closure_published() {
     use std::sync::atomic::Ordering;
     let minted = PRIVATE_CLOSURES_SINCE_MAJOR.fetch_add(1, Ordering::Relaxed) + 1;
     let tracking_active = egcl_rt::host_memory::tracking_active();
-    let live_bytes = egcl_rt::host_memory::live_bytes();
+    let live_bytes = private_host_live_bytes();
     let count_budget = PRIVATE_CLOSURE_MAJOR_BUDGET.load(Ordering::Relaxed);
     if PRIVATE_HOST_PRESSURE.requests_major(tracking_active, live_bytes, minted, count_budget) {
         egcl_rt::gc::request_major_gc();
@@ -890,7 +899,7 @@ fn sweep_function_captures(names: &[EgclVal]) {
     );
     PRIVATE_CLOSURES_SINCE_MAJOR.store(0, Ordering::Relaxed);
     if egcl_rt::host_memory::tracking_active() {
-        PRIVATE_HOST_PRESSURE.reset_after_major(egcl_rt::host_memory::live_bytes());
+        PRIVATE_HOST_PRESSURE.reset_after_major(private_host_live_bytes());
     }
 }
 

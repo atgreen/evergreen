@@ -37,7 +37,7 @@ mod native_runtime;
 mod python;
 mod reified_metadata;
 mod remembered_captures;
-use remembered_captures::FrameCell;
+use remembered_captures::{FrameCell, FrameWrite};
 mod shake;
 mod slot_access;
 pub mod sprof;

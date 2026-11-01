@@ -31,7 +31,6 @@ use super::EnvFrame;
 use egcl_rt::bytecode::BytecodeFunction;
 use egcl_rt::gc::ExternalRootScanKind;
 use egcl_rt::value::EgclVal;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 /// A shared lexical frame. Creation and every mutable lock record the frame as
@@ -40,25 +39,27 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 /// [`FrameCell::gc_borrow`], which records nothing: relocation stores only
 /// older addresses.
 ///
+/// Deliberately no larger than the plain `SharedCell<EnvFrame>` it replaces:
+/// frames are numerous, and extra bytes per frame shift the host-memory
+/// pressure that schedules major collections (measured on SHOW: 16 extra bytes
+/// per frame moved one major collection into a warm compilation). The write
+/// record is kept beside the frame, in the log and a per-thread cache.
+///
 /// A guard must never survive a Lisp allocation, evaluation, or safepoint (see
-/// `SharedCell`); that is also what makes stamping at lock time equivalent to
-/// stamping at each store.
+/// `SharedCell`); that is also what makes recording at lock time equivalent to
+/// recording each store.
 pub(super) struct FrameCell {
     frame: Mutex<EnvFrame>,
-    /// Epoch of the last mutator lock (or of creation).
-    written: AtomicU64,
-    this: Weak<FrameCell>,
 }
 
 impl FrameCell {
     pub(super) fn new_arc(frame: EnvFrame) -> Arc<Self> {
-        let epoch = egcl_rt::gc::minor_epoch();
-        let cell = Arc::new_cyclic(|this| FrameCell {
+        let cell = Arc::new(FrameCell {
             frame: Mutex::new(frame),
-            written: AtomicU64::new(epoch),
-            this: this.clone(),
         });
-        FRAMES.note(&cell.this, epoch);
+        // Always logged: a new frame may reuse a dead frame's address, so the
+        // per-thread cache must not suppress it.
+        note_frame(&cell, true);
         cell
     }
 
@@ -68,26 +69,47 @@ impl FrameCell {
         FrameRead(self.gc_borrow())
     }
 
-    /// Lock for writing, recording the frame as written in this epoch.
-    #[inline]
-    pub(super) fn borrow_mut(&self) -> MutexGuard<'_, EnvFrame> {
-        self.note_write();
-        self.gc_borrow()
-    }
-
     /// Lock without recording a write. Only for collector-side visitors and
     /// read-only snapshots, which never store a nursery reference.
+    #[inline]
     pub(super) fn gc_borrow(&self) -> MutexGuard<'_, EnvFrame> {
         self.frame.lock().unwrap_or_else(|error| error.into_inner())
     }
+}
 
+/// Mutable access to a frame. Taken through the owning `Arc` so the write can
+/// be recorded without a back-pointer in every frame.
+pub(super) trait FrameWrite {
+    /// Lock for writing, recording the frame as written in this epoch.
+    fn borrow_mut(&self) -> MutexGuard<'_, EnvFrame>;
+}
+
+impl FrameWrite for Arc<FrameCell> {
     #[inline]
-    fn note_write(&self) {
-        let epoch = egcl_rt::gc::minor_epoch();
-        if self.written.load(Ordering::Relaxed) != epoch {
-            self.written.store(epoch, Ordering::Relaxed);
-            FRAMES.note(&self.this, epoch);
-        }
+    fn borrow_mut(&self) -> MutexGuard<'_, EnvFrame> {
+        note_frame(self, false);
+        self.gc_borrow()
+    }
+}
+
+/// Frames this thread recorded recently, by address, with the epoch: a frame
+/// written repeatedly is logged about once per epoch without a stamp in it.
+/// A miss only adds a duplicate entry, which the log drops.
+const RECENT_FRAMES: usize = 64;
+
+thread_local! {
+    static RECENT: [std::cell::Cell<(usize, u64)>; RECENT_FRAMES] =
+        const { [const { std::cell::Cell::new((0, u64::MAX)) }; RECENT_FRAMES] };
+}
+
+#[inline]
+fn note_frame(frame: &Arc<FrameCell>, created: bool) {
+    let epoch = egcl_rt::gc::minor_epoch();
+    let address = Arc::as_ptr(frame) as usize;
+    let slot = (address >> 4) % RECENT_FRAMES;
+    let seen = RECENT.with(|recent| recent[slot].replace((address, epoch)) == (address, epoch));
+    if created || !seen {
+        FRAMES.note(Arc::downgrade(frame), epoch);
     }
 }
 
@@ -97,6 +119,7 @@ pub(super) struct FrameRead<'a>(MutexGuard<'a, EnvFrame>);
 
 impl std::ops::Deref for FrameRead<'_> {
     type Target = EnvFrame;
+    #[inline]
     fn deref(&self) -> &EnvFrame {
         &self.0
     }
@@ -105,7 +128,7 @@ impl std::ops::Deref for FrameRead<'_> {
 /// Record that `body` became reachable through a closure-body table or the
 /// bytecode root registry in the current epoch.
 pub(super) fn note_published_body(body: &Arc<BytecodeFunction>) {
-    BODIES.note(&Arc::downgrade(body), egcl_rt::gc::minor_epoch());
+    BODIES.note(Arc::downgrade(body), egcl_rt::gc::minor_epoch());
 }
 
 /// Live entries one epoch may hold before a log gives up and the next minor
@@ -113,22 +136,28 @@ pub(super) fn note_published_body(body: &Arc<BytecodeFunction>) {
 /// so this bounds the frames that stay live across one epoch, not the frames
 /// created in it.
 const LOG_HARD_LIMIT: usize = 1 << 20;
-/// Dead entries tolerated between compactions, beyond a quarter of the live
-/// ones. A dead entry's `Weak` keeps its allocation (not its contents), and
-/// that host memory counts toward host-pressure major collections, so the
-/// log compacts in proportion to what it keeps rather than by doubling.
-const LOG_MIN_SLACK: usize = 4096;
+/// New entries between checks of the recent tail. Most frames die young, and
+/// a dead entry's `Weak` keeps its allocation (not its contents), which counts
+/// toward host-pressure major collections, so the tail is checked often. Each
+/// entry is checked once in the tail, so the cost per entry does not depend on
+/// this; re-reading every logged frame's count instead cost about 1% of a SHOW
+/// compilation in cache misses.
+const LOG_TAIL: usize = 256;
 
 struct WriteLog<T> {
     state: Mutex<LogState<T>>,
+    /// Bytes the entry buffer holds (see [`bookkeeping_bytes`]).
+    bytes: std::sync::atomic::AtomicUsize,
 }
 
 struct LogState<T> {
     /// (epoch written, storage). Entries from earlier epochs were visited by a
     /// completed minor collection and are discarded lazily.
     entries: Vec<(u64, Weak<T>)>,
-    /// Length at which `note` next compacts.
-    compact_at: usize,
+    /// Entries before this index were live when last checked.
+    settled: usize,
+    /// Length at which the whole log is checked again (and deduplicated).
+    full_at: usize,
     /// The epoch in which this log gave up, if it has not completed since.
     overflowed: Option<u64>,
 }
@@ -138,17 +167,25 @@ impl<T> WriteLog<T> {
         Self {
             state: Mutex::new(LogState {
                 entries: Vec::new(),
-                compact_at: LOG_MIN_SLACK,
+                settled: 0,
+                full_at: 4 * LOG_TAIL,
                 overflowed: None,
             }),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    fn account(&self, log: &LogState<T>) {
+        let bytes = log.entries.capacity() * std::mem::size_of::<(u64, Weak<T>)>();
+        self.bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn lock(&self) -> MutexGuard<'_, LogState<T>> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    fn note(&self, item: &Weak<T>, epoch: u64) {
+    fn note(&self, item: Weak<T>, epoch: u64) {
         let mut log = self.lock();
         if log.overflowed == Some(epoch) {
             return;
@@ -156,13 +193,17 @@ impl<T> WriteLog<T> {
         if log
             .entries
             .last()
-            .is_some_and(|(at, last)| *at == epoch && Weak::ptr_eq(last, item))
+            .is_some_and(|(at, last)| *at == epoch && Weak::ptr_eq(last, &item))
         {
             return;
         }
-        log.entries.push((epoch, item.clone()));
-        if log.entries.len() >= log.compact_at {
-            log.compact(epoch);
+        let capacity = log.entries.capacity();
+        log.entries.push((epoch, item));
+        if log.entries.len() - log.settled >= LOG_TAIL {
+            log.compact_tail(epoch);
+        }
+        if log.entries.capacity() != capacity {
+            self.account(&log);
         }
     }
 
@@ -188,33 +229,74 @@ impl<T> WriteLog<T> {
         if log.overflowed.is_some_and(|at| at < epoch) {
             log.overflowed = None;
         }
-        log.reset_slack();
+        log.settle();
+        self.account(&log);
         live
+    }
+
+    /// Drop every entry written up to `epoch`, once the collection that
+    /// visits them is past failing: their `Weak`s would otherwise keep dead
+    /// frames' allocations until the next check.
+    fn retire(&self, epoch: u64) {
+        let mut log = self.lock();
+        log.entries.retain(|(at, _)| *at > epoch);
+        log.settle();
+        self.account(&log);
     }
 }
 
 impl<T> LogState<T> {
-    fn compact(&mut self, epoch: u64) {
-        self.entries
-            .retain(|(at, item)| *at >= epoch && item.strong_count() > 0);
-        if self.entries.len() > LOG_HARD_LIMIT {
-            self.overflowed = Some(epoch);
-            self.entries = Vec::new();
+    /// Check the entries added since the last check; every so often (as the
+    /// log doubles) check and deduplicate the whole log.
+    fn compact_tail(&mut self, epoch: u64) {
+        if self.entries.len() >= self.full_at {
+            let mut seen = std::collections::HashSet::with_capacity(self.entries.len());
+            self.entries.retain(|(at, item)| {
+                *at >= epoch && item.strong_count() > 0 && seen.insert(item.as_ptr() as usize)
+            });
+            if self.entries.len() > LOG_HARD_LIMIT {
+                self.overflowed = Some(epoch);
+                self.entries = Vec::new();
+            }
+        } else {
+            let mut kept = self.settled;
+            for index in self.settled..self.entries.len() {
+                let (at, item) = &self.entries[index];
+                if *at >= epoch && item.strong_count() > 0 {
+                    self.entries.swap(kept, index);
+                    kept += 1;
+                }
+            }
+            self.entries.truncate(kept);
+            self.settled = kept;
+            return;
         }
-        self.reset_slack();
+        self.settle();
     }
 
-    fn reset_slack(&mut self) {
-        let live = self.entries.len();
-        self.compact_at = live + LOG_MIN_SLACK.max(live / 4);
-        if self.entries.capacity() > 4 * self.compact_at {
-            self.entries.shrink_to(self.compact_at);
+    /// Everything currently logged counts as checked.
+    fn settle(&mut self) {
+        let len = self.entries.len();
+        self.settled = len;
+        self.full_at = (2 * len).max(4 * LOG_TAIL);
+        if self.entries.capacity() > 2 * self.full_at {
+            self.entries.shrink_to(self.full_at);
         }
     }
 }
 
 static FRAMES: WriteLog<FrameCell> = WriteLog::new();
 static BODIES: WriteLog<BytecodeFunction> = WriteLog::new();
+
+/// Host bytes held by the write logs. They are bookkeeping that every minor
+/// collection empties, not private-closure state a major collection could
+/// release, so host-pressure accounting leaves them out: counting them made
+/// closure-heavy code request extra major collections (21 -> 24 on a
+/// 900k-closure loop; one more landing in a warm SHOW compilation).
+pub(super) fn bookkeeping_bytes() -> usize {
+    use std::sync::atomic::Ordering::Relaxed;
+    FRAMES.bytes.load(Relaxed) + BODIES.bytes.load(Relaxed)
+}
 
 /// `EGCL_GC_REMEMBERED_CAPTURES=0` traces every capture on every minor
 /// collection, as before bliss-gg3i1.7.9.
@@ -280,7 +362,11 @@ pub(super) fn scan_remembered_captures(visit: &mut dyn FnMut(*mut EgclVal)) {
         super::visit_env_frame_slots(&mut frame.gc_borrow(), visit);
     }
     if kind == ExternalRootScanKind::MinorRelocate {
+        // Relocation runs after evacuation, when this collection can no
+        // longer fail and be retried: what it visited is now old.
         *snapshot = None;
+        FRAMES.retire(epoch);
+        BODIES.retire(epoch);
     }
 }
 
@@ -406,19 +492,19 @@ mod tests {
         // Dead entries never make the log give up, however many there are.
         for i in 0..(LOG_HARD_LIMIT as u32 * 2) {
             let item = Arc::new(i);
-            log.note(&Arc::downgrade(&item), epoch);
+            log.note(Arc::downgrade(&item), epoch);
         }
         assert!(!log.overflowed_at(epoch));
         // Entries from earlier epochs were covered by a completed collection.
         let earlier: Vec<_> = (0..1000u32).map(Arc::new).collect();
         for item in &earlier {
-            log.note(&Arc::downgrade(item), epoch - 1);
+            log.note(Arc::downgrade(item), epoch - 1);
         }
         assert!(log.live_since(epoch).is_empty());
         // Too many live entries in one epoch make it give up for that epoch.
         let live: Vec<_> = (0..2 * LOG_HARD_LIMIT as u32).map(Arc::new).collect();
         for item in &live {
-            log.note(&Arc::downgrade(item), epoch);
+            log.note(Arc::downgrade(item), epoch);
         }
         assert!(log.overflowed_at(epoch));
         assert!(log.live_since(epoch).is_empty());
@@ -426,9 +512,9 @@ mod tests {
         // The completed (full) collection ends the epoch.
         assert!(log.live_since(epoch + 1).is_empty());
         assert!(!log.overflowed_at(epoch + 1));
-        log.note(&Arc::downgrade(&live[0]), epoch + 1);
-        log.note(&Arc::downgrade(&live[1]), epoch + 1);
-        log.note(&Arc::downgrade(&live[0]), epoch + 1);
+        log.note(Arc::downgrade(&live[0]), epoch + 1);
+        log.note(Arc::downgrade(&live[1]), epoch + 1);
+        log.note(Arc::downgrade(&live[0]), epoch + 1);
         assert_eq!(
             log.live_since(epoch + 1).len(),
             2,
