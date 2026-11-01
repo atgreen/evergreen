@@ -1412,12 +1412,12 @@ fn typep_class_matches(class: u16, v: EgclVal) -> bool {
 /// tree-walked (SBCL's CALC-…-HASH functions and PARSE-<FUNCTION>;
 /// bliss-gg3i1.7.16).
 fn lambda_form_application(op: EgclVal, args: EgclVal) -> LowerResult<Option<EgclVal>> {
-    // Root the operator and arguments before anything here can allocate.
+    // Root the operator and arguments before anything here can allocate; the
+    // head is matched by name so nothing allocates until all parts are rooted.
     egcl_rt::rooted!(op = op);
     egcl_rt::rooted!(args = list_to_vec(args));
-    let lambda = resolve_sym("LAMBDA");
     let (head, tail) = cp(*op);
-    if !head.is_symbol() || lambda != Some(head) || !tail.is_cons() {
+    if !head.is_symbol() || sym_name(head) != "LAMBDA" || !tail.is_cons() {
         return Ok(None);
     }
     let (params, body) = cp(tail);
