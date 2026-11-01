@@ -4306,6 +4306,26 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
+        "EGCL::PUT-SYMBOL-PROPERTY" => Some(|_operator, args, _env| {
+            // Store primitive for bytecode-lowered `(setf (get symbol indicator
+            // [default]) value)` (bliss-gg3i1.7.16). Arguments arrive evaluated
+            // in the place's own order -- symbol, indicator, value -- and the
+            // value is returned. Same TYPE-ERROR and store as the tree-walker's
+            // SETF GET arm.
+            let sym = args.first().copied().unwrap_or(NIL);
+            let key = args.get(1).copied().unwrap_or(NIL);
+            egcl_rt::rooted!(val = args.get(2).copied().unwrap_or(NIL));
+            if !sym.is_symbol() {
+                return Err(EgclError::TypeError {
+                    datum: sym,
+                    expected: "SYMBOL".to_string(),
+                });
+            }
+            // symbol_plist_put may cons a new pair: return the rooted value.
+            symbol_plist_put(sym, key, *val);
+            Ok(*val)
+        }),
+
         "EGCL-INTERNAL:%METHOD-CONTEXT"
         | "EGCL-INTERNAL::%METHOD-CONTEXT"
         | "EGCL-INTERNAL:%METHOD-CONTINUE"
