@@ -211,6 +211,9 @@ pub mod type_id {
     pub const PYTHON_OBJECT: u8 = 0x1E;
     /// Opaque PRNG seed and initialization flag: two untraced raw words.
     pub const RANDOM_STATE: u8 = 0x1F;
+    /// Heap lexical environment: `[count(raw), parent, slots...]` (Backpack,
+    /// bliss-gg3i1.7.15.4; see `crate::lexenv`).
+    pub const LEXENV: u8 = 0x20;
 }
 
 /// Persistent flags in word 1 of a MUTEX body.

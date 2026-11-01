@@ -459,6 +459,15 @@ pub enum Opcode {
     /// is the store's result, and a miss writes nothing and the caller
     /// branches to the retained store call.
     TryVecSet,
+    /// Heap lexical environment slot read (Backpack): `args[0]` is an
+    /// environment the compile-time rewrite laid out; follow
+    /// `AuxData::EnvSlot.depth` parent links and load slot `idx`. The rewrite
+    /// guarantees the shape and that the binding is made before any read, so
+    /// the access is a plain load chain with no check.
+    EnvSlotRef,
+    /// Heap lexical environment slot write: `args = [value, environment]`,
+    /// addressed as for `EnvSlotRef`, stored through the reference barrier.
+    EnvSlotSet,
 }
 
 impl Opcode {
@@ -538,6 +547,11 @@ pub enum AuxData {
     FieldOffset(u32),
     /// Index in the retained root bytecode body's environment name table.
     EnvironmentName(u16),
+    /// A heap-environment slot: parent links to follow, then the slot index.
+    EnvSlot {
+        depth: u8,
+        idx: u16,
+    },
     /// Exact absent function-cell binding required by a builtin expansion.
     /// The address points into a pinned symbol; comparison does not dereference
     /// a movable callable. This guard stays ordered with calls and stores.

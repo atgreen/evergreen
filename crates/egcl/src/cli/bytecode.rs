@@ -178,6 +178,9 @@ mod call_table_funcall;
 #[path = "bytecode/call_table_native_s390x.rs"]
 mod call_table_native;
 mod closure_templates;
+pub(super) mod heap_env;
+#[cfg(test)]
+mod heap_env_tests;
 mod mapping_transforms;
 mod method_context_use;
 mod quoted_funcall;
@@ -654,8 +657,11 @@ unsafe fn trace_bytecode_graph(
 
 fn trace_lexical_keys(code: &[Instr], names: &[String], visit: &mut dyn FnMut(*mut EgclVal)) {
     for instruction in code {
-        if let Instr::LoadEnvVar(index) | Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) =
-            instruction
+        if let Instr::LoadEnvVar(index)
+        | Instr::StoreEnvVar(index)
+        | Instr::DefineEnvVar(index)
+        | Instr::EnvRef { name: index, .. }
+        | Instr::EnvSet { name: index, .. } = instruction
         {
             if let Some(key) = names.get(*index as usize) {
                 lexical_identity::trace(key, visit);
@@ -1243,7 +1249,10 @@ fn closure_body_has_acyclic_owner_lease(body: &BytecodeFunction) -> bool {
         | Instr::BindSpecial(sym) => !egcl_rt::symbols::is_uninterned(*sym),
         // These instructions retain executable forms/control metadata or can
         // manufacture code edges beyond the immutable constant graph above.
-        Instr::EvalHost(_) | Instr::MakeClosureEnv(_) | Instr::MakeClosure { .. } => false,
+        Instr::EvalHost(_)
+        | Instr::MakeClosureEnv(_)
+        | Instr::MakeClosure { .. }
+        | Instr::MakeEnvClosure { .. } => false,
         _ => true,
     })
 }
@@ -2120,6 +2129,14 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
     let mut out = disasm_header(sym, bf);
     out.push_str("; T0 — tree-walked forms compiled to stack bytecode; call sites show the\n");
     out.push_str("; runtime operand-type profile (fix/float/other) that drives tier-up.\n");
+    // The compile-time name table of the heap environments this body reaches
+    // (Backpack): which variable each (environment, depth, slot) holds.
+    for (local, depth, idx, name) in heap_env::slot_names(bf) {
+        let _ = writeln!(
+            out,
+            "; heap environment in local {local}, depth {depth}, slot {idx}: {name}"
+        );
+    }
     let func_ptr = Arc::as_ptr(bf) as usize;
     for (pc, instr) in bf.code.iter().enumerate() {
         // Render the instruction with symbol NAMES substituted for the raw sym
@@ -2158,6 +2175,11 @@ fn format_bytecode_listing(sym: u32, bf: &Arc<BytecodeFunction>) -> String {
                 .unwrap_or_default(),
             Instr::Br(t) | Instr::BrIfFalse(t) | Instr::BrIfTrue(t) => format!("→ {t}"),
             Instr::Go { target_bcp, .. } => format!("→ {target_bcp}"),
+            Instr::EnvRef { name, .. } | Instr::EnvSet { name, .. } => bf
+                .names
+                .get(usize::from(*name))
+                .map(|name| lexical_identity::name(name).to_owned())
+                .unwrap_or_default(),
             _ => String::new(),
         };
         if ann.is_empty() {
@@ -5758,7 +5780,7 @@ impl<'e> Lowerer<'e> {
     /// created by a `MakeClosure` that this scan already inspects.
     fn code_may_reach_control(&self, start: usize, blocks: &[&str], tags: &[&str]) -> bool {
         self.code[start..].iter().any(|instr| match instr {
-            Instr::MakeClosure { func, .. } => self
+            Instr::MakeClosure { func, .. } | Instr::MakeEnvClosure { func, .. } => self
                 .nested_functions
                 .get(*func as usize)
                 .is_none_or(|nested| bf_may_reach_control(nested, blocks, tags)),
@@ -11882,6 +11904,14 @@ fn compile_function_forcing_boxed(
 
     method_context_use::elide_helper_values(&mut function);
 
+    // A function that captures nothing from outside is the root of its own
+    // compilation unit; its capturing closures are rewritten with it. (A body
+    // compiled with `captures` is a closure of an enclosing unit or reads a
+    // live frame, so it keeps the name-keyed frames.)
+    if captures.is_empty() {
+        heap_env::rewrite_unit(&mut function);
+    }
+
     Some(function)
 }
 
@@ -12295,7 +12325,7 @@ fn compile_thunk_forcing_boxed(
         return None;
     }
     lo.emit(Instr::Return);
-    Some(BytecodeFunction {
+    let mut function = BytecodeFunction {
         self_call_sites: Vec::new(),
         notinline_sites: lo.notinline_sites,
         code: lo.code,
@@ -12319,7 +12349,10 @@ fn compile_thunk_forcing_boxed(
         variadic: false,
         binder_cache: Default::default(),
         closure_template: Default::default(),
-    })
+    };
+    // A top-level form is a compilation unit of its own.
+    heap_env::rewrite_unit(&mut function);
+    Some(function)
 }
 
 // ── BFASL Bytecode Unit serialization ─────────────────────────────
@@ -12366,7 +12399,10 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0302: length-only NIL array storage (tag 32).
 // 0x0303: typed FUNCTION-namespace lexical-name references.
 // 0x0304: structure slot, predicate and constructor opcodes 0x48-0x4b.
-const BBU_BYTECODE_VERSION: u16 = 0x0304;
+// 0x0305: heap lexical environments (Backpack): MAKE_ENV 0x4c, ENV_REF 0x4d,
+// ENV_SET 0x4e, CLOSURE_ENV 0x4f, MAKE_ENV_CLOSURE 0x50. Older units carry
+// only the name-keyed frame opcodes and still load.
+const BBU_BYTECODE_VERSION: u16 = 0x0305;
 const BBU_FUNCTION_NAME_REF: u32 = 1 << 31;
 mod array_constants;
 mod make_load_form;
@@ -13140,6 +13176,12 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
         Instr::MakeClosureEnv(_) => return None,
         // opcode + u32 global function index + u16 capture indicator.
         Instr::MakeClosure { .. } => 7,
+        // Heap environments (0x0305): opcode + u16 size; opcode + u8 depth +
+        // u16 index + u32 lexical name; opcode; opcode + u32 function + u16.
+        Instr::MakeEnv(_) => 3,
+        Instr::EnvRef { .. } | Instr::EnvSet { .. } => 8,
+        Instr::ClosureEnv => 1,
+        Instr::MakeEnvClosure { .. } => 7,
         Instr::AllocCons => 1,
         Instr::TypeP(_) => 3, // opcode byte + u16 type-class
         // opcode + u32 name literal + u32 slot literal + u16 index hint.
@@ -13514,6 +13556,29 @@ fn serialize_bbu_function(
                 // env frame. Individual capture slots are not used (the whole
                 // heap frame is captured), so no slot payload follows.
                 put_u16(&mut code, u16::from(*capture_env));
+            }
+            Instr::MakeEnv(size) => {
+                put_u8(&mut code, 0x4c);
+                put_u16(&mut code, *size);
+            }
+            Instr::EnvRef { depth, idx, name } | Instr::EnvSet { depth, idx, name } => {
+                put_u8(
+                    &mut code,
+                    if matches!(instr, Instr::EnvRef { .. }) {
+                        0x4d
+                    } else {
+                        0x4e
+                    },
+                );
+                put_u8(&mut code, *depth);
+                put_u16(&mut code, *idx);
+                put_u32(&mut code, pool.lexical_name(bf.names.get(*name as usize)?)?);
+            }
+            Instr::ClosureEnv => put_u8(&mut code, 0x4f),
+            Instr::MakeEnvClosure { func, nflat } => {
+                put_u8(&mut code, 0x50);
+                put_u32(&mut code, *nested_global.get(*func as usize)?);
+                put_u16(&mut code, *nflat);
             }
             Instr::EvalHost(idx) | Instr::MakeClosureEnv(idx) if image => {
                 put_u8(
@@ -15560,6 +15625,15 @@ fn validate_bbu_lexical_operands(
                 validate_bbu_lexical_name(constants, cursor.u32()?, version)?;
                 0
             }
+            // Heap environments (0x0305): depth u8 + index u16 + a debug name.
+            0x4d | 0x4e if version >= 0x0305 => {
+                cursor.take(3)?;
+                validate_bbu_lexical_name(constants, cursor.u32()?, version)?;
+                0
+            }
+            0x4c if version >= 0x0305 => 2,
+            0x4f if version >= 0x0305 => 0,
+            0x50 if version >= 0x0305 => 6,
             0x01 | 0x07 | 0x08 | 0x09 | 0x1c | 0x15 | 0x18 | 0x19 | 0x1a | 0x1f | 0x3f | 0x40
             | 0x2a | 0x46 | 0x47 => 4,
             0x02 | 0x03 | 0x1d | 0x13 | 0x10 | 0x42 => 2,
@@ -16694,6 +16768,30 @@ fn decode_bbu_function(
             0x2d => Instr::PopRestartCase,
             0x36 => Instr::PushEnvChild,
             0x37 => Instr::PopEnvChild,
+            0x4c if bytecode_version >= 0x0305 => Instr::MakeEnv(cursor.u16()?),
+            0x4d | 0x4e if bytecode_version >= 0x0305 => {
+                let depth = cursor.u8()?;
+                let idx = cursor.u16()?;
+                let name = bbu_lexical_key_from_values(constants, cursor.u32()?, bytecode_version)?;
+                let index = names.len();
+                if index > u16::MAX as usize {
+                    return Err(bbu_error("too many environment names"));
+                }
+                names.push(name);
+                let name = index as u16;
+                if opcode == 0x4d {
+                    Instr::EnvRef { depth, idx, name }
+                } else {
+                    Instr::EnvSet { depth, idx, name }
+                }
+            }
+            0x4f if bytecode_version >= 0x0305 => Instr::ClosureEnv,
+            // As for MAKE_CLOSURE, the operand holds the global function
+            // index until reconstruction maps it to the owner's local one.
+            0x50 if bytecode_version >= 0x0305 => Instr::MakeEnvClosure {
+                func: cursor.u32()?,
+                nflat: cursor.u16()?,
+            },
             0x3c..=0x3e => {
                 let opcode = encoded.code[starts.last().copied().unwrap() as usize];
                 let name = bbu_lexical_key_from_values(constants, cursor.u32()?, bytecode_version)?;
@@ -17275,7 +17373,7 @@ fn bf_free_control_exits(bf: &BytecodeFunction) -> Option<FreeControlExits> {
                 exits.tags.insert(bf.names.get(*name_idx as usize)?.clone());
             }
             Instr::MakeClosureEnv(_) | Instr::EvalHost(_) => return None,
-            Instr::MakeClosure { func, .. } => {
+            Instr::MakeClosure { func, .. } | Instr::MakeEnvClosure { func, .. } => {
                 let nested = bf.nested_functions.get(*func as usize)?;
                 created[*func as usize] = true;
                 let inner = bf_free_control_exits(nested)?;
@@ -17442,7 +17540,7 @@ fn native_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
     // T0 when such a closure can exit by name to a block/tag outside itself:
     // the interpreter gives it the creator's full captured control.
     for instr in &bf.code {
-        if let Instr::MakeClosure { func, .. } = instr {
+        if let Instr::MakeClosure { func, .. } | Instr::MakeEnvClosure { func, .. } = instr {
             if bf_has_free_control_exit(&bf.nested_functions[*func as usize]) {
                 return true;
             }
@@ -17454,7 +17552,7 @@ fn native_would_lose_captured_control(bf: &BytecodeFunction) -> bool {
     // Does any closure created here capture one of those blocks/tags?
     for instr in &bf.code {
         match instr {
-            Instr::MakeClosure { func, .. } => {
+            Instr::MakeClosure { func, .. } | Instr::MakeEnvClosure { func, .. } => {
                 if bf_escapes_to_control(
                     &bf.nested_functions[*func as usize],
                     &own_blocks,
@@ -18819,6 +18917,10 @@ fn verified_operand_stack_depths(func: &BytecodeFunction) -> Result<Vec<Option<u
             Instr::MemoryFence(_) => Some((0, 1)),
             Instr::SetValues(nvals) => Some((*nvals as u32, 1)),
             Instr::AllocCons => Some((2, 1)),
+            Instr::MakeEnv(_) | Instr::EnvRef { .. } => Some((1, 1)),
+            Instr::EnvSet { .. } => Some((2, 0)),
+            Instr::ClosureEnv => Some((0, 1)),
+            Instr::MakeEnvClosure { nflat, .. } => Some((u32::from(*nflat) + 1, 1)),
             Instr::Dup => Some((1, 2)),
             Instr::CallNamed { nargs, .. } => Some((*nargs as u32, 1)),
             Instr::PushHandlerBind { hb } => {
@@ -19568,7 +19670,7 @@ fn load_bbu_definitions(
         let mut nested_functions: Vec<Arc<BytecodeFunction>> = Vec::new();
         let mut global_to_local: HashMap<u32, u32> = HashMap::new();
         for instr in &mut function.code {
-            if let Instr::MakeClosure { func, .. } = instr {
+            if let Instr::MakeClosure { func, .. } | Instr::MakeEnvClosure { func, .. } = instr {
                 let global = *func;
                 if global as usize >= index {
                     return Err(bbu_error(
@@ -20283,6 +20385,17 @@ fn make_env_frame(func: &BytecodeFunction, parent: Arc<FrameCell>) -> Option<Arc
         parent: Some(parent),
     });
     Some(frame)
+}
+
+/// The error for a heap-environment slot read before its binding was made
+/// (or a malformed address): UNBOUND-VARIABLE naming the variable.
+fn heap_env_unbound(function: &BytecodeFunction, name: u16) -> EgclError {
+    let symbol = function
+        .names
+        .get(usize::from(name))
+        .and_then(|name| lexical_identity::resolve(name))
+        .unwrap_or(NIL);
+    EgclError::UnboundVariable(symbol)
 }
 
 /// Enter a fresh child heap `EnvFrame` (`PushEnvChild`). The interpreter and
@@ -21298,6 +21411,70 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // exits resolve against the tokens visible where it was created,
                 // not the dynamic stack where it is later called (bliss-4u5u).
                 acts[top_idx].push_op(closure);
+            }
+            // Heap lexical environments (Backpack; see `heap_env`). The
+            // environments are ordinary values in this activation's slots.
+            Instr::MakeEnv(size) => {
+                let parent = acts[top_idx].pop_op();
+                match egcl_rt::lexenv::make(parent, usize::from(size)) {
+                    Some(made) => acts[top_idx].push_op(made),
+                    None => initiate_unwind(
+                        acts,
+                        stack,
+                        env,
+                        Pending::Propagate(EgclError::Internal(
+                            egcl_rt::gc::allocation_failure_message("a lexical environment"),
+                        )),
+                    )?,
+                }
+            }
+            Instr::EnvRef { depth, idx, name } => {
+                let environment = acts[top_idx].pop_op();
+                heap_env::count_access(depth);
+                match egcl_rt::lexenv::load(environment, depth, idx) {
+                    Some(value) if value != egcl_rt::value::UNBOUND => acts[top_idx].push_op(value),
+                    _ => {
+                        let error = heap_env_unbound(&acts[top_idx].func, name);
+                        initiate_unwind(acts, stack, env, Pending::Propagate(error))?;
+                    }
+                }
+            }
+            Instr::EnvSet { depth, idx, name } => {
+                let environment = acts[top_idx].pop_op();
+                heap_env::count_access(depth);
+                let value = acts[top_idx].pop_op();
+                if !egcl_rt::lexenv::store(environment, depth, idx, value) {
+                    let error = heap_env_unbound(&acts[top_idx].func, name);
+                    initiate_unwind(acts, stack, env, Pending::Propagate(error))?;
+                }
+            }
+            Instr::ClosureEnv => {
+                let captured = heap_env::captured_env(acts[top_idx].env_frame.as_ref());
+                acts[top_idx].push_op(captured);
+            }
+            Instr::MakeEnvClosure { func, nflat } => {
+                let nested = acts[top_idx].func.nested_functions[func as usize].clone();
+                let act = &mut acts[top_idx];
+                let base = act.n_locals + act.sp_top - nflat;
+                // Copy the values out; `make_closure` roots its own copy.
+                let values: Vec<EgclVal> = (0..nflat)
+                    .map(|i| unsafe { slot_get(act.frame, base + i) })
+                    .collect();
+                for _ in 0..nflat {
+                    act.pop_op();
+                }
+                let parent = act.pop_op();
+                match heap_env::make_closure(&nested, parent, &values, env) {
+                    Some(closure) => acts[top_idx].push_op(closure),
+                    None => initiate_unwind(
+                        acts,
+                        stack,
+                        env,
+                        Pending::Propagate(EgclError::Internal(
+                            egcl_rt::gc::allocation_failure_message("a closure environment"),
+                        )),
+                    )?,
+                }
             }
             Instr::AllocCons => {
                 let mut cdr = acts[top_idx].pop_op();
@@ -29695,6 +29872,84 @@ fn emit_native(
                 emit_c2i_helper_call(&mut c);
                 push_rax(&mut c);
             }
+            // Heap lexical environments (Backpack): helper calls taking the
+            // environment value and (depth, idx); no name work.
+            Instr::MakeEnv(size) => {
+                pop_into(&mut c, 7, false); // parent -> rdi
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, size
+                c.extend_from_slice(&u64::from(*size).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_make_env as extern "C" fn(u64, u64) -> u64 as usize
+                        as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::EnvRef { depth, idx, name } => {
+                pop_into(&mut c, 7, false); // environment -> rdi
+                c.extend_from_slice(&[0x48, 0xBE]); // mov rsi, packed operands
+                c.extend_from_slice(&heap_env::pack(*depth, *idx, *name).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, retained names
+                c.extend_from_slice(&(std::ptr::from_ref(&*env_names) as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_env_ref
+                        as extern "C" fn(u64, u64, *const NativeEnvNames) -> u64
+                        as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::EnvSet { depth, idx, name } => {
+                pop_into(&mut c, 7, false); // environment -> rdi
+                pop_into(&mut c, 6, false); // value -> rsi
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, packed operands
+                c.extend_from_slice(&heap_env::pack(*depth, *idx, *name).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB9]); // mov rcx, retained names
+                c.extend_from_slice(&(std::ptr::from_ref(&*env_names) as u64).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_env_set
+                        as extern "C" fn(u64, u64, u64, *const NativeEnvNames)
+                        as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+            }
+            Instr::ClosureEnv => {
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_closure_env as extern "C" fn() -> u64 as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                push_rax(&mut c);
+            }
+            Instr::MakeEnvClosure { func, nflat } => {
+                let nested =
+                    bf.nested_functions.get(*func as usize)? as *const Arc<BytecodeFunction>;
+                let operands = 8 * (i32::from(*nflat) + 1);
+                c.extend_from_slice(&[0x48, 0xBF]); // mov rdi, retained nested body
+                c.extend_from_slice(&(nested as u64).to_le_bytes());
+                c.extend_from_slice(&[0x49, 0x8D, 0xB7]); // lea rsi, [r15 - operands]
+                c.extend_from_slice(&(-operands).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, nflat
+                c.extend_from_slice(&u64::from(*nflat).to_le_bytes());
+                c.extend_from_slice(&[0x48, 0xB8]);
+                c.extend_from_slice(
+                    &(heap_env::c2i_heap_make_env_closure
+                        as extern "C" fn(*const Arc<BytecodeFunction>, *const u64, u64) -> u64
+                        as usize as u64)
+                        .to_le_bytes(),
+                );
+                emit_c2i_helper_call(&mut c);
+                c.extend_from_slice(&[0x49, 0x81, 0xEF]); // sub r15, operands
+                c.extend_from_slice(&operands.to_le_bytes());
+                push_rax(&mut c);
+            }
             Instr::EvalHost(index) | Instr::MakeClosureEnv(index) => {
                 // Like Const: the form is a movable heap cons — load it through
                 // the GC-rewritten constants slot, never as a baked immediate.
@@ -30940,6 +31195,11 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
+                    | Instr::MakeEnv(_)
+                    | Instr::EnvRef { .. }
+                    | Instr::EnvSet { .. }
+                    | Instr::ClosureEnv
+                    | Instr::MakeEnvClosure { .. }
             )
         })
     {
@@ -33806,6 +34066,8 @@ mod direct_call_invalidation_tests {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Exercises the name-keyed captured-frame path.
+        let _legacy = super::heap_env::legacy_frames_for_test();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(
@@ -35937,6 +36199,8 @@ fn capturing_local_native_frame_preserves_a_relocated_capture() {
     let _lock = super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // Exercises the name-keyed captured-frame path.
+    let _legacy = heap_env::legacy_frames_for_test();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::read_eval_all_env(
@@ -36035,6 +36299,19 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
             .any(|op| matches!(op, Instr::CallNamed { sym, .. }
         if sym_name(EgclVal::from_symbol_index(*sym)) == "FUNCALL"))
     );
+    // A heap-environment closure body (Backpack) reads MASK from the
+    // environment its closure carries; run bare, it would have none. Its
+    // native execution is covered with real closures by heap_env_cli.
+    if matches!(worker.code.first(), Some(Instr::ClosureEnv)) {
+        assert!(
+            worker
+                .code
+                .iter()
+                .any(|op| matches!(op, Instr::EnvRef { name, .. }
+                    if worker.names[usize::from(*name)] == "MASK"))
+        );
+        return;
+    }
     use native_transfer_entry::{TransferCode, take_native_fallback_count};
     egcl_rt::rooted!(_worker = ActiveBytecodeRoot::new(worker));
     let native = TransferCode::compile_mapped_for_test(Arc::clone(worker))

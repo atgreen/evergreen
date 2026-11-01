@@ -51,6 +51,7 @@ pub(crate) mod gc_soft_dirty;
 pub mod host_memory;
 pub mod jit;
 pub mod jit_debug;
+pub mod lexenv;
 pub mod lock_order;
 
 // ── Thread runtime ────────────────────────────────────────────────

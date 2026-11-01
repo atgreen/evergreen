@@ -23,10 +23,12 @@ fn compile_and_call(source: &str, portable: bool, expected: i64, env: &mut Env) 
     );
     let function = compile_thunk(*form, env, portable).expect("top-level thunk must compile");
     assert!(
-        function
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, Instr::MakeClosure { .. })),
+        function.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instr::MakeClosure { .. } | Instr::MakeEnvClosure { .. }
+            )
+        }),
         "an escaping callback must be emitted as nested bytecode"
     );
     require_compiled_callbacks(&function);

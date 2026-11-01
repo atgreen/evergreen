@@ -123,6 +123,32 @@ pub enum Instr {
     /// and write the enclosing lexical bindings (portable `flet`/`labels` locals
     /// and capturing lambdas); otherwise it is a noncapturing closure.
     MakeClosure { func: u32, capture_env: bool },
+
+    // ── Heap lexical environments (Backpack, bliss-gg3i1.7.15.4) ──
+    //
+    // Emitted only by the heap-environment rewrite of an eligible compilation
+    // unit (see the lowerer's `heap_env` module). An environment is an
+    // ordinary heap value (`crate::lexenv`): the unit keeps each one in a local
+    // slot, so no tier holds hidden environment state, and a slot is addressed
+    // by `(depth, idx)` from the environment value on the operand stack. The
+    // `name` operands index `names` for debugging only; no tier reads them to
+    // find a binding.
+    /// Pop a parent environment (or NIL) and push a fresh environment of
+    /// `size` unbound slots whose parent it is.
+    MakeEnv(u16),
+    /// Pop an environment, follow `depth` parent links, and push slot `idx`.
+    EnvRef { depth: u8, idx: u16, name: u16 },
+    /// Pop an environment and then a value; store the value into slot `idx`
+    /// of the environment `depth` parent links up (through the write barrier).
+    EnvSet { depth: u8, idx: u16, name: u16 },
+    /// Push the environment the running closure captured, or NIL when it has
+    /// none. Emitted once, in the prologue of a closure body that reads one.
+    ClosureEnv,
+    /// Pop `nflat` values (pushed in order) and then a parent environment (or
+    /// NIL), and push a closure of nested function `func` whose captured
+    /// environment is a fresh `[parent, values...]` environment, or the parent
+    /// itself when `nflat` is zero.
+    MakeEnvClosure { func: u32, nflat: u16 },
     /// Discard the top of the operand stack.
     Pop,
     /// Duplicate the top of the operand stack.

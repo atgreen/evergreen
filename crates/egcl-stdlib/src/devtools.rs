@@ -3079,6 +3079,7 @@ fn heap_type_name(type_id: u8) -> &'static str {
         0x14 => "PATHNAME",
         0x15 => "READTABLE",
         0x16 => "CONDITION",
+        0x20 => "LEXICAL-ENVIRONMENT",
         _ => "UNKNOWN-HEAP-OBJECT",
     }
 }
