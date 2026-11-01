@@ -35808,6 +35808,7 @@ impl DynBind {
 
     /// Take ownership of a binding that is already in effect (one a
     /// deoptimizing native frame established), restoring `saved` on drop.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn adopt(idx: u32, saved: Option<EgclVal>) -> Self {
         DynBind { idx, saved }
     }
