@@ -234,6 +234,48 @@ extern "C" fn set_svref<const C: bool>(vector: u64, i: u64, value: u64) -> u64 {
     })
 }
 
+/// `(setf (car cons) value)` / `(setf (cdr cons) value)`, compiled as
+/// EGCL::SET-CAR / EGCL::SET-CDR: the value. The store goes through the write
+/// barrier exactly as `store_cons_field` does; anything but a plain cons misses
+/// so the general path signals (bliss-gg3i1.7.13).
+fn set_cons_field<const C: bool>(cons: u64, value: u64, car: bool) -> u64 {
+    let cons = EgclVal(cons);
+    if !cons.is_cons() {
+        return MISS;
+    }
+    // SAFETY: a live cons.
+    let (head, tail) = unsafe {
+        let cell = &*(cons.as_ptr() as *const egcl_rt::object::ConsCell);
+        (cell.car, cell.cdr)
+    };
+    // An interpreter closure is physically `(EGCL::CLOSURE . id)` and must not
+    // be stored into; leave any (symbol . fixnum) cons to the general path,
+    // which tells the two apart.
+    if head.is_symbol() && tail.is_fixnum() {
+        return MISS;
+    }
+    let value = EgclVal(value);
+    // SAFETY: a live cons; nothing allocates between the check and the store.
+    unsafe {
+        let cell = cons.as_ptr() as *mut egcl_rt::object::ConsCell;
+        let slot = if car {
+            std::ptr::addr_of_mut!((*cell).car)
+        } else {
+            std::ptr::addr_of_mut!((*cell).cdr)
+        };
+        egcl_rt::gc::store_ref(slot, value);
+    }
+    single::<C>(value)
+}
+
+extern "C" fn set_car<const C: bool>(cons: u64, value: u64) -> u64 {
+    set_cons_field::<C>(cons, value, true)
+}
+
+extern "C" fn set_cdr<const C: bool>(cons: u64, value: u64) -> u64 {
+    set_cons_field::<C>(cons, value, false)
+}
+
 /// `(gethash key table)` where the second value is discarded.
 extern "C" fn gethash2<const C: bool>(key: u64, table: u64) -> u64 {
     guarded(
@@ -398,6 +440,8 @@ fn table() -> Vec<(&'static str, u8, Entry, bool)> {
         ("SVREF", 2, entry!(svref, Helper2), false),
         ("EGCL::SET-AREF", 3, entry!(set_aref, Helper3), false),
         ("EGCL::SET-SVREF", 3, entry!(set_svref, Helper3), false),
+        ("EGCL::SET-CAR", 2, entry!(set_car, Helper2), false),
+        ("EGCL::SET-CDR", 2, entry!(set_cdr, Helper2), false),
         ("GETHASH", 2, entry!(gethash2, Helper2), true),
         ("GETHASH", 3, entry!(gethash3, Helper3), true),
         ("=", 2, entry!(num_eq, Helper2), false),
