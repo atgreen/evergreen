@@ -20724,6 +20724,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
             }
             Instr::LoadEnvVar(name_idx) => {
+                super::env_counts::bump(super::env_counts::Counter::NameOps, 1);
                 let name = acts[top_idx].func.names[name_idx as usize].clone();
                 let ef = acts[top_idx]
                     .env_frame
@@ -20743,6 +20744,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
             }
             Instr::StoreEnvVar(name_idx) => {
+                super::env_counts::bump(super::env_counts::Counter::NameOps, 1);
                 let name = acts[top_idx].func.names[name_idx as usize].clone();
                 let v = acts[top_idx].pop_op();
                 let ef = acts[top_idx]
@@ -20752,6 +20754,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 Env::set_lexical_frame(&ef, &name, v);
             }
             Instr::DefineEnvVar(name_idx) => {
+                super::env_counts::bump(super::env_counts::Counter::NameOps, 1);
                 let name = acts[top_idx].func.names[name_idx as usize].clone();
                 let v = acts[top_idx].pop_op();
                 let ef = acts[top_idx]
@@ -22736,6 +22739,7 @@ fn stash_native_error(error: EgclError) {
 }
 
 extern "C" fn c2i_load_env(names: *const NativeEnvNames, name_index: u64) -> u64 {
+    super::env_counts::bump(super::env_counts::Counter::NameOps, 1);
     // SAFETY: emitted code retains its boxed name table through its code owner,
     // including OSR entries and retired direct callees.
     let Some(resolved) = (unsafe { &*names }).get(name_index) else {
@@ -22766,6 +22770,7 @@ extern "C" fn c2i_load_env(names: *const NativeEnvNames, name_index: u64) -> u64
 }
 
 extern "C" fn c2i_store_env(names: *const NativeEnvNames, name_index: u64, value: u64) {
+    super::env_counts::bump(super::env_counts::Counter::NameOps, 1);
     // SAFETY: emitted code retains its boxed name table through its code owner,
     // including OSR entries and retired direct callees.
     let Some(resolved) = (unsafe { &*names }).get(name_index) else {
@@ -22793,6 +22798,7 @@ extern "C" fn c2i_store_env(names: *const NativeEnvNames, name_index: u64, value
 }
 
 extern "C" fn c2i_define_env(names: *const NativeEnvNames, name_index: u64, value: u64) {
+    super::env_counts::bump(super::env_counts::Counter::NameOps, 1);
     // SAFETY: emitted code retains its boxed name table through its code owner,
     // including OSR entries and retired direct callees.
     let Some(resolved) = (unsafe { &*names }).get(name_index) else {

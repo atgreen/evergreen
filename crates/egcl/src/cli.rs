@@ -27,6 +27,7 @@ mod structure_subtype;
 use structure_subtype::raw_structure_boolean_subtypep;
 mod class_protocol;
 mod control_payload;
+mod env_counts;
 mod evaluated_builtins;
 pub mod events;
 mod generic_binding;
@@ -12221,6 +12222,7 @@ impl Env {
                     return Some(*value);
                 }
                 current = frame.parent.clone();
+                env_counts::bump(env_counts::Counter::NameHops, 1);
             }
             return None;
         }
@@ -12241,6 +12243,7 @@ impl Env {
                     return true;
                 }
                 current = frame.parent.clone();
+                env_counts::bump(env_counts::Counter::NameHops, 1);
             }
             return false;
         }
@@ -12326,6 +12329,7 @@ impl Env {
             }
             let parent = borrowed.parent.clone();
             drop(borrowed);
+            env_counts::bump(env_counts::Counter::NameHops, 1);
             cur = parent;
         }
         None
@@ -12338,6 +12342,7 @@ impl Env {
         }
         let parent = borrowed.parent.clone();
         drop(borrowed);
+        env_counts::bump(env_counts::Counter::NameHops, 1);
         parent.and_then(|parent| Self::lookup_symbol_frame(&parent, symbol_index))
     }
 
@@ -12365,6 +12370,7 @@ impl Env {
             let parent = borrowed.parent.clone();
             drop(borrowed);
             if let Some(parent) = parent {
+                env_counts::bump(env_counts::Counter::NameHops, 1);
                 return Self::set_resolved_frame_var(&parent, name, symbol_index, val);
             }
         }
@@ -12401,6 +12407,7 @@ impl Env {
             let parent = borrowed.parent.clone();
             drop(borrowed);
             if let Some(parent) = parent {
+                env_counts::bump(env_counts::Counter::NameHops, 1);
                 return Self::set_symbol_frame_var(&parent, symbol_index, val);
             }
         }
@@ -24371,6 +24378,24 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 egcl_rt::rooted!(b = EgclVal::from_fixnum(before as i64));
                 egcl_rt::rooted!(a = EgclVal::from_fixnum(after as i64));
                 return Ok(vec_to_list(&[*b, *a]));
+            }
+            "EGCL::%ENV-ACCESS-COUNTS" => {
+                // (egcl::%env-access-counts [on]) → this thread's captured-
+                // environment access counts (Backpack stage 0): with an
+                // argument, T resets and enables counting and NIL disables it.
+                // `env_counts::Counter` gives the list order.
+                if cdr.is_cons() {
+                    let on = eval_form(cp(cdr).0, env)?;
+                    env_counts::set_enabled(!on.is_nil());
+                }
+                let counts = env_counts::snapshot();
+                egcl_rt::rooted!(
+                    values = counts
+                        .iter()
+                        .map(|&count| EgclVal::from_fixnum(count.min(1 << 60) as i64))
+                        .collect::<Vec<_>>()
+                );
+                return Ok(vec_to_list(&values));
             }
             "EGCL::%BC-REGISTRY-SIZES" => {
                 // (egcl::%bc-registry-sizes) → (bytecode native generations):

@@ -38,6 +38,7 @@ pub(super) fn access(args: &[EgclVal], store: bool) -> Result<EgclVal, EgclError
     let index = usize::try_from(args[1].as_fixnum()).map_err(|_| invalid_capture())?;
     let name = owner.body.names.get(index).ok_or_else(invalid_capture)?;
     let frame = closure_captured_env(args[0]).ok_or_else(invalid_capture)?;
+    crate::cli::env_counts::bump(crate::cli::env_counts::Counter::NameOps, 1);
     let symbol = egcl_rt::symbols::find_index(name);
     if store {
         // The existing Env mutation protocol owns the write barrier and shared
@@ -96,6 +97,7 @@ pub(super) unsafe fn leaf(
             let index = usize::try_from(args[1].as_fixnum()).ok()?;
             let name = owner.body.names.get(index)?;
             let symbol = owner.leaf_symbol(index);
+            crate::cli::env_counts::bump(crate::cli::env_counts::Counter::NameOps, 1);
             let answer = if store {
                 let updated = if lexical_identity::encoded(name) {
                     Env::set_lexical_frame(&frame, name, args[2])

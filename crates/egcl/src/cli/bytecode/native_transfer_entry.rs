@@ -3523,6 +3523,7 @@ unsafe fn lexical_environment_leaf(
         _ => return None,
     };
     let name = owner.body.names.get(usize::from(index))?;
+    crate::cli::env_counts::bump(crate::cli::env_counts::Counter::NameOps, 1);
     let value = if lexical_identity::encoded(name) {
         if store {
             let value = unsafe { *call.args };
@@ -3672,6 +3673,7 @@ unsafe fn lexical_environment_request(
     match instruction {
         Instr::LoadEnvVar(index) => {
             assert_eq!(call.nargs, 0);
+            crate::cli::env_counts::bump(crate::cli::env_counts::Counter::NameOps, 1);
             let name = name(index)?;
             Env::lookup_lexical_frame(&current()?, name).ok_or_else(|| {
                 EgclError::UnboundVariable(lexical_identity::resolve(name).unwrap_or(NIL))
@@ -3679,6 +3681,7 @@ unsafe fn lexical_environment_request(
         }
         Instr::StoreEnvVar(index) | Instr::DefineEnvVar(index) => {
             assert_eq!(call.nargs, 1);
+            crate::cli::env_counts::bump(crate::cli::env_counts::Counter::NameOps, 1);
             let (name, frame) = (name(index)?, current()?);
             // The argument area stays rooted; neither store allocates Lisp.
             let value = unsafe { *call.args };
