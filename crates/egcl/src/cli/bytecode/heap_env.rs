@@ -555,7 +555,7 @@ pub(super) fn rewrite_unit(root: &mut BytecodeFunction) -> bool {
     // prologue (`method_context_use`); rewriting them would keep both helper
     // closures alive on every call. Keep those units on the frames.
     let call_next_method = closure_fn_binding_key("CALL-NEXT-METHOD");
-    if root.names.iter().any(|name| *name == call_next_method) {
+    if root.names.contains(&call_next_method) {
         return false;
     }
     if !within_bisect_limit()
