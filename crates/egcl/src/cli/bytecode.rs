@@ -2881,6 +2881,44 @@ fn bail_trace_on() -> bool {
     egcl_rt::log::enabled("bail", egcl_rt::log::TRACE)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FORCE_LAMBDA_HOST_HANDOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While alive, opportunistic lambdas lowered on this thread take the host
+/// handoff (`EvalHost`/`MakeClosureEnv`) again, as `EGCL_LAMBDA_HOST_HANDOFF`
+/// does process-wide. For unit tests of that still-reachable fallback path,
+/// which need a host form at a known constant index.
+#[cfg(test)]
+pub(super) struct ForceLambdaHostHandoff(bool);
+
+#[cfg(test)]
+impl ForceLambdaHostHandoff {
+    pub(super) fn enter() -> Self {
+        Self(FORCE_LAMBDA_HOST_HANDOFF.with(|forced| forced.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceLambdaHostHandoff {
+    fn drop(&mut self) {
+        FORCE_LAMBDA_HOST_HANDOFF.with(|forced| forced.set(self.0));
+    }
+}
+
+#[inline]
+fn lambda_host_handoff_forced_for_test() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_LAMBDA_HOST_HANDOFF.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// Record why the lowerer is about to bail. The reason is built lazily so
 /// there is no cost unless EGCL_BAIL_TRACE is set. Returns `Bail` for
 /// `return Err(record_bail(...))` at bail sites.
@@ -8598,7 +8636,9 @@ impl<'e> Lowerer<'e> {
         // Diagnostic A/B switch: restore the old host handoff for every
         // opportunistic lambda, to compare against it in one binary.
         static HOST_HANDOFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *HOST_HANDOFF.get_or_init(|| std::env::var_os("EGCL_LAMBDA_HOST_HANDOFF").is_some()) {
+        if *HOST_HANDOFF.get_or_init(|| std::env::var_os("EGCL_LAMBDA_HOST_HANDOFF").is_some())
+            || lambda_host_handoff_forced_for_test()
+        {
             let form = rebuild(*lambda_tail)?;
             return self.emit_closure(form, captured, "nonportable");
         }
