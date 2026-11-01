@@ -16515,6 +16515,10 @@ fn closure_captured_control(fn_val: EgclVal) -> Option<super::LexicalExitNames> 
 }
 
 /// Whether a closure carries a captured block/tag scope.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "s390x")),
+    allow(dead_code)
+)]
 fn has_captured_control(fn_val: EgclVal) -> bool {
     closure_templates::with_state(fn_val, |state| state.control.is_some()).unwrap_or(false)
 }
@@ -16542,6 +16546,10 @@ fn is_closure_template_symbol(sym: u32) -> bool {
 /// Whether a direct call to `sym` could enter an object with closure state:
 /// its current function owns one, or it is a closure template whose
 /// instances may. Such a callee needs the callable on entry.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "s390x")),
+    allow(dead_code)
+)]
 fn callee_may_own_closure_state(sym: u32) -> bool {
     egcl_rt::symbols::symbol_function(sym).is_some_and(|function| {
         egcl_rt::function::is_closure_template(function)
