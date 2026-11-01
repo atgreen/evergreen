@@ -621,6 +621,14 @@
 
 ### Performance
 
+- On x86-64 Linux, closures that read or assign captured variables run
+  faster in native code. A variable a closure captures but never assigns is
+  copied into the closure, and one it assigns lives in a heap environment
+  that compiled code reads and writes directly, with no lookup by name: a
+  captured read three LETs deep falls from 230 to 18 ns at T2, and nested
+  LETs whose variables a closure captures run about 1.75x faster at every
+  tier. `EGCL_HEAP_ENV=0` restores the previous representation.
+  ([#971](https://github.com/atgreen/evergreen/pull/971))
 - Functions using DESTRUCTURING-BIND with `&whole`, `&key` or `&aux`,
   `(setf (getf place key) ...)`, HANDLER-CASE with a `:no-error` clause, or
   HANDLER-BIND on an `(or ...)` or `(satisfies ...)` type now compile instead
