@@ -625,7 +625,9 @@
   named, fixed-arity, optimized function is cheaper. The function object now
   carries its own native entry, so the caller loads the name's current
   definition and calls that entry directly; the callee checks its own stack.
-  Redefining a function still takes effect at the next call. Saved images
+  The `native-call4` benchmark drops from 13 to 10 ms, and a chain of three
+  such calls runs about 15% faster per iteration. Redefining a function
+  still takes effect at the next call. Saved images
   from earlier versions must be rebuilt (image format 19).
   ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
 - A `(lambda ...)` inside code compiled for speed (for example a
