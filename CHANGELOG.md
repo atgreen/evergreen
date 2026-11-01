@@ -623,7 +623,7 @@
   pause time about fourfold in closure-heavy programs and makes the first
   compilation of SBCL's own sources about 2 seconds faster.
   `EGCL_GC_REMEMBERED_CAPTURES=0` restores the old full rescan.
-  ([#PR](https://github.com/atgreen/evergreen/pull/PR))
+  ([#962](https://github.com/atgreen/evergreen/pull/962))
 - Compiled functions that bind special variables with LET or LAMBDA, and use
   no other dynamic scope, stay in the fastest native tier instead of the
   slower mapped one. Binding a special variable and reading it in a callee
