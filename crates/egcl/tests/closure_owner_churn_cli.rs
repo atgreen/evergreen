@@ -61,18 +61,29 @@ const PROGRAM: &str = r#"
 // below match the complete tiny child, not a generic CLOSURE display name.
 fn child_has_native_t2(snapshot: &str, capturing: bool) -> bool {
     snapshot.split("\"t0\":\"").skip(1).any(|record| {
-        let body_matches = if capturing {
-            record.contains(
+        // The capturing child reads J through its captured frame or, where the
+        // unit uses heap environments (Backpack; `EGCL_HEAP_ENV`), from its
+        // closure's own environment, which its prologue caches in local 1.
+        let frame_capture = record.starts_with("; CLOSURE — 1 arg(s), 1 local(s),")
+            && record.contains(
                 "0: LoadLocal(0)\\n     1: LoadEnvVar(0)\\n     2: CallNamed { sym: +, nargs: 2 }",
-            ) && record.contains("\\n     3: Return\\n")
+            )
+            && record.contains("\\n     3: Return\\n");
+        let heap_capture = record.starts_with("; CLOSURE — 1 arg(s), 2 local(s),")
+            && record.contains(
+                "0: ClosureEnv\\n     1: StoreLocal(1)\\n     2: LoadLocal(0)\\n     \
+                 3: LoadLocal(1)\\n     4: EnvRef { depth: 0, idx: 0, name: 0 }    ; J\\n     \
+                 5: CallNamed { sym: +, nargs: 2 }",
+            )
+            && record.contains("\\n     6: Return\\n");
+        let body_matches = if capturing {
+            frame_capture || heap_capture
         } else {
-            record.contains("0: LoadLocal(0)\\n     1: CallNamed { sym: 1+, nargs: 1 }")
+            record.starts_with("; CLOSURE — 1 arg(s), 1 local(s),")
+                && record.contains("0: LoadLocal(0)\\n     1: CallNamed { sym: 1+, nargs: 1 }")
                 && record.contains("\\n     2: Return\\n")
         };
-        record.starts_with("; CLOSURE — 1 arg(s), 1 local(s),")
-            && body_matches
-            && record.contains(",\"t2\":\"")
-            && !record.contains(",\"t2\":\"\"")
+        body_matches && record.contains(",\"t2\":\"") && !record.contains(",\"t2\":\"\"")
     })
 }
 
