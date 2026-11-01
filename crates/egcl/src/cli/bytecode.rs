@@ -178,7 +178,7 @@ mod call_table_funcall;
 #[path = "bytecode/call_table_native_s390x.rs"]
 mod call_table_native;
 mod closure_templates;
-mod heap_env;
+pub(super) mod heap_env;
 #[cfg(test)]
 mod heap_env_tests;
 mod mapping_transforms;
@@ -34066,6 +34066,8 @@ mod direct_call_invalidation_tests {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Exercises the name-keyed captured-frame path.
+        let _legacy = super::heap_env::legacy_frames_for_test();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(
@@ -36197,6 +36199,8 @@ fn capturing_local_native_frame_preserves_a_relocated_capture() {
     let _lock = super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // Exercises the name-keyed captured-frame path.
+    let _legacy = heap_env::legacy_frames_for_test();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::read_eval_all_env(
@@ -36295,6 +36299,19 @@ fn mixed_local_sibling_inlines_a_transitive_capture() {
             .any(|op| matches!(op, Instr::CallNamed { sym, .. }
         if sym_name(EgclVal::from_symbol_index(*sym)) == "FUNCALL"))
     );
+    // A heap-environment closure body (Backpack) reads MASK from the
+    // environment its closure carries; run bare, it would have none. Its
+    // native execution is covered with real closures by heap_env_cli.
+    if matches!(worker.code.first(), Some(Instr::ClosureEnv)) {
+        assert!(
+            worker
+                .code
+                .iter()
+                .any(|op| matches!(op, Instr::EnvRef { name, .. }
+                    if worker.names[usize::from(*name)] == "MASK"))
+        );
+        return;
+    }
     use native_transfer_entry::{TransferCode, take_native_fallback_count};
     egcl_rt::rooted!(_worker = ActiveBytecodeRoot::new(worker));
     let native = TransferCode::compile_mapped_for_test(Arc::clone(worker))

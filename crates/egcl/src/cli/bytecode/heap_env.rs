@@ -550,6 +550,14 @@ pub(super) fn rewrite_unit(root: &mut BytecodeFunction) -> bool {
     if !enabled() || !unit_uses_env(root) {
         return false;
     }
+    // A method body's generated CALL-NEXT-METHOD/NEXT-METHOD-P helpers have
+    // their own elision and raw-slot-reader proofs keyed on the name-keyed
+    // prologue (`method_context_use`); rewriting them would keep both helper
+    // closures alive on every call. Keep those units on the frames.
+    let call_next_method = closure_fn_binding_key("CALL-NEXT-METHOD");
+    if root.names.iter().any(|name| *name == call_next_method) {
+        return false;
+    }
     if !within_bisect_limit()
         || std::env::var("EGCL_HEAP_ENV_SKIP")
             .is_ok_and(|skip| skip.split(',').any(|name| root.name.contains(name)))
@@ -621,6 +629,24 @@ fn within_bisect_limit() -> bool {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEGACY_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Compile on this thread with the name-keyed frames while the guard lives:
+/// for tests of that machinery, which still serves every ineligible unit.
+#[cfg(test)]
+pub(in crate::cli) fn legacy_frames_for_test() -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            LEGACY_FOR_TEST.with(|cell| cell.set(self.0));
+        }
+    }
+    Restore(LEGACY_FOR_TEST.with(|cell| cell.replace(true)))
+}
+
 /// Whether this target's native tiers execute heap environments.
 const NATIVE_SUPPORT: bool = cfg!(all(target_arch = "x86_64", target_os = "linux"));
 
@@ -632,6 +658,10 @@ const NATIVE_SUPPORT: bool = cfg!(all(target_arch = "x86_64", target_os = "linux
 /// everywhere; another target's native tiers decline its heap units to T0.
 pub(super) fn enabled() -> bool {
     if !NATIVE_SUPPORT {
+        return false;
+    }
+    #[cfg(test)]
+    if LEGACY_FOR_TEST.with(std::cell::Cell::get) {
         return false;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1014,12 +1044,12 @@ pub(super) fn captured_env(frame: Option<&Arc<FrameCell>>) -> EgclVal {
         return NIL;
     };
     let frame = frame.borrow();
+    // Only a closure the rewrite made reaches `ClosureEnv`, so its frame is
+    // always a carrier. Anything else answers NIL rather than a foreign
+    // binding (this runs inside `extern "C"` helpers, which must not panic).
     match frame.vars.iter().next() {
-        Some((key, value)) => {
-            debug_assert_eq!(key, CARRIER_KEY);
-            *value
-        }
-        None => NIL,
+        Some((key, value)) if key == CARRIER_KEY && frame.vars.len() == 1 => *value,
+        _ => NIL,
     }
 }
 

@@ -1948,7 +1948,13 @@ mod tests {
                 parent: None,
             });
             bind_boxed_param(&capture, "SEED", EgclVal::from_fixnum(1));
-            *function = make_bytecode_closure(&body, Some(capture));
+            // An eligible unit's closure reads SEED from its heap environment
+            // (Backpack), a copied value in its capture layer.
+            *function = if matches!(body.code.first(), Some(Instr::ClosureEnv)) {
+                super::heap_env::make_closure(&body, NIL, &[EgclVal::from_fixnum(1)], &env).unwrap()
+            } else {
+                make_bytecode_closure(&body, Some(capture))
+            };
             let symbol = egcl_rt::function::name(*function).as_symbol_index();
             let input = snapshot_t2_input(symbol, 0).unwrap();
             let generation = input.generation;

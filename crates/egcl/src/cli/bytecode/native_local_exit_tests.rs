@@ -93,6 +93,8 @@ fn local_exit_ir_retains_original_scope_identity_and_refuses_other_unwinds() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // The captured-binding case checks the name-keyed frame's exit record.
+    let _legacy = super::heap_env::legacy_frames_for_test();
     egcl_rt::rooted!(env = Env::new(false));
     crate::cli::read_eval_all_env("(setq *native-local-state* nil)", &mut env).unwrap();
     let body = fixture_body(

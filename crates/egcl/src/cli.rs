@@ -51919,6 +51919,8 @@ mod method_block_tests {
     #[test]
     fn dormant_compiled_closure_relocates_its_captured_values() {
         let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Inspects the closure's name-keyed captured frame.
+        let _legacy = bytecode::heap_env::legacy_frames_for_test();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
         let bytes = build_bfasl_from_source(
