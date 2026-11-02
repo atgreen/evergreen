@@ -367,10 +367,10 @@ fn spec_image_header_validation_rejects_corrupt_or_incompatible_images() {
     let mut bytes = fs::read(&path).expect("read image");
     assert_eq!(
         u32::from_ne_bytes(bytes[8..12].try_into().unwrap()),
-        19,
-        "entry words in function objects require image format version 19"
+        20,
+        "heap-environment words in function objects require image format version 20"
     );
-    for version in [1u32, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20] {
+    for version in [1u32, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21] {
         let mut incompatible = bytes.clone();
         incompatible[8..12].copy_from_slice(&version.to_ne_bytes());
         let incompatible_path = temp_path(&format!("header-version-{version}.bimg"));
