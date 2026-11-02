@@ -3115,9 +3115,10 @@ fn resolve(name: &str) -> Option<Handler> {
         }),
 
         "GET" => Some(|_operator, args, _env| {
-            let args = RootedVals::new(args.to_vec());
-
             // (get symbol indicator &optional default)
+            //
+            // Nothing below allocates, so the arguments need no root: copying
+            // them into a HostRoot took a global lock and a Vec on every call.
 
             let s = args.first().copied().unwrap_or(NIL);
             // A non-symbol first argument is a TYPE-ERROR (get.error.4).

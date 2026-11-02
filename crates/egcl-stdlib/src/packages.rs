@@ -79,7 +79,78 @@ static CURRENT_STORE: egcl_rt::execution_local::ExecutionLocal<
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { RefCell::new(None) }) };
 
 fn swap_current_store(new_store: Option<Arc<RegistryStore>>) -> Option<Arc<RegistryStore>> {
-    CURRENT_STORE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new_store))
+    let previous = CURRENT_STORE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), new_store));
+    presence_changed();
+    previous
+}
+
+// ── Home-package presence memo ─────────────────────────────────────
+//
+// SYMBOL-PACKAGE answers with a symbol's home-package cell only while the
+// symbol is still present in that package, which used to mean a name string
+// and a package-table probe on every call (~1 us). The answer can change only
+// when a symbol leaves a package (UNINTERN, a displacing IMPORT or
+// SHADOWING-IMPORT, DELETE-PACKAGE) or the active package namespace is
+// switched, and each of those bumps `PRESENCE_EPOCH`. A verified pair stays
+// valid until the next bump.
+
+static PRESENCE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Invalidate every remembered presence. Called after the change is made, so
+/// a reader that loaded the old epoch before verifying stores a stale epoch.
+fn presence_changed() {
+    PRESENCE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
+#[derive(Clone, Copy)]
+struct HomeMemo {
+    symbol: u64,
+    home: u64,
+    epoch: u64,
+}
+
+const HOME_MEMO_SLOTS: usize = 1024;
+
+// Per execution, like the package namespace it caches answers about. Symbols
+// and packages are pinned and immortal, so their bits are stable keys.
+static HOME_MEMO: egcl_rt::execution_local::ExecutionLocal<RefCell<Vec<HomeMemo>>> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| {
+        RefCell::new(vec![
+            HomeMemo {
+                symbol: 0,
+                home: 0,
+                epoch: u64::MAX,
+            };
+            HOME_MEMO_SLOTS
+        ])
+    })
+};
+
+/// Is `symbol` present (internal or external) in `home`, a live package of
+/// the active namespace? `bare_name` supplies the symbol's name for the probe,
+/// which runs only when this pair has not been verified since the last
+/// presence change. Allocates no Lisp object.
+pub fn present_in_home(symbol: EgclVal, home: EgclVal, bare_name: impl FnOnce() -> String) -> bool {
+    let epoch = PRESENCE_EPOCH.load(std::sync::atomic::Ordering::Acquire);
+    let slot = ((symbol.0 ^ (symbol.0 >> 17)) as usize >> 3) % HOME_MEMO_SLOTS;
+    let remembered = HOME_MEMO.with(|memo| {
+        let entry = memo.borrow()[slot];
+        entry.symbol == symbol.0 && entry.home == home.0 && entry.epoch == epoch
+    });
+    if remembered {
+        return true;
+    }
+    let present = is_package(home) && find_present_symbol(home, &bare_name()) == Some(symbol);
+    if present {
+        HOME_MEMO.with(|memo| {
+            memo.borrow_mut()[slot] = HomeMemo {
+                symbol: symbol.0,
+                home: home.0,
+                epoch,
+            }
+        });
+    }
+    present
 }
 
 /// A shareable package namespace inherited by a new Lisp execution.
@@ -178,8 +249,12 @@ impl PackageSymbolTable {
     }
 
     fn insert(self, name: &str, symbol: EgclVal) {
+        let displaced = self.get(name).is_some_and(|old| old != symbol);
         set_gethash(make_lisp_string(name), self.0, symbol)
             .expect("package symbol table must remain a valid hash table");
+        if displaced {
+            presence_changed();
+        }
     }
 
     fn remove(self, name: &str) -> Option<EgclVal> {
@@ -187,6 +262,7 @@ impl PackageSymbolTable {
         if old.is_some() {
             remhash(make_lisp_string(name), self.0)
                 .expect("package symbol table must remain a valid hash table");
+            presence_changed();
         }
         old
     }
@@ -750,6 +826,7 @@ impl PackageRegistry {
         let deleted = pkg.object;
         drop(pkg);
         egcl_rt::symbols::detach_package_symbols(deleted);
+        presence_changed();
         egcl_rt::packages::unregister(deleted);
 
         for package in store.packages.values() {
@@ -797,6 +874,7 @@ impl Drop for PackageRegistry {
                 *slot = self.previous_store.take();
             }
         });
+        presence_changed();
     }
 }
 
@@ -804,6 +882,7 @@ impl Drop for ActivePackageRegistryGuard {
     fn drop(&mut self) {
         let previous_store = self.previous_store.take();
         let _ = CURRENT_STORE.try_with(|cell| *cell.borrow_mut() = previous_store);
+        presence_changed();
     }
 }
 
@@ -1782,6 +1861,7 @@ pub fn delete_package(name: &str) -> Result<(), EgclError> {
         if let Ok(pkg) = pkg.read() {
             drop(pkg);
             egcl_rt::symbols::detach_package_symbols(package);
+            presence_changed();
             egcl_rt::packages::unregister(package);
         }
     }

@@ -13812,6 +13812,23 @@ fn symbol_package_value(env: &Env, sym: EgclVal) -> EgclVal {
     if !sym.is_symbol() {
         return NIL;
     }
+    // The home package cell, when the symbol is still present there. Checked
+    // first: the two NIL cases below apply only to an empty cell, so this
+    // answers exactly as it would after them. The presence check is memoized
+    // until a symbol next leaves a package, so the usual cost is a cell read.
+    // For a COMMON-LISP symbol, whose registry key carries no package prefix,
+    // the name-based lookup at the end probes every package in the image,
+    // which made each SYMBOL-PACKAGE cost ~27us (bliss-a2bso).
+    if sym != NIL
+        && sym != T
+        && let Some(home) = sym
+            .symbol_index()
+            .and_then(egcl_rt::symbols::symbol_package)
+        && !home.is_nil()
+        && egcl_stdlib::packages::present_in_home(sym, home, || symbol_name_of(sym))
+    {
+        return home;
+    }
     if sym != NIL && sym != T {
         if let Some(idx) = sym.symbol_index() {
             // Symbols made homeless by UNINTERN have SYMBOL-PACKAGE = NIL, as
@@ -13830,21 +13847,6 @@ fn symbol_package_value(env: &Env, sym: EgclVal) -> EgclVal {
                 return NIL;
             }
         }
-    }
-    // The home package cell, when the symbol is still present there: what the
-    // name-based lookup below works out. For a COMMON-LISP symbol, whose
-    // registry key carries no package prefix, that lookup probes every
-    // package in the image, which made each SYMBOL-PACKAGE cost ~27us
-    // (bliss-a2bso).
-    if sym != NIL
-        && sym != T
-        && let Some(home) = sym
-            .symbol_index()
-            .and_then(egcl_rt::symbols::symbol_package)
-        && egcl_stdlib::is_package(home)
-        && egcl_stdlib::find_present_symbol(home, &symbol_name_of(sym)) == Some(sym)
-    {
-        return home;
     }
     let pkg = symbol_home_package_name(sym);
     egcl_stdlib::find_package(&resolve_package_name(env, &pkg)).unwrap_or(NIL)
@@ -17044,6 +17046,26 @@ fn resolve_package_name(env: &Env, raw: &str) -> String {
     resolve_package_name_cow(env, raw).into_owned()
 }
 
+/// The package `raw` designates, as `find_package(resolve_package_name(raw))`
+/// finds it, but without working out and copying its canonical name only to
+/// look the package up by it again.
+fn resolve_package_object(env: &Env, raw: &str) -> Option<EgclVal> {
+    let normalized = normalize_package_name_cow(raw);
+    let name = match &*normalized {
+        "CL" => "COMMON-LISP",
+        "CL-USER" => "COMMON-LISP-USER",
+        name => name,
+    };
+    if name == &*normalized
+        && egcl_stdlib::any_package_local_nicknames()
+        && let Some(current) = current_package_object(env)
+        && let Some(actual) = egcl_stdlib::local_nickname_target(current, name)
+    {
+        return egcl_stdlib::is_package(actual).then_some(actual);
+    }
+    egcl_stdlib::find_package(name)
+}
+
 /// Borrowing form of [`resolve_package_name`] for the reader's hot path: the
 /// use-graph walk resolves every reachable package once per symbol token, and
 /// the owned `String` was allocated and dropped immediately in almost every
@@ -17196,17 +17218,7 @@ fn symbol_bare_slice(name: &str) -> (&str, bool) {
 /// does and is only for case-folded lookups.
 fn string_designator_name(v: EgclVal) -> String {
     if v.is_symbol() {
-        let full = sym_name_rc(v);
-        if let Some(name) = egcl_rt::symbols::keyword_key_name(&full) {
-            return name.to_string();
-        }
-        let without_keyword: &str = &full;
-        without_keyword
-            .split_once("::")
-            .map(|(_, tail)| tail)
-            .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
-            .unwrap_or(without_keyword)
-            .to_string()
+        bare_symbol_name(&sym_name_rc(v)).to_string()
     } else if v.is_character() {
         v.as_char().to_string()
     } else {
@@ -17248,18 +17260,27 @@ unsafe fn c_string_to_lisp(ptr: u64) -> EgclVal {
 /// The bare `symbol-name` (CL `SYMBOL-NAME` / `STRING` of a symbol): strips any
 /// package prefix but preserves case, unlike `symbol_bare_name` which upper-cases.
 fn symbol_name_string(name: &str) -> String {
+    bare_symbol_name(name).to_string()
+}
+
+/// [`symbol_name_string`] without the copy: the bare name within `name`.
+fn bare_symbol_name(name: &str) -> &str {
     // A keyword's name is everything after its marker, colons included
     // (GitHub #468): `KEYWORD:A:B` names "A:B".
     if let Some(name) = egcl_rt::symbols::keyword_key_name(name) {
-        return name.to_string();
+        return name;
     }
-    let without_keyword = name;
-    without_keyword
-        .split_once("::")
-        .map(|(_, tail)| tail)
-        .or_else(|| without_keyword.split_once(':').map(|(_, tail)| tail))
-        .unwrap_or(without_keyword)
-        .to_string()
+    // The tail after the first "::", else after the first ':', as
+    // `split_once` would find them. A byte scan: the substring searcher's
+    // setup cost more than the rest of STRING of a symbol.
+    let bytes = name.as_bytes();
+    let Some(first) = bytes.iter().position(|&b| b == b':') else {
+        return name;
+    };
+    match bytes[first..].windows(2).position(|w| w == b"::") {
+        Some(at) => &name[first + at + 2..],
+        None => &name[first + 1..],
+    }
 }
 
 /// `SYMBOL-NAME` of a symbol VALUE.
@@ -17269,17 +17290,52 @@ fn symbol_name_string(name: &str) -> String {
 /// no package prefix — its name is the whole string, colons and all, which is
 /// why `(symbol-name (make-symbol "A:B"))` is "A:B" and not "B" (bliss-lgml).
 fn symbol_name_of(sym: EgclVal) -> String {
+    with_symbol_name(sym, str::to_string)
+}
+
+/// Apply `f` to [`symbol_name_of`]'s text without first copying it into a
+/// `String`: the name is borrowed from the per-thread name cache.
+fn with_symbol_name<R>(sym: EgclVal, f: impl FnOnce(&str) -> R) -> R {
     let raw = sym_name_rc(sym);
     if sym
         .symbol_index()
         .is_some_and(egcl_compiler::reader::is_uninterned)
     {
-        return raw.to_string();
+        return f(&raw);
     }
-    symbol_name_string(&raw)
+    f(bare_symbol_name(&raw))
 }
 
 fn package_status_symbol(status: &str) -> EgclVal {
+    // FIND-SYMBOL's three statuses, remembered per thread once found: the
+    // registry probe below costs a key string and a lock on every call.
+    // Interned keywords are immortal and keep their index.
+    thread_local! {
+        static STATUS_KEYWORDS: std::cell::Cell<[Option<EgclVal>; 3]> =
+            const { std::cell::Cell::new([None; 3]) };
+    }
+    let slot = match status {
+        "INTERNAL" => Some(0),
+        "EXTERNAL" => Some(1),
+        "INHERITED" => Some(2),
+        _ => None,
+    };
+    if let Some(slot) = slot {
+        if let Some(keyword) = STATUS_KEYWORDS.with(|k| k.get()[slot]) {
+            return keyword;
+        }
+        if let Some(idx) =
+            reader::find_symbol_index(&egcl_rt::symbols::keyword_registry_key(status))
+        {
+            let keyword = EgclVal::from_symbol_index(idx);
+            STATUS_KEYWORDS.with(|k| {
+                let mut known = k.get();
+                known[slot] = Some(keyword);
+                k.set(known);
+            });
+            return keyword;
+        }
+    }
     // The keyword already exists in the common case; look it up by its
     // registry key before paying for the general token resolution.
     if let Some(idx) = reader::find_symbol_index(&egcl_rt::symbols::keyword_registry_key(status)) {
@@ -22755,13 +22811,16 @@ fn set_cons_values(name: &str, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
 /// name, a character as a one-character string. Shared by operator position
 /// and compiled calls (bliss-qoy0k).
 fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
+    // A symbol first: no string test below accepts one, and they cost more
+    // than the rest of STRING of a symbol (pathname and registry probes).
+    if v.is_symbol() || v.is_nil() || v == T {
+        return Ok(with_symbol_name(v, arena_str));
+    }
     if is_string_value(v) {
         return Ok(v);
     }
     let s = if v.is_character() {
         v.as_char().to_string()
-    } else if v.is_symbol() || v.is_nil() || v == T {
-        symbol_name_of(v)
     } else {
         val_as_str(v)
     };
@@ -22888,12 +22947,15 @@ fn find_symbol_values(
     let pkg = match package {
         Some(designator) if egcl_stdlib::is_package(designator) => designator,
         Some(designator) => {
-            let pkg_name = resolve_package_name(env, &string_designator_name(designator));
+            let raw = string_designator_name(designator);
             // A designator naming no package is a PACKAGE-ERROR, not "no such
             // symbol": FIND-SYMBOL answered NIL for a package that did not
             // exist, which is indistinguishable from the name simply being
             // absent, so a typo read as a successful lookup (#375).
-            package_or_package_error(&pkg_name, "FIND-SYMBOL")?
+            match resolve_package_object(env, &raw) {
+                Some(package) => package,
+                None => package_or_package_error(&resolve_package_name(env, &raw), "FIND-SYMBOL")?,
+            }
         }
         None => package_or_package_error(&effective_package_name(env), "FIND-SYMBOL")?,
     };
@@ -48923,6 +48985,20 @@ fn val_as_str(val: EgclVal) -> String {
     // (bliss-bhs).
     if let Some(name) = package_object_name(val) {
         return name;
+    }
+    // A simple string reads in place. A registered string is one too, and
+    // its registry text is its own contents, so asking the registry first
+    // (a lock and a hash) only cost time.
+    if val.is_heap_object() {
+        unsafe {
+            let p = val.as_ptr();
+            let h = *(p as *const ObjectHeader);
+            if h.type_id() == type_id::SIMPLE_BASE_STRING
+                || h.type_id() == type_id::SIMPLE_CHARACTER_STRING
+            {
+                return egcl_rt::object::read_simple_string(p);
+            }
+        }
     }
     if let Some(s) = egcl_stdlib::registered_string(val) {
         return s;
