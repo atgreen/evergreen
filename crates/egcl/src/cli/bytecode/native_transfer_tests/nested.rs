@@ -15,6 +15,8 @@ pub(super) mod reentry;
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_distinct_callees_share_segment_and_unwind_into_caller() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -253,6 +255,8 @@ fn native_v2_distinct_mutual_calls_bound_depth_and_retire_crossed_frames() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_distinct_active_callee_survives_redefinition_and_unbinding() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());

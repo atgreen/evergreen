@@ -113,6 +113,8 @@ fn ordinary_mapped_osr_preserves_inherited_handler_catch_and_cleanup() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_mapped_osr_entry_guard_resumes_after_committed_effects() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     exercise_ordinary_osr(false, true, false);
 }
 
@@ -572,6 +574,8 @@ impl Drop for ChildOsrObserveScope {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_mapped_child_osr_retains_parent_and_current_child_activation() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());

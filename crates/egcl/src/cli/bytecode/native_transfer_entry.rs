@@ -2321,6 +2321,8 @@ fn named_call_symbol(instruction: &Instr) -> Option<u32> {
     match instruction {
         Instr::CallNamed { sym, .. } => Some(*sym),
         Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+        // SetValues is built as its VALUES call.
+        Instr::SetValues(_) => Some(egcl_rt::symbols::intern("VALUES")),
         // A structure constructor is built as its %MAKE-STRUCT call.
         Instr::MakeStruct { .. } => Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT")),
         // A scoped body's structure opcodes are built as their general calls.
@@ -2593,6 +2595,9 @@ fn ordinary_native_op(op: &Instr) -> bool {
             op,
             Instr::EnvRef { .. } | Instr::EnvSet { .. } | Instr::ClosureEnv | Instr::MakeEnv(_)
         )
+        // VALUES publishes its tuple through a noncollecting leaf and the
+        // ordinary return descriptor (bliss-gg3i1.7.15.10.4).
+        || (matches!(op, Instr::SetValues(_)) && ordinary_values_enabled())
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
         || (matches!(op, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
             && ordinary_special_bindings_enabled())
@@ -2635,6 +2640,42 @@ pub(in crate::cli::bytecode) fn special_binding_body(body: &BytecodeFunction) ->
                     | Instr::MakeEnvClosure { .. }
             )
         })
+}
+
+/// Ordinary entries produce multiple values (bliss-gg3i1.7.15.10.4).
+/// `EGCL_DISABLE_ORDINARY_VALUES` keeps VALUES-producing bodies on the mapped
+/// entry, for comparison and bisection.
+pub(super) fn ordinary_values_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if MAPPED_VALUES_PINS.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return false;
+    }
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_VALUES").is_none())
+}
+
+#[cfg(test)]
+static MAPPED_VALUES_PINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keep VALUES-producing bodies on the mapped entry while alive, for the
+/// mapped-protocol fixtures that use VALUES to select it. Compilations on
+/// worker threads observe it too.
+#[cfg(test)]
+pub(in crate::cli::bytecode) struct MappedValuesForTest(());
+
+#[cfg(test)]
+impl MappedValuesForTest {
+    pub(in crate::cli::bytecode) fn new() -> Self {
+        MAPPED_VALUES_PINS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for MappedValuesForTest {
+    fn drop(&mut self) {
+        MAPPED_VALUES_PINS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 pub(super) fn ordinary_function_designators_enabled() -> bool {

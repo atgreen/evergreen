@@ -1595,6 +1595,8 @@ fn ordinary_t2_recursive_calls_preserve_redefinition_and_unbinding() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -1688,6 +1690,8 @@ fn ordinary_t2_idle_polls_skip_publication_but_t1_retains_heat() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_t2_generated_poll_cold_edge_relocates_a_native_only_root() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());

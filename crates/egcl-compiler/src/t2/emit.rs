@@ -8780,6 +8780,24 @@ fn emit_framed_inner(
                     slots,
                     d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args),
                 );
+            } else if ordinary_call_mode
+                && d.opcode == Opcode::Call
+                && inline_leaf::ordinary_values_helper(&d).is_some()
+            {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                {
+                    let NativeValueArea::NativeStack(base) = outgoing_area else {
+                        return Err(EmitError::UnsupportedOp(0xFD));
+                    };
+                    inline_leaf::emit_ordinary_values(
+                        &mut a,
+                        &d,
+                        &homes,
+                        &const_tagged,
+                        base,
+                        inline_leaf::ordinary_values_helper(&d).unwrap(),
+                    )?;
+                }
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {

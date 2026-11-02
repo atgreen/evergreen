@@ -476,6 +476,8 @@ fn native_multiple_returns_move_during_native_cleanup() {
 
 #[test]
 fn native_private_root_survives_real_callee_osr() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     const CHILD: &str = "EGCL_TEST_NATIVE_ROOT_OSR";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())

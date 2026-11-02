@@ -847,7 +847,54 @@ pub(super) fn install() {
         bind_special_keep_values: bind_special::<false> as Helper3 as usize as u64,
         unbind_special: unbind_special::<true> as Helper1 as usize as u64,
         unbind_special_keep_values: unbind_special::<false> as Helper1 as usize as u64,
+        values: ordinary_values
+            as extern "C" fn(*const EgclVal, u64, *mut NativeReturnValues) -> u64
+            as usize as u64,
     });
+}
+
+use egcl_rt::native_transfer::NativeReturnValues;
+
+/// VALUES in ordinary T2 code (bliss-gg3i1.7.15.10.4): publish `args[..n]` as
+/// the execution's multiple values exactly as the VALUES builtin does, write
+/// the ordinary return descriptor for them to `out`, and return the primary.
+/// The buffer's storage is reused, so the common call allocates nothing; it
+/// never allocates a Lisp object, collects, polls, signals or unwinds. The
+/// arguments are the caller's mapped outgoing slots and the tuple the
+/// descriptor borrows belongs to the Env, which traces it.
+extern "C" fn ordinary_values(args: *const EgclVal, n: u64, out: *mut NativeReturnValues) -> u64 {
+    let env = NATIVE_ENV.with(std::cell::Cell::get);
+    // SAFETY: ordinary native code runs with its parked Env published, and
+    // `args` addresses `n` initialized slots of the calling frame.
+    let args = if n == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(args, n as usize) }
+    };
+    let primary = args.first().copied().unwrap_or(NIL);
+    let descriptor = if env.is_null() {
+        NativeReturnValues::SINGLE
+    } else {
+        let env = unsafe { &mut *env };
+        env.mv.clear();
+        if args.len() == 1 {
+            env.mv_active = false;
+            NativeReturnValues::SINGLE
+        } else {
+            env.mv.extend_from_slice(args);
+            env.mv_active = true;
+            NativeReturnValues {
+                count: args.len(),
+                payload: if args.is_empty() {
+                    std::ptr::null()
+                } else {
+                    env.mv.as_ptr()
+                },
+            }
+        }
+    };
+    unsafe { out.write(descriptor) };
+    primary.0
 }
 
 /// Establish a special binding owned by an ordinary native frame

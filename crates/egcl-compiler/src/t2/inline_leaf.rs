@@ -68,6 +68,11 @@ pub struct LeafHelpers {
     pub unbind_special: u64,
     /// `unbind_special` leaving the multiple-value buffer alone.
     pub unbind_special_keep_values: u64,
+    /// `values(args, n, descriptor) -> primary`: publish `args[..n]` as the
+    /// multiple values exactly as VALUES does and write their ordinary return
+    /// descriptor `{ count, payload }`. Never allocates a Lisp object,
+    /// collects, polls, signals or unwinds (bliss-gg3i1.7.15.10.4).
+    pub values: u64,
 }
 
 /// The native special-binding leaf helpers.
@@ -267,4 +272,74 @@ pub(super) fn emit_ordinary_fast_path(
     a.jmp(done);
     a.bind(slow);
     Some(done)
+}
+
+/// The VALUES helper for an ordinary call to VALUES, if installed.
+pub(super) fn ordinary_values_helper(data: &InstData) -> Option<u64> {
+    static VALUES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // NOTINLINE calls carry OpaqueCallTarget and keep named dispatch.
+    let AuxData::CallTarget(symbol) = data.aux else {
+        return None;
+    };
+    if disabled() || data.results.len() > 1 {
+        return None;
+    }
+    let helper = LEAF.get()?.values;
+    (helper != 0 && symbol == *VALUES.get_or_init(|| egcl_rt::symbols::intern("VALUES")))
+        .then_some(helper)
+}
+
+/// VALUES in ordinary code (bliss-gg3i1.7.15.10.4). VALUES is a standard
+/// function, so the call needs no binding guard: store the arguments in the
+/// outgoing area at `base`, let the helper publish them as the execution's
+/// multiple values, and leave the call's complete result as an ordinary
+/// callee returns it, the primary in RAX and the tuple descriptor in
+/// CF/RDX/RCX. A caller forwarding the result returns that descriptor;
+/// every other consumer reads the buffer the helper set, as after any call.
+/// The helper is a noncollecting leaf, so nothing here is a safepoint, and
+/// the outgoing area is not a home for any value live across the call.
+pub(super) fn emit_ordinary_values(
+    a: &mut Asm,
+    data: &InstData,
+    homes: &HashMap<Value, FramedHome>,
+    constants: &HashMap<Value, u64>,
+    base: u32,
+    helper: u64,
+) -> Result<(), super::EmitError> {
+    let n = data.args.len();
+    for (index, value) in data.args.iter().enumerate() {
+        if let Some(&bits) = constants.get(value) {
+            mov_imm64(a, RAX, bits as i64);
+        } else {
+            let home = *homes
+                .get(value)
+                .ok_or(super::EmitError::UnsupportedOp(0xF2))?;
+            load_home(a, RAX, home, 0);
+        }
+        super::store_home(a, FramedHome::Stack(base + index as u32), RAX, 0);
+    }
+    // A 16-byte descriptor below the aligned frame keeps the call aligned.
+    a.extend_from_slice(&[0x48, 0x83, 0xec, 16]); // sub rsp,16
+    let args = i32::try_from(u64::from(base) * 8 + 16)
+        .map_err(|_| super::EmitError::UnsupportedOp(0xFD))?;
+    a.extend_from_slice(&[0x48, 0x8d, 0xbc, 0x24]); // lea rdi,[rsp+disp32]
+    a.extend_from_slice(&args.to_le_bytes());
+    mov_imm64(a, 6, n as i64); // rsi = count
+    a.extend_from_slice(&[0x48, 0x89, 0xe2]); // mov rdx,rsp
+    mov_imm64(a, RAX, helper as i64);
+    a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    a.extend_from_slice(&[0x48, 0x8b, 0x14, 0x24]); // mov rdx,[rsp]: count
+    a.extend_from_slice(&[0x48, 0x8b, 0x4c, 0x24, 8]); // mov rcx,[rsp+8]: payload
+    a.extend_from_slice(&[0x48, 0x83, 0xc4, 16]); // add rsp,16
+    // CF last: set for zero or many values, clear for one.
+    let single = a.label();
+    let done = a.label();
+    a.extend_from_slice(&[0x48, 0x83, 0xfa, 1]); // cmp rdx,1
+    a.jcc(Cc::E, single);
+    a.push(0xf9); // stc
+    a.jmp(done);
+    a.bind(single);
+    a.push(0xf8); // clc
+    a.bind(done);
+    Ok(())
 }

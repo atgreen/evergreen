@@ -27805,6 +27805,8 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                 let sym = match instruction {
                     Instr::CallNamed { sym, .. } => Some(*sym),
                     Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+                    // SetValues is built as its VALUES call.
+                    Instr::SetValues(_) => Some(egcl_rt::symbols::intern("VALUES")),
                     Instr::MakeStruct { .. } => {
                         Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT"))
                     }

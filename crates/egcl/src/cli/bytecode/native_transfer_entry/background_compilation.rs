@@ -527,7 +527,11 @@ impl EmittedTransfer {
                                     let symbol = ir.inst(inst).aux.named_call_target()?;
                                     let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
                                     Some((inst, ordinary_call_target(symbol, cell)))
-                                }).collect::<Option<Vec<_>>>()?;
+                                }).collect::<Option<Vec<_>>>()
+                                .or_else(|| {
+                                    ordinary_declined(&"a call without a named call cell");
+                                    None
+                                })?;
                             egcl_compiler::t2::emit::emit_framed_ordinary_function_with_self_call_facts(
                                 &ir, options, &targets, call_flags, cold.as_ptr() as u64,
                                 egcl_compiler::t2::emit::OrdinaryGuardOptions {

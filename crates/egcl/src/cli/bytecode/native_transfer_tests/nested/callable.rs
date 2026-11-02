@@ -6,6 +6,8 @@ use super::*;
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn native_v2_funcall_and_apply_enter_exact_mapped_callable_and_preserve_caller_capture() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
