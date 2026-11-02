@@ -24,6 +24,7 @@ pub mod digest;
 /// Lisp execution context reached from generated code (§2.3.1, R4.72).
 /// NOT `context` above, which is the machine/stack-pointer switch.
 pub mod exec_context;
+pub mod execution_heat;
 pub mod execution_local;
 pub mod execution_poll;
 pub mod function;

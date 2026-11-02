@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Experimental sharing prerequisite; legacy countdowns remain the default.
+fn execution_heat_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && *ENABLED.get_or_init(|| std::env::var("EGCL_EXECUTION_T1_HEAT").is_ok_and(|v| v == "1"))
+}
+
 /// A named ordinary call through `cell`. The lean path (bliss-gg3i1.7.15.10.1)
 /// reads the symbol's function cell, so it is off for the private semantic
 /// primitives, whose compiled callers must keep primitive meaning even when a
@@ -74,6 +81,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     _capture: JitBuffer,
     _poll: JitBuffer,
     _heat_counter: Option<Box<std::sync::atomic::AtomicU32>>,
+    execution_heat: Option<(egcl_rt::execution_heat::HeatId, u32)>,
     _completion: JitBuffer,
     _recursive_prepare: Option<JitBuffer>,
     _deopt_capture: Option<JitBuffer>,
@@ -108,6 +116,16 @@ impl EmittedTransfer {
         roots: Arc<ActiveBytecodeRoot>,
         metadata: Option<Arc<T2InstalledMetadata>>,
     ) -> Result<TransferCode, EmitDecline> {
+        let execution_heat_binding = if let Some((id, batch)) = self.execution_heat {
+            // Owner-side publication, before exposing an executable entry.
+            // Rust allocation here cannot collect Lisp objects or park.
+            let context = egcl_rt::thread::current_execution_context_for_native()
+                .ok_or(EmitDecline::ExecutingIdentity)?;
+            unsafe { &*context }.heat().install(id, batch);
+            Some(native_poll::installed_heat(unsafe { &*context }, id))
+        } else {
+            None
+        };
         let debug_info = self
             .code
             .install_debug_info_with_arguments(&body.name, self.arguments.as_ref())
@@ -165,6 +183,7 @@ impl EmittedTransfer {
             _capture: self._capture,
             _poll: self._poll,
             _heat_counter: self._heat_counter,
+            execution_heat_binding,
             _completion: self._completion,
             _recursive_prepare: self._recursive_prepare,
             _deopt_capture: self._deopt_capture,
@@ -327,22 +346,42 @@ impl EmittedTransfer {
             .collect();
         // Optimized baseline code still needs T1 heat and OSR handling. The
         // construction tier, not IR optimization or deopt metadata, selects this.
-        let heat_counter = matches!(tier, CompilationTier::T1)
+        let execution_heat = if matches!(tier, CompilationTier::T1) && execution_heat_enabled() {
+            Some((
+                egcl_rt::execution_heat::HeatId::new().ok_or(EmitDecline::ExecutingIdentity)?,
+                native_poll::heat_batch(),
+            ))
+        } else {
+            None
+        };
+        let heat_counter = (matches!(tier, CompilationTier::T1) && execution_heat.is_none())
             .then(|| Box::new(std::sync::atomic::AtomicU32::new(native_poll::heat_batch())));
-        let baseline_heat =
-            heat_counter
-                .as_ref()
-                .map(|counter| egcl_compiler::t2::emit::BaselineHeat {
-                    counter: counter.as_ptr() as u64,
-                    batch: native_poll::heat_batch(),
-                });
-        let poll_fast_path =
-            context
-                .poll_fast_path
-                .map(|fast| egcl_compiler::t2::emit::NativePollFastPath {
-                    baseline_heat,
-                    ..fast
-                });
+        let baseline_heat = execution_heat
+            .map(|(id, batch)| egcl_compiler::t2::emit::BaselineHeat {
+                counter: egcl_compiler::t2::emit::BaselineHeatCounter::ExecutionOwned(id),
+                batch,
+            })
+            .or_else(|| {
+                heat_counter
+                    .as_ref()
+                    .map(|counter| egcl_compiler::t2::emit::BaselineHeat {
+                        counter: egcl_compiler::t2::emit::BaselineHeatCounter::CodeOwned(
+                            counter.as_ptr() as u64,
+                        ),
+                        batch: native_poll::heat_batch(),
+                    })
+            });
+        let poll_fast_path = context.poll_fast_path.map(|fast| {
+            let fast = if execution_heat.is_some() {
+                native_poll::with_execution_heat(fast)
+            } else {
+                fast
+            };
+            egcl_compiler::t2::emit::NativePollFastPath {
+                baseline_heat,
+                ..fast
+            }
+        });
         let poll_helper = match tier {
             CompilationTier::T1 => poll_t1_or_transfer,
             CompilationTier::T2 => poll_t2_or_transfer,
@@ -884,6 +923,7 @@ impl EmittedTransfer {
             _capture: capture,
             _poll: poll,
             _heat_counter: heat_counter,
+            execution_heat,
             _completion: completion,
             _recursive_prepare: recursive_prepare,
             _deopt_capture: deopt_capture,

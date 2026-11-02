@@ -383,6 +383,7 @@ pub(super) struct TransferCode {
     _poll: JitBuffer,
     /// Baseline loop heat countdown the generated polls address (bliss-tudsy).
     _heat_counter: Option<Box<std::sync::atomic::AtomicU32>>,
+    execution_heat_binding: Option<native_poll::InstalledHeat>,
     _completion: JitBuffer,
     _recursive_prepare: Option<JitBuffer>,
     _deopt_capture: Option<JitBuffer>,
