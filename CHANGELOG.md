@@ -637,6 +637,14 @@
 
 ### Performance
 
+- More functions compile instead of running in the interpreter on every
+  call: functions with a parameter named by a special variable (such as
+  `(&key ((:lossage-fun *lossage-fun*)))`), inline `((lambda (x &aux ...))
+  ...)` applications, and DESTRUCTURING-BIND inside a lambda in compiled
+  top-level code. A special parameter is still bound dynamically and
+  restored on every exit; when a later default form could observe the new
+  binding, the function keeps the interpreter.
+  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
 - On x86-64 Linux, optimized code answers ATOM, LISTP, SYMBOLP, PLUSP,
   MINUSP, BIT, SBIT, GET, three-argument LOGAND/LOGIOR/LOGXOR, and TYPEP of a
   structure type name without the general runtime call: about 11 ns a call
