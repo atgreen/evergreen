@@ -651,7 +651,7 @@
   template dispatch stub that follows code replacement and preserves the
   runtime fallback for other executions and unsupported callees.
   `EGCL_LEAN_FUNCALL=0` selects the previous route
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN)).
+  ([#977](https://github.com/atgreen/evergreen/pull/977)).
 
 - More functions that create closures now compile instead of running in the
   interpreter: a closure over a MULTIPLE-VALUE-BIND variable, a HANDLER-CASE
