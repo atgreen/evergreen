@@ -3092,8 +3092,10 @@ mod tests {
             "observer-forced publication cannot prove baseline poll selection"
         );
         assert!(
-            replacement._native_calls.iter().any(|site| matches!(site.origin,
-                egcl_compiler::t2::x64_calls::NativeCallOrigin::StraightPoll(_))),
+            replacement._native_calls.iter().any(|site| matches!(
+                site.origin,
+                egcl_compiler::t2::x64_calls::NativeCallOrigin::StraightPoll(_)
+            )),
             "the refreshed baseline retains its straight-line polls"
         );
         reset_poll_paths_for_test();
@@ -3110,7 +3112,10 @@ mod tests {
         // A baseline straight-line poll samples no heat and services only
         // runtime requests; with none pending it skips the runtime, as the
         // final tier's polls do (bliss-tudsy).
-        assert_eq!(published, 0, "idle baseline straight-line polls skip publication");
+        assert_eq!(
+            published, 0,
+            "idle baseline straight-line polls skip publication"
+        );
         assert_eq!(
             replacement.deopt_count(),
             0,

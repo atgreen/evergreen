@@ -4,6 +4,10 @@
 
 ### Added
 
+- Extend character and string storage to preserve surrogate character codes,
+  with remaining stream, reader and formatting limitations
+  ([#980](https://github.com/atgreen/evergreen/pull/980)).
+
 - Add an experimental iOS Xcode project generator with bundled Lisp source,
   host-worker UI integration and SDK-selected static-runtime linking. Generated
   projects and Apple execution remain unvalidated
@@ -645,14 +649,17 @@
 
 ### Performance
 
+- Add experimental lazy native-frame publication, broader T1 loop entries
+  and batched polling, native closure string access, and wider generic-call
+  caches ([#980](https://github.com/atgreen/evergreen/pull/980)).
+
 - More functions compile instead of running in the interpreter on every
   call: functions with a parameter named by a special variable (such as
   `(&key ((:lossage-fun *lossage-fun*)))`), inline `((lambda (x &aux ...))
   ...)` applications, and DESTRUCTURING-BIND inside a lambda in compiled
   top-level code. A special parameter is still bound dynamically and
-  restored on every exit; when a later default form could observe the new
-  binding, the function keeps the interpreter.
-  ([#977](https://github.com/atgreen/evergreen/pull/977))
+  restored on exit. Keyword-default visibility remains experimental.
+  ([#980](https://github.com/atgreen/evergreen/pull/980))
 - On x86-64 Linux, optimized code answers ATOM, LISTP, SYMBOLP, PLUSP,
   MINUSP, BIT, SBIT, GET, three-argument LOGAND/LOGIOR/LOGXOR, and TYPEP of a
   structure type name without the general runtime call: about 11 ns a call
@@ -691,7 +698,7 @@
   arguments also stays native.
   `EGCL_DISABLE_ORDINARY_VALUES=1` keeps multiple-value functions on the old
   path for comparison.
-  ([#979](https://github.com/atgreen/evergreen/pull/979))
+  ([#980](https://github.com/atgreen/evergreen/pull/980))
 - On x86-64 Linux, a compiled call from one optimized function to another
   named, fixed-arity, optimized function is cheaper. The function object now
   carries its own native entry, so the caller loads the name's current

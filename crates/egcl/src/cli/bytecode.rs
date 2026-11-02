@@ -11895,7 +11895,7 @@ fn key_default_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal,
             continue;
         }
         let mut mentioned = std::collections::HashSet::new();
-        collect_symbol_names(init, &mut mentioned);
+        collect_symbol_names_qq(init, &mut mentioned, 0, false);
         if bound
             .iter()
             .any(|(at, name)| *at >= index && mentioned.contains(name))

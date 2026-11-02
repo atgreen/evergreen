@@ -1709,11 +1709,17 @@ fn t1_loop_polls_sample_heat_in_batches() {
     const BATCH: u32 = 16;
     native_transfer_entry::native_poll::TEST_HEAT_BATCH
         .store(BATCH, std::sync::atomic::Ordering::Relaxed);
-    assert!(!profiling_disabled(), "this regression must exercise real T1 heat");
+    assert!(
+        !profiling_disabled(),
+        "this regression must exercise real T1 heat"
+    );
     assert!(native_transfer_entry::root_publication::OBSERVE.with(|hook| hook.get().is_none()));
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    for (name, speculated) in [("T1-BATCHED-HEAT-LOOP", true), ("T1-BATCHED-HEAT-MAPPED", false)] {
+    for (name, speculated) in [
+        ("T1-BATCHED-HEAT-LOOP", true),
+        ("T1-BATCHED-HEAT-MAPPED", false),
+    ] {
         let source = "((let ((x 0)) (dotimes (i n x) (setq x i))))";
         super::super::super::read_eval_all_env(
             &format!("(defun {name} (n) (progn . {source}))"),
@@ -1724,17 +1730,32 @@ fn t1_loop_polls_sample_heat_in_batches() {
         egcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
         let symbol = egcl_rt::symbols::intern(name);
         let body = Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
-        assert!(body.code.iter().any(|op| matches!(op, Instr::PushTag { .. })), "DOTIMES owns a TAGBODY");
+        assert!(
+            body.code
+                .iter()
+                .any(|op| matches!(op, Instr::PushTag { .. })),
+            "DOTIMES owns a TAGBODY"
+        );
         registry_put(symbol, Arc::clone(&body));
         let baseline = if speculated {
             try_promote_to_t1(symbol).expect("speculated T1 loop")
         } else {
-            native_transfer_entry::install_baseline(symbol, Arc::clone(&body)).expect("generic mapped T1 loop")
+            native_transfer_entry::install_baseline(symbol, Arc::clone(&body))
+                .expect("generic mapped T1 loop")
         };
         assert!(!baseline.is_t2);
-        let NativeCodeStorage::Mapped(code) = &baseline._storage else { panic!("mapped T1 storage") };
-        assert_eq!(code.has_deopt, speculated, "{name}: only the optimized T1 speculates");
-        assert_eq!(code.ordinary_entry.is_some(), speculated, "{name}: ordinary entry");
+        let NativeCodeStorage::Mapped(code) = &baseline._storage else {
+            panic!("mapped T1 storage")
+        };
+        assert_eq!(
+            code.has_deopt, speculated,
+            "{name}: only the optimized T1 speculates"
+        );
+        assert_eq!(
+            code.ordinary_entry.is_some(),
+            speculated,
+            "{name}: ordinary entry"
+        );
         egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(symbol).unwrap());
         let heat_before = egcl_rt::function::back_edge_count(*function);
         native_transfer_entry::reset_poll_paths_for_test();
@@ -1745,12 +1766,20 @@ fn t1_loop_polls_sample_heat_in_batches() {
         );
         let (_, slow) = native_transfer_entry::take_poll_paths_for_test();
         let heat = egcl_rt::function::back_edge_count(*function) - heat_before;
-        assert!((55..=70).contains(&slow),
-            "{name}: about one runtime poll per {BATCH} of 1000 visits, not every visit: {slow}");
-        assert_eq!(heat, slow as u32 * BATCH, "{name}: each sample records its whole batch");
+        assert!(
+            (55..=70).contains(&slow),
+            "{name}: about one runtime poll per {BATCH} of 1000 visits, not every visit: {slow}"
+        );
+        assert_eq!(
+            heat,
+            slow as u32 * BATCH,
+            "{name}: each sample records its whole batch"
+        );
         if !speculated {
-            assert!(native_transfer_entry::native_poll::take_generated_skips() >= 900,
-                "{name}: the mapped loop's other polls take the generated idle guard");
+            assert!(
+                native_transfer_entry::native_poll::take_generated_skips() >= 900,
+                "{name}: the mapped loop's other polls take the generated idle guard"
+            );
         }
     }
 }

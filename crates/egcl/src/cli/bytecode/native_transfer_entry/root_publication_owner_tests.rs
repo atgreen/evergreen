@@ -15,7 +15,9 @@ fn compiled(name: &str, form: &str, env: &Env) -> Rc<TransferCode> {
     let body = Arc::new(compile_function(name, *params, *forms, env, false, false).unwrap());
     // The generic mapped baseline: a speculated local-TAGBODY body would take
     // the ordinary entry's frame layout instead (bliss-tudsy).
-    Rc::new(TransferCode::compile_variant(body, false, true, None).expect("compiled frame-map fixture"))
+    Rc::new(
+        TransferCode::compile_variant(body, false, true, None).expect("compiled frame-map fixture"),
+    )
 }
 
 #[test]
