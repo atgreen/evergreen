@@ -5,8 +5,10 @@
 use super::*;
 
 #[cfg(test)]
+type CreatorObserver = Option<unsafe fn(*mut EgclVal, usize)>;
+#[cfg(test)]
 pub(in crate::cli::bytecode) static OBSERVE: egcl_rt::execution_local::ExecutionLocal<
-    Cell<Option<unsafe fn(*mut EgclVal, usize)>>,
+    Cell<CreatorObserver>,
 > = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(None)) };
 
 pub(super) fn make(args: &[EgclVal], env: &Env) -> Result<EgclVal, EgclError> {
