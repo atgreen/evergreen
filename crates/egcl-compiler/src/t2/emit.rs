@@ -1559,31 +1559,156 @@ pub struct NativePollFastPath {
     pub baseline_heat: Option<BaselineHeat>,
 }
 
-/// Baseline loop heat sampling (bliss-tudsy). Generated code counts
-/// loop-header visits down in a code-owned `u32` at `counter`; when it runs out,
-/// or the idle guard finds pending work, it reloads `batch` and calls the
-/// runtime poll with request bit 2, which records `batch` visits.
+/// Baseline sampling storage. Legacy code embeds a stable address; experimental
+/// execution-owned code resolves an immutable artifact identity at entry.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub enum BaselineHeatCounter {
+    CodeOwned(u64),
+    ExecutionOwned(egcl_rt::execution_heat::HeatId),
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[derive(Clone, Copy, Debug)]
 pub struct BaselineHeat {
-    pub counter: u64,
+    pub counter: BaselineHeatCounter,
     pub batch: u32,
 }
 
-/// Count one visit; branch to `slow` once the batch is spent.
+/// Two raw frame words. Neither is a tagged value or a collector root.
+/// The fallback's address is stable across calls and fiber suspension because
+/// native frames retain their physical stack until their epilogue retires it.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn emit_heat_countdown(a: &mut Asm, heat: BaselineHeat, slow: egcl_rt::asm::Label) {
-    mov_imm64(a, RAX, heat.counter as i64);
+#[derive(Clone, Copy)]
+struct HeatCacheHomes {
+    pointer: u32,
+    fallback: u32,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_fallback_address(a: &mut Asm, dst: u8, cache: HeatCacheHomes) {
+    debug_assert!(dst == RAX || dst == SCRATCH);
+    // lea rax/rdx,[rsp+fallback]. Poll emission runs at body RSP, before
+    // reserving any temporary call/request area.
+    a.extend_from_slice(&[0x48, 0x8d, if dst == RAX { 0x84 } else { 0x94 }, 0x24]);
+    a.extend_from_slice(&framed_stack_disp(cache.fallback).to_le_bytes());
+}
+
+/// Always initialize a valid fallback before attempting an execution lookup.
+/// RDX is untouched so it can hold the execution pointer during this sequence.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_fallback(a: &mut Asm, cache: HeatCacheHomes) {
+    mov_imm64(a, RAX, 1);
+    store_home(a, FramedHome::Stack(cache.fallback), RAX, 0);
+    emit_heat_fallback_address(a, RAX, cache);
+    store_home(a, FramedHome::Stack(cache.pointer), RAX, 0);
+}
+
+/// Resolve once per activation using only reserved scratch registers. The
+/// execution retains cells and old views until its last native frame retires.
+/// Missing execution/view/binding keeps the valid per-frame countdown of one.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_binding(
+    a: &mut Asm,
+    id: egcl_rt::execution_heat::HeatId,
+    execution: u8,
+    cache: HeatCacheHomes,
+) {
+    use egcl_rt::execution_heat::{ExecutionHeatDirectory, HeatView};
+    let missing = a.label();
+    mov_rr(a, SCRATCH, execution);
+    emit_heat_fallback(a, cache);
+    mov_rr(a, RAX, SCRATCH);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::E, missing);
+    load_mem64_disp(
+        a,
+        RAX,
+        RAX,
+        egcl_rt::exec_context::offsets::EXECUTION_HEAT as i32,
+    );
+    load_mem64_disp(a, RAX, RAX, ExecutionHeatDirectory::VIEW_OFFSET as i32);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::E, missing);
+    mov_imm64(a, SCRATCH, id.ordinal() as i64);
+    cmp_mem64_disp8(a, SCRATCH, RAX, std::mem::offset_of!(HeatView, len) as u8);
+    a.jcc(Cc::Ae, missing);
+    load_mem64_disp(a, RAX, RAX, std::mem::offset_of!(HeatView, slots) as i32);
+    load_mem64_disp(a, RAX, RAX, (id.ordinal() * 8) as i32);
+    alu_r_imm(a, 7, RAX, 0);
+    a.jcc(Cc::E, missing);
+    store_home(a, FramedHome::Stack(cache.pointer), RAX, 0);
+    a.bind(missing);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn load_heat_counter(a: &mut Asm, heat: BaselineHeat, cache: Option<HeatCacheHomes>) {
+    match heat.counter {
+        BaselineHeatCounter::CodeOwned(address) => mov_imm64(a, RAX, address as i64),
+        BaselineHeatCounter::ExecutionOwned(_) => load_home(
+            a,
+            RAX,
+            FramedHome::Stack(cache.expect("execution heat cache").pointer),
+            0,
+        ),
+    }
+}
+
+/// Real and fallback counters use the same hot instruction shape: load the
+/// valid pointer, decrement, branch when spent. No null test per backedge.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_countdown(
+    a: &mut Asm,
+    heat: BaselineHeat,
+    cache: Option<HeatCacheHomes>,
+    slow: egcl_rt::asm::Label,
+) {
+    load_heat_counter(a, heat, cache);
     a.extend_from_slice(&[0x83, 0x28, 0x01]); // sub dword [rax],1
     a.jcc(Cc::Le, slow);
 }
 
-/// The slow edge of a counted poll: restart the batch it samples.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn emit_heat_reload(a: &mut Asm, heat: BaselineHeat) {
-    mov_imm64(a, RAX, heat.counter as i64);
-    a.extend_from_slice(&[0xc7, 0x00]); // mov dword [rax],batch
-    a.extend_from_slice(&heat.batch.to_le_bytes());
+fn emit_heat_reload(a: &mut Asm, heat: BaselineHeat, cache: Option<HeatCacheHomes>) {
+    load_heat_counter(a, heat, cache);
+    if matches!(heat.counter, BaselineHeatCounter::ExecutionOwned(_)) {
+        let fallback = a.label();
+        let done = a.label();
+        emit_heat_fallback_address(a, SCRATCH, cache.expect("execution heat cache"));
+        cmp_rr(a, RAX, SCRATCH);
+        a.jcc(Cc::E, fallback);
+        a.extend_from_slice(&[0xc7, 0x00]); // mov dword [rax],batch
+        a.extend_from_slice(&heat.batch.to_le_bytes());
+        a.jmp(done);
+        a.bind(fallback);
+        a.extend_from_slice(&[0xc7, 0x00]); // mov dword [rax],1
+        a.extend_from_slice(&1u32.to_le_bytes());
+        a.bind(done);
+    } else {
+        a.extend_from_slice(&[0xc7, 0x00]);
+        a.extend_from_slice(&heat.batch.to_le_bytes());
+    }
+}
+
+/// A fallback represents one observed visit, not a batch. Pointer comparison
+/// is confined to this cold request and reload, never the hot countdown.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_request(a: &mut Asm, heat: BaselineHeat, cache: Option<HeatCacheHomes>) {
+    if matches!(heat.counter, BaselineHeatCounter::ExecutionOwned(_)) {
+        let single = a.label();
+        let done = a.label();
+        load_heat_counter(a, heat, cache);
+        emit_heat_fallback_address(a, SCRATCH, cache.expect("execution heat cache"));
+        cmp_rr(a, RAX, SCRATCH);
+        a.jcc(Cc::E, single);
+        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x05]); // batch
+        a.jmp(done);
+        a.bind(single);
+        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // one actual visit
+        a.bind(done);
+    } else {
+        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x05]);
+    }
 }
 
 /// One acquire observation of the running execution's pending work. The slot
@@ -1613,6 +1738,7 @@ fn emit_idle_poll_guard(
     home: FramedHome,
     idle: egcl_rt::asm::Label,
     heat: Option<BaselineHeat>,
+    heat_cache: Option<HeatCacheHomes>,
 ) {
     use std::mem::offset_of;
     let slow = a.label();
@@ -1642,7 +1768,7 @@ fn emit_idle_poll_guard(
         a.bind(no_observer);
     }
     if let Some(heat) = heat {
-        emit_heat_countdown(a, heat, slow);
+        emit_heat_countdown(a, heat, heat_cache, slow);
     }
     if fast.instrument_skips {
         load_mem64_disp(
@@ -1658,7 +1784,7 @@ fn emit_idle_poll_guard(
     a.jmp(idle);
     a.bind(slow);
     if let Some(heat) = heat {
-        emit_heat_reload(a, heat);
+        emit_heat_reload(a, heat, heat_cache);
     }
 }
 
@@ -1671,6 +1797,7 @@ struct PollFrame {
     baseline_heat: bool,
     /// Baseline code's loop heat counter, when its idle polls can skip.
     heat_counter: Option<BaselineHeat>,
+    heat_cache: Option<HeatCacheHomes>,
     arguments: Vec<(crate::t2::ir::Value, u32)>,
     native_frame_mode: bool,
     spill_area: NativeValueArea,
@@ -1706,7 +1833,7 @@ fn emit_mapped_poll(
             .fast_path
             .map(|(fast, home)| {
                 let idle = a.label();
-                emit_idle_poll_guard(a, fast, home, idle, counter);
+                emit_idle_poll_guard(a, fast, home, idle, counter, frame.heat_cache);
                 idle
             })
             .or_else(|| {
@@ -1717,12 +1844,12 @@ fn emit_mapped_poll(
                     let slow = a.label();
                     emit_execution_poll_guard(a, 13, slow);
                     if let Some(heat) = counter {
-                        emit_heat_countdown(a, heat, slow);
+                        emit_heat_countdown(a, heat, frame.heat_cache, slow);
                     }
                     a.jmp(idle);
                     a.bind(slow);
                     if let Some(heat) = counter {
-                        emit_heat_reload(a, heat);
+                        emit_heat_reload(a, heat, frame.heat_cache);
                     }
                     idle
                 })
@@ -1786,8 +1913,8 @@ fn emit_mapped_poll(
     // Only a poll that always calls the runtime samples heat, one visit per
     // call. A counted poll samples its whole batch (bit 2); pending work that
     // ends a batch early also counts as one, since heat is an estimate.
-    if heat && counter.is_some() && idle.is_some() {
-        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x05]); // or rdi,5
+    if let Some(counter) = counter.filter(|_| heat && idle.is_some()) {
+        emit_heat_request(a, counter, frame.heat_cache);
     } else if heat && idle.is_none() {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
@@ -7874,6 +8001,28 @@ fn emit_framed_inner(
         next_stack += 1;
         home
     });
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let selected_heat = poll_fast_path
+        .and_then(|fast| fast.baseline_heat)
+        .or_else(|| {
+            ordinary_call
+                .filter(|call| !call.self_facts.top_tier)
+                .and_then(|call| call.self_facts.baseline_heat)
+        });
+    // Stable pointer plus fallback countdown: raw words absent from tagged
+    // root maps, allocated before frame sizing and ordinary stack admission.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let heat_cache = selected_heat.and_then(|heat| match heat.counter {
+        BaselineHeatCounter::ExecutionOwned(_) => {
+            let cache = HeatCacheHomes {
+                pointer: next_stack,
+                fallback: next_stack + 1,
+            };
+            next_stack += 2;
+            Some(cache)
+        }
+        BaselineHeatCounter::CodeOwned(_) => None,
+    });
     let native_control_home = native_frame_mode.then(|| {
         let home = FramedHome::Stack(next_stack);
         next_stack += 1;
@@ -7977,6 +8126,40 @@ fn emit_framed_inner(
             load_home(a, 7, frame_base_home.expect("mapped poll activation"), 0);
         }
     };
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let initialize_heat = |a: &mut Asm| {
+        if let Some((
+            BaselineHeat {
+                counter: BaselineHeatCounter::ExecutionOwned(id),
+                ..
+            },
+            home,
+        )) = selected_heat.zip(heat_cache)
+        {
+            if ordinary_call_mode {
+                emit_heat_binding(a, id, 13, home);
+            } else if let Some(control) = poll_control_home {
+                let missing = a.label();
+                let done = a.label();
+                load_home(a, RAX, control, 0);
+                alu_r_imm(a, 7, RAX, 0);
+                a.jcc(Cc::E, missing);
+                load_mem64_disp(
+                    a,
+                    SCRATCH,
+                    RAX,
+                    std::mem::offset_of!(NativePollControl, execution) as i32,
+                );
+                emit_heat_binding(a, id, SCRATCH, home);
+                a.jmp(done);
+                a.bind(missing);
+                emit_heat_fallback(a, home);
+                a.bind(done);
+            } else {
+                emit_heat_fallback(a, home);
+            }
+        }
+    };
     let mut a = Asm::new();
     let deopt = a.label();
     let arg_regs = [1u8, 8, 9, 10]; // rcx, r8, r9, r10
@@ -7992,6 +8175,13 @@ fn emit_framed_inner(
                 && !f.is_variadic()
                 && frame_base_home.is_none()
                 && f.block(entry).params.len() <= arg_regs.len()));
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if has_reg_entry && heat_cache.is_some() {
+        // Current recursive native entries have no poll fast path or sampled
+        // heat. Do not publish a future unchecked ingress with an uninitialized
+        // cache or introduce a helper call before its argument/root contract.
+        return Err(EmitError::UnsupportedOp(0xFA));
+    }
     // Even pure self-recursion can enter c2i at the stack limit or deoptimize.
     // Every native caller must propagate a transfer raised by that fallback.
     let transfer_check = (c2i_transfer_pending_addr != 0).then(|| NativeTransferCheck {
@@ -8203,6 +8393,8 @@ fn emit_framed_inner(
     }
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     initialize_poll(&mut a);
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    initialize_heat(&mut a);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(recursion) = native_recursion {
         store_home(&mut a, native_stack_home.unwrap(), 6, 0);
@@ -8612,6 +8804,7 @@ fn emit_framed_inner(
             parallel_home_move(&mut a, &bound_moves);
             a.bind(parameters_moved);
         }
+        initialize_heat(&mut a);
         if ordinary_call_mode {
             mov_imm64(&mut a, RAX, 0);
             store_home(&mut a, frame_base_home.unwrap(), RAX, 0);
@@ -8648,13 +8841,8 @@ fn emit_framed_inner(
                 || ordinary_call.is_some_and(|call| {
                     !call.self_facts.top_tier && call.self_facts.baseline_heat.is_some()
                 }),
-            heat_counter: poll_fast_path
-                .and_then(|fast| fast.baseline_heat)
-                .or_else(|| {
-                    ordinary_call
-                        .filter(|call| !call.self_facts.top_tier)
-                        .and_then(|call| call.self_facts.baseline_heat)
-                }),
+            heat_counter: selected_heat,
+            heat_cache,
             arguments: native_arguments.clone(),
             native_frame_mode,
             spill_area,
@@ -11455,6 +11643,8 @@ fn emit_framed_inner(
         }
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         initialize_poll(&mut a);
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        initialize_heat(&mut a);
         // The header state names values that are not live at the target and
         // so are never imported — deopt-only loop phis. Give those homes NIL
         // first, so a later deopt stub (a failed entry check, or any guard in
@@ -14794,6 +14984,7 @@ mod poll_map_tests {
                     execution_idle: false,
                     baseline_heat: false,
                     heat_counter: None,
+                    heat_cache: None,
                     arguments: Vec::new(),
                     native_frame_mode: false,
                     spill_area: NativeValueArea::Activation(0),
@@ -15003,6 +15194,7 @@ mod poll_map_tests {
                     execution_idle: false,
                     baseline_heat: false,
                     heat_counter: None,
+                    heat_cache: None,
                     arguments: Vec::new(),
                     native_frame_mode: false,
                     spill_area: if native_storage {
@@ -15261,3 +15453,192 @@ mod unused_deopt_tests;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 #[path = "phi_cycle_tests.rs"]
 mod phi_cycle_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod execution_heat_tests {
+    use super::*;
+    use egcl_rt::exec_context::{ExecutionKind, LispExecutionContext};
+    use egcl_rt::execution_heat::HeatId;
+    use std::sync::atomic::Ordering;
+
+    // Execute the actual binding/countdown/reload/request emission helpers.
+    // A call is one short activation; zero means no poll, 1/5 are actual
+    // runtime request bits and therefore credit one visit/a whole batch.
+    fn fragment(id: HeatId, batch: u32) -> (egcl_rt::jit::JitBuffer, Vec<u8>) {
+        fragment_visits(id, batch, 1)
+    }
+
+    fn fragment_visits(
+        id: HeatId,
+        batch: u32,
+        visits: usize,
+    ) -> (egcl_rt::jit::JitBuffer, Vec<u8>) {
+        let mut a = Asm::new();
+        let cache = HeatCacheHomes {
+            pointer: 0,
+            fallback: 1,
+        };
+        let heat = BaselineHeat {
+            counter: BaselineHeatCounter::ExecutionOwned(id),
+            batch,
+        };
+        alu_r_imm(&mut a, 5, 4, 16);
+        emit_heat_binding(&mut a, id, 7, cache);
+        mov_imm64(&mut a, 8, 0); // caller-saved request sum
+        for _ in 0..visits {
+            let slow = a.label();
+            let done = a.label();
+            emit_heat_countdown(&mut a, heat, Some(cache), slow);
+            a.jmp(done);
+            a.bind(slow);
+            emit_heat_reload(&mut a, heat, Some(cache));
+            mov_imm64(&mut a, 7, 0);
+            emit_heat_request(&mut a, heat, Some(cache));
+            alu_rr(&mut a, 0x01, 8, 7); // add r8,rdi
+            a.bind(done);
+        }
+        mov_rr(&mut a, RAX, 8);
+        alu_r_imm(&mut a, 0, 4, 16);
+        a.push(0xc3);
+        let bytes = a.finish().unwrap();
+        (egcl_rt::jit::JitBuffer::new(&bytes).unwrap(), bytes)
+    }
+
+    #[test]
+    fn execution_heat_hot_countdown_is_only_load_subtract_and_branch() {
+        let heat = BaselineHeat {
+            counter: BaselineHeatCounter::ExecutionOwned(HeatId::new().unwrap()),
+            batch: 128,
+        };
+        let cache = HeatCacheHomes {
+            pointer: 0,
+            fallback: 1,
+        };
+        let mut actual = Asm::new();
+        let slow = actual.label();
+        emit_heat_countdown(&mut actual, heat, Some(cache), slow);
+        actual.bind(slow);
+        let mut expected = Asm::new();
+        let slow = expected.label();
+        load_from_rsp(&mut expected, RAX, 0);
+        expected.extend_from_slice(&[0x83, 0x28, 0x01]);
+        expected.jcc(Cc::Le, slow);
+        expected.bind(slow);
+        assert_eq!(actual.finish().unwrap(), expected.finish().unwrap());
+    }
+
+    #[test]
+    fn legacy_heat_countdown_and_reload_keep_original_emission() {
+        let heat = BaselineHeat {
+            counter: BaselineHeatCounter::CodeOwned(0x1234_5678_90ab_cdef),
+            batch: 16,
+        };
+        let mut actual = Asm::new();
+        let slow = actual.label();
+        emit_heat_countdown(&mut actual, heat, None, slow);
+        actual.bind(slow);
+        emit_heat_reload(&mut actual, heat, None);
+        emit_heat_request(&mut actual, heat, None);
+        let mut expected = Asm::new();
+        let slow = expected.label();
+        mov_imm64(&mut expected, RAX, 0x1234_5678_90ab_cdef);
+        expected.extend_from_slice(&[0x83, 0x28, 0x01]);
+        expected.jcc(Cc::Le, slow);
+        expected.bind(slow);
+        mov_imm64(&mut expected, RAX, 0x1234_5678_90ab_cdef);
+        expected.extend_from_slice(&[0xc7, 0x00]);
+        expected.extend_from_slice(&16u32.to_le_bytes());
+        expected.extend_from_slice(&[0x48, 0x83, 0xcf, 0x05]);
+        assert_eq!(actual.finish().unwrap(), expected.finish().unwrap());
+    }
+
+    #[test]
+    fn execution_heat_is_independent_cumulative_and_versioned() {
+        let id = HeatId::new().unwrap();
+        let (code, bytes) = fragment(id, 4);
+        // SAFETY: fragment reads only a live context's retained metadata;
+        // all modified registers are caller-saved, and RSP is restored.
+        let visit: extern "C" fn(*const LispExecutionContext) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+        let a = LispExecutionContext::new(ExecutionKind::Fiber, 1, 1);
+        let b = LispExecutionContext::new(ExecutionKind::Fiber, 2, 1);
+        a.heat().install(id, 4);
+        b.heat().install(id, 4);
+        for _ in 0..3 {
+            assert_eq!(visit(&a), 0);
+        }
+        assert_eq!(a.heat().counter(id).unwrap().load(Ordering::Relaxed), 1);
+        assert_eq!(visit(&b), 0);
+        assert_eq!(b.heat().counter(id).unwrap().load(Ordering::Relaxed), 3);
+        a.heat().install(id, 4); // repeated entry/publication cannot reset heat
+        assert_eq!(visit(&a), 5, "four actual visits credit exactly four");
+        a.set_carrier_id(9);
+        assert_eq!(visit(&a), 0);
+        let next = HeatId::new().unwrap();
+        a.heat().install(next, 4);
+        let (replacement, _) = fragment(next, 4);
+        let new_visit: extern "C" fn(*const LispExecutionContext) -> u64 =
+            unsafe { std::mem::transmute(replacement.as_ptr()) };
+        assert_eq!(new_visit(&a), 0);
+        assert_eq!(a.heat().counter(next).unwrap().load(Ordering::Relaxed), 3);
+        for _ in 0..64 {
+            a.heat().install(HeatId::new().unwrap(), 4);
+        }
+        assert_eq!(
+            visit(&a),
+            0,
+            "retained older version keeps its own countdown"
+        );
+        assert_eq!(a.heat().counter(id).unwrap().load(Ordering::Relaxed), 2);
+        assert_eq!(b.heat().counter(id).unwrap().load(Ordering::Relaxed), 3);
+        for context in [&a, &b] {
+            let address = context.heat().counter(id).unwrap() as *const _ as usize;
+            assert!(!bytes.windows(8).any(|b| b == address.to_le_bytes()));
+        }
+    }
+
+    #[test]
+    fn missing_heat_binding_credits_one_visit_not_a_fabricated_batch() {
+        let low = HeatId::new().unwrap();
+        let a = LispExecutionContext::new(ExecutionKind::Fiber, 3, 1);
+        a.heat().install(low, 8);
+        // Allocate an identity beyond the current immutable view bounds.
+        let bound = (low.ordinal() + 1).next_power_of_two().max(16);
+        let id = loop {
+            let id = HeatId::new().unwrap();
+            if id.ordinal() >= bound {
+                break id;
+            }
+        };
+        let (code, _) = fragment(id, 8);
+        let visit: extern "C" fn(*const LispExecutionContext) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+        for _ in 0..3 {
+            assert_eq!(visit(&a), 1, "out of bounds");
+        }
+        assert_eq!(visit(std::ptr::null()), 1, "null execution");
+        let (repeated, _) = fragment_visits(id, 8, 3);
+        let repeat: extern "C" fn(*const LispExecutionContext) -> u64 =
+            unsafe { std::mem::transmute(repeated.as_ptr()) };
+        assert_eq!(
+            repeat(&a),
+            3,
+            "fallback reloads one on each edge within one activation"
+        );
+        assert_eq!(repeat(std::ptr::null()), 3);
+
+        let b = LispExecutionContext::new(ExecutionKind::Fiber, 4, 1);
+        assert_eq!(visit(&b), 1, "null view");
+        let high = HeatId::new().unwrap();
+        b.heat().install(high, 8);
+        for _ in 0..3 {
+            assert_eq!(visit(&b), 1, "null slot within view");
+        }
+        assert_eq!(a.heat().counter(low).unwrap().load(Ordering::Relaxed), 8);
+        assert_eq!(b.heat().counter(high).unwrap().load(Ordering::Relaxed), 8);
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "execution_heat_migration_test.rs"]
+mod execution_heat_migration_test;

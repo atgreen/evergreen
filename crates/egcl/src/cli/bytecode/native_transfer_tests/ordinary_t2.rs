@@ -1698,6 +1698,10 @@ fn t1_loop_polls_sample_heat_in_batches() {
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    // Generic tagbody loops also have ordinary entries now. Give the mapped
+    // fixture an observable MV return and keep that transport on its mapped
+    // path, so both native entry protocols remain covered.
+    let _mapped_values = native_transfer_entry::MappedValuesForTest::new();
     struct RestoreBatch;
     impl Drop for RestoreBatch {
         fn drop(&mut self) {
@@ -1720,7 +1724,11 @@ fn t1_loop_polls_sample_heat_in_batches() {
         ("T1-BATCHED-HEAT-LOOP", true),
         ("T1-BATCHED-HEAT-MAPPED", false),
     ] {
-        let source = "((let ((x 0)) (dotimes (i n x) (setq x i))))";
+        let source = if speculated {
+            "((let ((x 0)) (dotimes (i n x) (setq x i))))"
+        } else {
+            "((let ((x 0)) (values (dotimes (i n x) (setq x i)) 17)))"
+        };
         super::super::super::read_eval_all_env(
             &format!("(defun {name} (n) (progn . {source}))"),
             &mut env,
@@ -1764,6 +1772,13 @@ fn t1_loop_polls_sample_heat_in_batches() {
             run_native(&baseline, symbol, &[EgclVal::from_fixnum(1000)], &mut env).unwrap(),
             EgclVal::from_fixnum(999)
         );
+        if !speculated {
+            assert!(env.mv_active);
+            assert_eq!(
+                env.mv,
+                vec![EgclVal::from_fixnum(999), EgclVal::from_fixnum(17)]
+            );
+        }
         let (_, slow) = native_transfer_entry::take_poll_paths_for_test();
         let heat = egcl_rt::function::back_edge_count(*function) - heat_before;
         assert!(

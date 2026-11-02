@@ -82,6 +82,8 @@ pub struct LispExecutionContext {
     code_owner: u64,
     /// Lifetime owner of ordinal call cells and immutable generated views.
     call_linkage: Box<crate::call_table::ExecutionCallLinkage>,
+    /// Stable T1 countdown cells retained through execution retirement.
+    heat: Box<crate::execution_heat::ExecutionHeatDirectory>,
 }
 
 static NEXT_CODE_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -105,6 +107,8 @@ pub mod offsets {
     /// `code_owner`
     pub const CODE_OWNER: usize = 48;
     pub const CALL_LINKAGE: usize = 56;
+    /// Execution-owned T1 countdown directory.
+    pub const EXECUTION_HEAT: usize = 64;
 }
 
 impl LispExecutionContext {
@@ -118,11 +122,16 @@ impl LispExecutionContext {
             poll_slot: crate::execution_poll::register(carrier_id),
             code_owner: NEXT_CODE_OWNER.fetch_add(1, Ordering::Relaxed),
             call_linkage: Box::default(),
+            heat: Box::default(),
         }
     }
 
     pub fn call_linkage(&self) -> &crate::call_table::ExecutionCallLinkage {
         &self.call_linkage
+    }
+
+    pub fn heat(&self) -> &crate::execution_heat::ExecutionHeatDirectory {
+        &self.heat
     }
 
     /// This execution's unique code-owner key; see the field.
@@ -336,6 +345,10 @@ mod tests {
             &ctx.call_linkage as *const _ as usize - base,
             offsets::CALL_LINKAGE
         );
+        assert_eq!(
+            &ctx.heat as *const _ as usize - base,
+            offsets::EXECUTION_HEAT
+        );
         assert_ne!(ctx.code_owner(), 0);
         assert_ne!(ctx.code_owner(), other.code_owner());
     }
@@ -368,14 +381,14 @@ mod tests {
         assert_eq!(first.active_native_control(), 0);
         assert_eq!(second.active_native_control(), 0);
         assert_eq!(offsets::ACTIVE_NATIVE_CONTROL, 32);
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 64);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 72);
     }
 
     /// Every field is one machine word, so generated code can load any of them
     /// with a single `mov` at a fixed displacement.
     #[test]
     fn every_field_is_one_machine_word() {
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 64);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 72);
         assert_eq!(std::mem::align_of::<LispExecutionContext>(), 8);
     }
 

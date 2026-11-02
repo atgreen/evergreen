@@ -292,6 +292,7 @@ not a portable Common Lisp interface, and many are read once.
 | `EGCL_OSR_THRESHOLD` | Override named-loop OSR threshold; default 100,000 back edges |
 | `EGCL_BAIL_TRACE=1` | Collect bytecode-lowering decline reasons |
 | `EGCL_R13_CALL_LINKAGE=1` | Resolve ordinary x86-64 Linux call metadata through the current execution context; disabled by default |
+| `EGCL_EXECUTION_T1_HEAT=1` | Keep T1 sampling countdowns in the current execution on x86-64 Linux; disabled by default |
 
 Eager FASL compilation covers each installed named bytecode definition and the
 closure templates reachable through its nested-function graph. Templates share
