@@ -27,8 +27,8 @@ fn heap_environment_and_its_slot_values_relocate() {
     let _lock = super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    egcl_rt::gc::collect_t0_minor().unwrap();
     let _ = arena_cons(NIL, NIL);
+    egcl_rt::gc::collect_t0_minor().unwrap();
     egcl_rt::rooted!(parent = egcl_rt::lexenv::make(NIL, 1).expect("parent"));
     egcl_rt::rooted!(child = egcl_rt::lexenv::make(*parent, 2).expect("child"));
     egcl_rt::rooted!(value = arena_cons(EgclVal::from_fixnum(42), NIL));

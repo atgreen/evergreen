@@ -27,6 +27,7 @@
     "egcl:test:lexical_forwarding_cli": [""],
     "egcl:test:closure_owner_churn_cli": [""],
     "egcl:test:closure_entry_cli": [""],
+    "egcl:test:heap_creator_control_cli": [""],
     "egcl:test:lambda_list_entries_cli": [""],
     "egcl:test:special_parameter_entry_cli": [""],
     "egcl:test:treewalker_exit_cli": [""],

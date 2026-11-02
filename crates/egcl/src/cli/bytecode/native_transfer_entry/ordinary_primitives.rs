@@ -319,7 +319,9 @@ impl Bindings {
             *creator,
             |bcp, operands| {
                 matches!(body.code.get(bcp as usize), Some(Instr::MakeEnvClosure { func, nflat })
-                if operands == usize::from(*nflat) + 1 && body.nested_functions.get(*func as usize).is_some())
+                if operands == usize::from(*nflat) + 1
+                    && body.nested_functions.get(*func as usize)
+                        .is_some_and(|nested| super::super::closure_templates::control_free(nested)))
             },
         )?;
         if count != 0 && !cells.iter().any(|(symbol, _)| symbol == creator) {

@@ -1364,7 +1364,7 @@ impl TransferCode {
         let local_tags = optimize && t1_ordinary_tagbody_body(&body);
         let function_lookup = t1_ordinary_function_lookup_body(&body);
         let heap_access = t1_ordinary_heap_access_body(&body);
-        let heap_creator = t1_ordinary_heap_creator_body(&body);
+        let heap_creator = ordinary_heap_creator_supported(&body);
         let optimize = optimize
             && (scope_free_native_body(&body, false)
                 || local_tags
@@ -2603,13 +2603,23 @@ fn ordinary_heap_creators_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_HEAP_CREATORS").is_none())
 }
 
-fn t1_ordinary_heap_creator_body(body: &BytecodeFunction) -> bool {
+/// Ordinary creators cannot inherit or register lexical exit scopes. Their
+/// nested templates must therefore need only heap lexical values; control-aware
+/// creation remains on the mapped path that installs the captured scope.
+pub(super) fn ordinary_heap_creator_supported(body: &BytecodeFunction) -> bool {
     ordinary_heap_creators_enabled()
         && fixed_tagged_parameters(body)
         && body
             .code
             .iter()
             .any(|op| matches!(op, Instr::MakeEnvClosure { .. }))
+        && body.code.iter().all(|op| match op {
+            Instr::MakeEnvClosure { func, .. } => body
+                .nested_functions
+                .get(*func as usize)
+                .is_some_and(|nested| super::closure_templates::control_free(nested)),
+            _ => true,
+        })
         && body.code.iter().all(|op| {
             local_control_op(op, false, false, true)
                 || matches!(

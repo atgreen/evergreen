@@ -39,6 +39,11 @@ pub(super) fn make(args: &[EgclVal], env: &Env) -> Result<EgclVal, EgclError> {
                 .ok_or_else(invalid_capture)?,
         )
     };
+    // Ordinary callers do not install their captured lexical exit scopes in
+    // the shared Env. Publication must keep these creators on the mapped path.
+    if !super::super::closure_templates::control_free(&nested) {
+        return Err(invalid_capture());
+    }
     // Release all native-directory/body borrows before allocation. The caller
     // segment retains the template, while these writable roots own every
     // parent and flat capture throughout make_closure's allocations.

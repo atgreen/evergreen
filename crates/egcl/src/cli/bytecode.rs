@@ -32461,7 +32461,21 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
     // environment operations semantic too: the ordinary entry reads its
     // closure environment from the hidden callable, and a declined ordinary
     // emission falls back to the same legalized mapped clone.
+    let has_heap_creator = bf
+        .code
+        .iter()
+        .any(|op| matches!(op, Instr::MakeEnvClosure { .. }));
+    // The semantic creator adapter does not publish a creator's lexical
+    // block/tag scope. Keep scoped creators on the original native-scope
+    // builder, whose decode-at-PC helper captures those exact live tokens.
+    // Existing noncreator heap bodies retain their previous admission.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let semantic_heap_creators =
+        !has_heap_creator || native_transfer_entry::ordinary_heap_creator_supported(bf);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    let semantic_heap_creators = !has_heap_creator;
     let heap_env_body = cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && semantic_heap_creators
         && bf.code.iter().any(|op| {
             matches!(
                 op,
