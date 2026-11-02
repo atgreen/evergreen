@@ -1362,8 +1362,12 @@ impl TransferCode {
         // non-speculating retry keeps the generic native-cleanups build.
         let local_tags = optimize && t1_ordinary_tagbody_body(&body);
         let function_lookup = t1_ordinary_function_lookup_body(&body);
-        let optimize =
-            optimize && (scope_free_native_body(&body, false) || local_tags || function_lookup);
+        let heap_access = t1_ordinary_heap_access_body(&body);
+        let optimize = optimize
+            && (scope_free_native_body(&body, false)
+                || local_tags
+                || function_lookup
+                || heap_access);
         // Mandatory result guards also need exact recovery metadata in the
         // baseline tier, including when VALUES produced the checked primary.
         // This does not enable speculation for multiple-value bodies.
@@ -1376,6 +1380,7 @@ impl TransferCode {
             || result_recovery
             || t1_ordinary_tagbody_body(&body)
             || function_lookup
+            || heap_access
         {
             // A method's callable lives in an uninterned symbol whose name,
             // "(METHOD ...)", does not read back; the installed symbol is its
@@ -2560,6 +2565,29 @@ fn t1_ordinary_function_lookup_body(body: &BytecodeFunction) -> bool {
             .any(|op| matches!(op, Instr::LoadFunction(_)))
         && body.code.iter().all(|op| {
             local_control_op(op, false, false, true) || matches!(op, Instr::LoadFunction(_))
+        })
+}
+
+/// Acyclic heap-environment bodies need only the hidden callable and inline
+/// slot accesses already implemented by ordinary emission. Keep creators,
+/// dynamic scopes and backward branches on their existing mapped path.
+fn t1_ordinary_heap_access_body(body: &BytecodeFunction) -> bool {
+    let heap_op = |op: &Instr| {
+        matches!(
+            op,
+            Instr::ClosureEnv | Instr::EnvRef { .. } | Instr::EnvSet { .. }
+        )
+    };
+    fixed_tagged_parameters(body)
+        && body.code.iter().any(heap_op)
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true)
+                || heap_op(op)
+                || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
+        })
+        && !body.code.iter().enumerate().any(|(bcp, op)| {
+            matches!(op, Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target)
+                if (*target as usize) <= bcp)
         })
 }
 
