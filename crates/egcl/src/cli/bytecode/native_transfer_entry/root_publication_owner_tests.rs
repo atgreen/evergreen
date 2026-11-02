@@ -109,8 +109,9 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     words[(outer_saved_rbx - low) / 8] = 0xaaa0;
     words[(saved_rbx - low) / 8] = 0xabc0;
     let boundary = PublishedBoundary {
-        directory: Rc::clone(&directory),
-        owner: Rc::as_ptr(&inner),
+        directory: Rc::as_ptr(&directory),
+        owner: Cell::new(Rc::as_ptr(&inner)),
+        owner_resolved: Cell::new(true),
         context: std::ptr::null_mut(),
         root_owner: Rc::as_ptr(&inner),
         cursor: NativeFrameCursor {
@@ -168,7 +169,7 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     // A helper can start in B while the segment's root A is unregistered.
     // Publication must retain those two identities separately.
     let foreign = PublishedBoundary {
-        owner: Rc::as_ptr(&outer),
+        owner: Cell::new(Rc::as_ptr(&outer)),
         cursor: second_cursor.unwrap(),
         ..boundary
     };

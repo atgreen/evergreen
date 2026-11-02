@@ -71,9 +71,10 @@ fn observe_aliases() {
     // on which registers the allocator chooses for this particular fixture.
     // Both descriptors use the live frame's exact PC, bounds and unwind maps.
     let mut alias = PublishedBoundary {
-        owner: original.owner,
+        owner: Cell::new(original.owner()),
+        owner_resolved: Cell::new(true),
         root_owner: original.root_owner,
-        directory: std::rc::Rc::clone(&original.directory),
+        directory: original.directory,
         context: original.context,
         cursor: original.cursor,
         bounds: original.bounds.clone(),

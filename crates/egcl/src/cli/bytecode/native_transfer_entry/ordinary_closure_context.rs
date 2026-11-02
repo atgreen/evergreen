@@ -17,7 +17,7 @@ pub(super) fn access(args: &[EgclVal], store: bool) -> Result<EgclVal, EgclError
     let boundary = unsafe { boundary.as_ref() }.ok_or_else(invalid_capture)?;
     // This is the immutable owner selected from the exact native return PC,
     // retained by the publication directory even after a function redefinition.
-    let owner = unsafe { boundary.owner.as_ref() }.ok_or_else(invalid_capture)?;
+    let owner = unsafe { boundary.owner().as_ref() }.ok_or_else(invalid_capture)?;
     if root_publication::frame_callable(boundary) != Some(args[0])
         || owner.native_callable_slot.is_none()
     {

@@ -1705,7 +1705,7 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
         // Copy geometry, never retain a mutable GC-scanned context borrow.
         let (owner, cursor, bounds) = unsafe {
             (
-                (*boundary).owner,
+                (*boundary).owner(),
                 (*boundary).cursor,
                 (*boundary).bounds.clone(),
             )
@@ -2127,10 +2127,10 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         return Err(invalid_capture());
     }
     let boundary = unsafe { &*boundary };
-    if boundary.owner.is_null() || boundary.context != context {
+    if boundary.owner().is_null() || boundary.context != context {
         return Err(invalid_capture());
     }
-    let code = unsafe { &*boundary.owner };
+    let code = unsafe { &*boundary.owner() };
     egcl_rt::rooted!(
         _active_code_owner =
             super::super::ActiveCodeOwnerRoot(code.native_callable_slot.and(code.installed_symbol))
@@ -2302,7 +2302,7 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     // Equal code owners can occur in different physical activations. Only the
     // actual root frame is allowed to reuse the managed anchor's callable/state.
     let is_root = !unsafe { (*context).ordinary_bridge }
-        && boundary.owner == unsafe { (*context).owner }
+        && boundary.owner() == unsafe { (*context).owner }
         && (step.caller.call_sp, step.caller.pc)
             == unsafe { ((*segment).saved_sp, (*segment).return_pc()) };
     if is_root {
@@ -2353,8 +2353,8 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         *callable = root_publication::frame_callable(boundary).ok_or_else(invalid_capture)?;
     } else {
         let retained = boundary
-            .directory
-            .callable_for_pc(boundary.cursor.pc)
+            .directory()
+            .and_then(|directory| directory.callable_for_pc(boundary.cursor.pc))
             .ok_or_else(invalid_capture)?;
         retained.with_gc_stable_mutator(|value| *callable = *value);
     }
@@ -2457,7 +2457,7 @@ unsafe fn resume_guard_with_arguments(
             None
         } else {
             let boundary = root_publication::ACTIVE.with(Cell::get);
-            if boundary.is_null() || unsafe { (*boundary).owner != owner } {
+            if boundary.is_null() || unsafe { (*boundary).owner() != owner } {
                 return Err(invalid_capture());
             }
             let base = code.code.as_ptr() as usize;

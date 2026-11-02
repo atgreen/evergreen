@@ -551,6 +551,19 @@ pub(in crate::cli::bytecode) fn active_ordinary_directory() -> Rc<OrdinaryCodeDi
     })
 }
 
+/// [`active_ordinary_directory`] without the handle, for a frame anchor. The
+/// execution owns its directory for its whole life, so the address stays
+/// valid for any publication that execution links.
+pub(in crate::cli::bytecode) fn active_ordinary_directory_ptr() -> *const OrdinaryCodeDirectory {
+    DIRECTORY.with(|directory| {
+        debug_assert!(
+            directory.retained.borrow().segments > 0,
+            "native publication needs a segment lease"
+        );
+        Rc::as_ptr(directory)
+    })
+}
+
 /// Owns a lease for the whole segment, including suspension and Rust callbacks.
 /// Drop uses the saved directory, never whichever execution is currently cached.
 pub(in crate::cli::bytecode) struct OrdinarySegmentGuard {
