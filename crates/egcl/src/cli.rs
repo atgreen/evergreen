@@ -22870,7 +22870,13 @@ fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     if is_string_value(v) {
         return Ok(v);
     }
-    let s = if v.is_character() {
+    if !v.is_character() {
+        return Err(EgclError::TypeError {
+            datum: v,
+            expected: "(OR STRING SYMBOL CHARACTER)".into(),
+        });
+    }
+    let s = {
         if egcl_stdlib::characters::is_surrogate_char(v) {
             // No Rust text holds a surrogate; build the string from its code.
             return Ok(egcl_stdlib::make_lisp_string_from_codes(
@@ -22879,8 +22885,6 @@ fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
             ));
         }
         v.as_char().to_string()
-    } else {
-        val_as_str(v)
     };
     Ok(arena_str(&s))
 }
