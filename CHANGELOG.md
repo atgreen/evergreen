@@ -636,7 +636,7 @@
   ns instead of 500 ns. Compiling SBCL's `src/compiler/sset` while hosting its
   cross-compiler takes 7% less time. `EGCL_BUILTIN_CENSUS=<path>` writes a
   count of the calls that still take the general route, by callee and route
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN)).
+  ([#975](https://github.com/atgreen/evergreen/pull/975)).
 
 - More functions that create closures now compile instead of running in the
   interpreter: a closure over a MULTIPLE-VALUE-BIND variable, a HANDLER-CASE
