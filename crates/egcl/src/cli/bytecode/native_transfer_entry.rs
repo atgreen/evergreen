@@ -41,6 +41,7 @@ mod deopt;
 pub(super) use deopt::with_ordinary_guard_payload_observer_for_test;
 #[cfg(test)]
 pub(super) use deopt::with_ordinary_guard_resume_observer_for_test;
+pub(super) mod closure_entry;
 pub(super) mod funcall_fast;
 mod lean_root;
 mod native_frames;
@@ -388,6 +389,9 @@ pub(super) struct TransferCode {
     recompile: Cell<bool>,
     private_probe_revision: Arc<std::sync::atomic::AtomicU64>,
     private_probe_published: Cell<bool>,
+    /// Closure-template entry claims this code holds (bliss-gg3i1.7.15.10.3),
+    /// released with its private entries.
+    template_claims: std::cell::RefCell<Vec<closure_entry::TemplateClaim>>,
     recursive_symbol: Option<u32>,
     recursive_generation: u64,
     pub(super) native_entry_kind_slot: Option<u32>,
@@ -1257,7 +1261,17 @@ impl TransferCode {
         Arc::clone(&self.private_probe_revision)
     }
 
+    /// Hold `claim` until this code's private entries retire.
+    pub(super) fn note_template_claim(&self, claim: closure_entry::TemplateClaim) {
+        self.template_claims.borrow_mut().push(claim);
+    }
+
     pub(super) fn retire_private_entries(&self) {
+        // The template pairs this code claimed stop naming it first.
+        let claims = std::mem::take(&mut *self.template_claims.borrow_mut());
+        for claim in &claims {
+            claim.release();
+        }
         if self.private_probe_published.get() {
             self.private_probe_revision
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);

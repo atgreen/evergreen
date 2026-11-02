@@ -196,6 +196,16 @@ fn record_funcall_target(
         return false;
     };
     let captured = code.native_callable_slot.is_some();
+    // A closure whose word is its template's dispatch stub never reaches
+    // this probe again: the call site enters the stub first
+    // (bliss-gg3i1.7.15.10.3). The probe keeps the closures without one,
+    // such as a tree-walker closure's compiled object.
+    if captured
+        && egcl_rt::function::entry_word(function)
+            .is_some_and(|(_, owner)| owner == egcl_rt::function::SHARED_ENTRY_OWNER)
+    {
+        return false;
+    }
     if captured {
         if !code.accepts_explicit_callable(selected) {
             return false;

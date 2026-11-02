@@ -646,6 +646,17 @@
   count of the calls that still take the general route, by callee and route
   ([#975](https://github.com/atgreen/evergreen/pull/975)).
 
+- On x86-64 Linux, `(funcall f ...)` in optimized code calls `f` directly when
+  it is an optimized function or closure, instead of going through FUNCALL's
+  call cell and a lookup table. Each closure's object carries an entry into
+  its template's compiled code, so a newly compiled or recompiled template
+  takes effect for every existing closure at once, and a garbage collection
+  no longer empties anything that later calls must refill. FUNCALL of a
+  global function value drops from 18 to 11 ns per call, and of a closure
+  from 18–20 to 11–14 ns. A local function called through a closure (LABELS
+  over captured variables) benefits the same way once its caller is
+  optimized. `EGCL_LEAN_FUNCALL=0` keeps the previous route
+  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN)).
 - More functions that create closures now compile instead of running in the
   interpreter: a closure over a MULTIPLE-VALUE-BIND variable, a HANDLER-CASE
   clause variable, or a local function's parameter no longer forces its whole

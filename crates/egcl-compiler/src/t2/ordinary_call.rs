@@ -23,7 +23,40 @@ pub struct OrdinaryCallTarget {
     /// (bliss-gg3i1.7.15.10.1): load the cell, check for an interpreted
     /// function whose entry word this execution owns, and call that entry.
     /// Every other callee takes the descriptor admission below.
+    /// [`FUNCALL_FIRST_ARGUMENT`] selects the lean FUNCALL instead
+    /// (bliss-gg3i1.7.15.10.3): the callee is the call's first argument.
     pub function_cell: u64,
+}
+
+/// `OrdinaryCallTarget::function_cell` of a call to the builtin FUNCALL: the
+/// callee is the first argument, not a symbol's function cell. No pinned
+/// symbol object sits at address 1.
+pub const FUNCALL_FIRST_ARGUMENT: u64 = 1;
+
+/// A closure template's dispatch stub (bliss-gg3i1.7.15.10.3): the entry word
+/// of every instance of one template, and of its prototype when that is
+/// itself a closure value. `record` is the template's process-lifetime
+/// `[entry, owner]` pair, which one execution claims for its compiled code
+/// of the template. The stub enters that code when the caller's execution
+/// (R13) owns the claim, and otherwise leaves through `miss`, which receives
+/// the ordinary call unchanged. RAX (the closure), the arguments, RCX and the
+/// stack are untouched; only R10 and R11 change. The entry is read before
+/// the owner, and only the owning execution writes its own claim, so a match
+/// always pairs with that execution's current entry.
+pub fn emit_template_entry_stub(record: u64, miss: u64) -> Vec<u8> {
+    let owner = egcl_rt::exec_context::offsets::CODE_OWNER;
+    let mut a = Asm::new();
+    let missed = a.label();
+    mov_imm64(&mut a, 11, record as i64);
+    a.extend_from_slice(&[0x4d, 0x8b, 0x13]); // mov r10,[r11]: entry
+    a.extend_from_slice(&[0x4d, 0x8b, 0x5b, 0x08]); // mov r11,[r11+8]: owner
+    cmp_mem64_disp8(&mut a, 11, 13, owner as u8); // cmp r11,[r13+owner]
+    a.jcc(Cc::Ne, missed);
+    a.extend_from_slice(&[0x41, 0xff, 0xe2]); // jmp r10, RAX = closure
+    a.bind(missed);
+    mov_imm64(&mut a, 11, miss as i64);
+    a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11, every incoming value intact
+    a.finish().expect("template entry stub labels")
 }
 
 /// The veneer a lean entry's stack check jumps to on overflow, or zero when
@@ -1239,10 +1272,12 @@ impl OrdinaryCallEmission<'_> {
             compare_zero_memory(a, 11, 0, true);
             a.jcc(Cc::Ne, cold);
         }
-        let lean_return = if !self.direct_self && self.target.function_cell != 0 {
-            emit_lean_named_call(a, &self, data, base, overflow, emit_epilogue, done)
-        } else {
+        let lean_return = if self.direct_self || self.target.function_cell == 0 {
             None
+        } else if self.target.function_cell == FUNCALL_FIRST_ARGUMENT {
+            emit_lean_funcall(a, &self, data, base, emit_epilogue, done)
+        } else {
+            emit_lean_named_call(a, &self, data, base, overflow, emit_epilogue, done)
         };
         // Ordinary machine frames are bounded by their exact stack budget.
         // The legacy depth counter bounds Rust/native reentry only.
@@ -1597,6 +1632,94 @@ fn emit_lean_named_call(
             load_home(a, reg, FramedHome::Stack(base + index as u32), overflow);
         }
         mov_imm64(a, 1, data.args.len() as i64);
+        a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, RAX = callee
+        let lean = CallReturn {
+            return_offset: a.here(),
+            stack_adjust: overflow as u32,
+        };
+        retire(a, overflow as u32);
+        a.jmp(done);
+        Some(lean)
+    };
+    a.bind(legacy);
+    lean
+}
+
+/// The lean FUNCALL (bliss-gg3i1.7.15.10.3), at a call to the builtin
+/// FUNCALL whose actuals (the function, then its arguments) are already in
+/// the outgoing area, after every caller-side admission. When the function is
+/// an interpreted function whose entry word this execution owns, or a shared
+/// closure dispatch stub, call that entry with the function in RAX and the
+/// remaining actuals as an ordinary call's arguments. Anything else (a symbol,
+/// a builtin, an unowned or foreign word) falls through to the FUNCALL cell's
+/// descriptor admission that follows, with every outgoing word unchanged.
+///
+/// GC: as for the lean named call, nothing between the load of the function
+/// and the call polls, calls or allocates; the function stays in its
+/// outgoing slot, and the callee publishes RAX itself.
+fn emit_lean_funcall(
+    a: &mut Asm,
+    emission: &OrdinaryCallEmission<'_>,
+    data: &InstData,
+    base: u32,
+    emit_epilogue: &dyn Fn(&mut Asm),
+    done: egcl_rt::asm::Label,
+) -> Option<CallReturn> {
+    use egcl_rt::function::{
+        ENTRY_OWNER_TAGGED_OFFSET, ENTRY_TAGGED_OFFSET, SHARED_ENTRY_OWNER, TYPE_ID_TAGGED_OFFSET,
+    };
+    let count = data.args.len().checked_sub(1)?;
+    // A tail call has room for no outgoing stack word of its own.
+    if emission.tail && count > 3 {
+        return None;
+    }
+    let overflow = ((count.saturating_sub(3) * 8 + 15) & !15) as i32;
+    let legacy = a.label();
+    let enter = a.label();
+    load_home(a, RAX, FramedHome::Stack(base), 0);
+    a.extend_from_slice(&[0x4c, 0x8d, 0x50]); // lea r10, [rax - heap tag]
+    a.push((-(egcl_rt::value::TAG_HEAP_OBJECT as i8)) as u8);
+    a.extend_from_slice(&[0x41, 0xf6, 0xc2, egcl_rt::value::TAG_MASK as u8]); // test r10b, 7
+    a.jcc(Cc::Ne, legacy);
+    a.extend_from_slice(&[
+        0x80,
+        0x78,
+        TYPE_ID_TAGGED_OFFSET as u8,
+        egcl_rt::object::type_id::FUNCTION_INTERPRETED,
+    ]); // cmp byte [rax + type id], FUNCTION_INTERPRETED
+    a.jcc(Cc::Ne, legacy);
+    // Entry first, then owner: see `egcl_rt::function::claim_entry`.
+    load_mem64_disp(a, 11, RAX, ENTRY_TAGGED_OFFSET);
+    load_mem64_disp(a, 10, 13, egcl_rt::exec_context::offsets::CODE_OWNER as i32);
+    cmp_mem64_disp8(a, 10, RAX, ENTRY_OWNER_TAGGED_OFFSET as u8);
+    a.jcc(Cc::E, enter);
+    debug_assert_eq!(SHARED_ENTRY_OWNER, u64::MAX);
+    a.extend_from_slice(&[0x48, 0x83, 0x78, ENTRY_OWNER_TAGGED_OFFSET as u8, 0xff]); // cmp qword [rax+owner], -1
+    a.jcc(Cc::Ne, legacy);
+    // A shared word may have been armed after the entry load above; the
+    // stub was stored before the owner, so reload it.
+    load_mem64_disp(a, 11, RAX, ENTRY_TAGGED_OFFSET);
+    a.bind(enter);
+    let lean = if emission.tail {
+        for (index, reg) in [7, 6, 2].into_iter().take(count).enumerate() {
+            load_home(a, reg, FramedHome::Stack(base + 1 + index as u32), 0);
+        }
+        mov_imm64(a, 1, count as i64);
+        emit_epilogue(a);
+        a.extend_from_slice(&[0x41, 0xff, 0xe3]); // jmp r11, RAX = callee
+        None
+    } else {
+        if overflow != 0 {
+            reserve_ordinary_stack(a, overflow as usize);
+            for index in 3..count {
+                load_home(a, 10, FramedHome::Stack(base + 1 + index as u32), overflow);
+                store_to_rsp(a, 10, ((index - 3) * 8) as i32);
+            }
+        }
+        for (index, reg) in [7, 6, 2].into_iter().take(count).enumerate() {
+            load_home(a, reg, FramedHome::Stack(base + 1 + index as u32), overflow);
+        }
+        mov_imm64(a, 1, count as i64);
         a.extend_from_slice(&[0x41, 0xff, 0xd3]); // call r11, RAX = callee
         let lean = CallReturn {
             return_offset: a.here(),

@@ -20,7 +20,7 @@ pub(super) use ordinary::RootIdentity;
 pub(super) use ordinary::assert_guarded_callable_publication_for_test;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::ordinary_segment_depth_for_test;
-#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::private_probe_target;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::take_root_identities_for_test;
@@ -705,8 +705,10 @@ fn ordinary_funcall_fast(state: &State, args: &[EgclVal]) -> Option<Result<EgclV
             .then(|| super::super::apply_function_impl(call[0], &call[1..], env))
     };
     if super::call_table_funcall::is_builtin(state.symbol) {
-        // Teach the cell's generated probe first: the call below may tier,
-        // collect or redefine, and the probe re-checks all of that.
+        // Teach the entry claims first: the call below may tier, collect or
+        // redefine. A closure's template claims its pair; a global function
+        // gets its call cell published, which claims its word.
+        super::native_transfer_entry::closure_entry::teach(args[0], args.len() - 1);
         adapter::record_funcall(state, args[0], args.len() - 1);
         return apply(args, env);
     }

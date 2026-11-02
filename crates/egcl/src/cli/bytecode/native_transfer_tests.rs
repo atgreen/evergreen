@@ -8,6 +8,7 @@ use egcl_rt::{Collector, HeapCollector};
 mod backpack_entry;
 mod catches;
 mod cleanup_ir;
+mod closure_entry;
 mod compiled;
 mod deopt;
 mod fallback;

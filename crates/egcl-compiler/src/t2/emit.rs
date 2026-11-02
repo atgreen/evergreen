@@ -406,12 +406,13 @@ fn is_global_special(symbol: u32) -> bool {
 mod ordinary_primitives;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_call::{
-    OrdinaryCallFlags, OrdinaryCallTarget, OrdinaryColdRequest, OrdinaryGuardOptions,
-    OrdinaryGuardRequest, OrdinarySelfCallFacts, emit_framed_ordinary_call,
+    FUNCALL_FIRST_ARGUMENT, OrdinaryCallFlags, OrdinaryCallTarget, OrdinaryColdRequest,
+    OrdinaryGuardOptions, OrdinaryGuardRequest, OrdinarySelfCallFacts, emit_framed_ordinary_call,
     emit_framed_ordinary_function, emit_framed_ordinary_function_with_poll,
     emit_framed_ordinary_function_with_self_call_facts,
     emit_framed_ordinary_function_with_self_calls, emit_framed_ordinary_guarded_call,
-    emit_framed_ordinary_tail_call, emit_framed_ordinary_two_calls, set_lean_entry_overflow,
+    emit_framed_ordinary_tail_call, emit_framed_ordinary_two_calls, emit_template_entry_stub,
+    set_lean_entry_overflow,
 };
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(crate) use ordinary_primitives::packed_u8_adapter;
