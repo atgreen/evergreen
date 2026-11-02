@@ -35,7 +35,16 @@ pub(crate) enum Route {
     T1Direct,
     T2Direct,
     C2i,
+    /// Reached only through the x86-64 Linux ordinary adapters.
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_os = "linux")),
+        allow(dead_code)
+    )]
     Ordinary,
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_os = "linux")),
+        allow(dead_code)
+    )]
     OrdinaryCold,
 }
 

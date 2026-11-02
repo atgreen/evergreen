@@ -129,7 +129,7 @@ fn generated_adapter_preserves_heap_actual_after_real_child_collection() {
         &mut env,
         "GENERATED-CHILD",
         "(x)",
-        "(progn (logxor 7 7 7) x)",
+        "(progn (logxor 7 7 7 0) x)",
     );
     let (symbol, parent) = install(
         &mut env,
@@ -179,7 +179,7 @@ fn generated_adapter_passes_named_captured_functions_their_actual_defining_envir
         // hand-built child passed as a new top-level Env is not a lexical
         // binding form and intentionally does not capture under DEFUN rules.
         crate::cli::read_eval_all_env(
-            &format!("(let ((generated-capture-cell {captured})) (defun {name} (x) (logxor 7 7 7) (+ generated-capture-cell x)))"),
+            &format!("(let ((generated-capture-cell {captured})) (defun {name} (x) (logxor 7 7 7 0) (+ generated-capture-cell x)))"),
             &mut env,
         ).unwrap();
         // Trigger the ordinary lazy bytecode path, preserving the definition's

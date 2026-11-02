@@ -55,7 +55,7 @@ fn mapped_parent_native_only_root_moves_during_an_ordinary_bridge_call() {
     egcl_rt::rooted_ref!(_env = &mut env);
     crate::cli::read_eval_all_env(
         "(defun bridge-parent-poll-child (limit)
-           (if (= (logxor limit limit limit) limit) 42 0))
+           (if (= (logxor limit limit limit 0) limit) 42 0))
          (defun bridge-parent-root-caller (&key (limit (1+ 1999)))
            (bridge-parent-poll-child 1)
            (let ((marker (cons 716239 nil)))
@@ -68,7 +68,7 @@ fn mapped_parent_native_only_root_moves_during_an_ordinary_bridge_call() {
     let (child_symbol, child) = ordinary_t2::install(
         "BRIDGE-PARENT-POLL-CHILD",
         "(limit)",
-        "((if (= (logxor limit limit limit) limit) 42 0))",
+        "((if (= (logxor limit limit limit 0) limit) 42 0))",
         &mut env,
     );
     let (parent_symbol, parent) = ordinary_t2::install(
