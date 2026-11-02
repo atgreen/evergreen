@@ -85,6 +85,7 @@ pub use clos::{
     set_slot_value_if_present, set_structure_class, shared_initialize, shared_initialize_with_list,
     slot_boundp, slot_makunbound, slot_present_p, slot_value, slot_value_if_present,
     struct_ref_fast, struct_set_fast, struct_typep_fast, structure_instance_typep,
+    structure_typep_leaf,
 };
 pub use clos::{StructAllocation, allocate_struct, struct_allocation, struct_init_slot};
 pub use conditions::{

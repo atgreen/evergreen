@@ -4084,6 +4084,33 @@ pub fn structure_instance_typep(object: EgclVal, name: EgclVal) -> Option<bool> 
     })
 }
 
+/// [`structure_instance_typep`] extended to objects that can never be
+/// structure instances: a fixnum, character, cons or symbol (NIL included) is
+/// of no structure type, so `(typep object 'NAME)` is false when NAME is
+/// registered under this exact symbol as a structure class. None defers to
+/// the general TYPEP path exactly as `structure_instance_typep` does. Does not
+/// allocate (bliss-gg3i1.7.15.10.2).
+pub fn structure_typep_leaf(object: EgclVal, name: EgclVal) -> Option<bool> {
+    if !name.is_symbol() || name.is_nil() {
+        return None;
+    }
+    if object.is_heap_object() && !object.is_cons() && !object.is_symbol() {
+        return structure_instance_typep(object, name);
+    }
+    if !(object.is_fixnum()
+        || object.is_character()
+        || object.is_cons()
+        || object.is_symbol()
+        || object.is_nil())
+    {
+        return None;
+    }
+    with_state(|st| {
+        let expected = *st.class_registry.get(&name)?;
+        st.structure_classes.contains(&expected).then_some(false)
+    })
+}
+
 /// The current structure wrapper of `object` and its [`StructInfo`], or None
 /// when `object` is not an instance, its wrapper is obsolete or absent, or its
 /// class is not a (prefix-laid-out) structure class. Does not allocate.

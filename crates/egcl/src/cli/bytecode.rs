@@ -22199,11 +22199,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // stops being a plain builtin stops being dispatched as one.
                 // `None` from either step falls through to the general path,
                 // which is always correct.
-                super::builtin_census::note(
-                    sym,
-                    super::builtin_census::Route::T0,
-                    nargs as usize,
-                );
+                super::builtin_census::note(sym, super::builtin_census::Route::T0, nargs as usize);
                 let direct = match (fn_val == EgclVal::from_symbol_index(sym))
                     .then(|| super::direct_builtin_slot_memoized(sym, nargs as usize))
                     .flatten()

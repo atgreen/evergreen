@@ -100,9 +100,7 @@ pub(crate) fn reset() {
 }
 
 fn kind(symbol: u32, nargs: usize) -> &'static str {
-    if super::installed_function(symbol)
-        .is_some_and(egcl_rt::function::is_interpreted_function)
-    {
+    if super::installed_function(symbol).is_some_and(egcl_rt::function::is_interpreted_function) {
         "lisp-fn"
     } else if super::direct_builtin_slot_memoized(symbol, nargs).is_some() {
         "builtin-direct"

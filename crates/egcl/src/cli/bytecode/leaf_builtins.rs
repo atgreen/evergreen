@@ -398,6 +398,142 @@ extern "C" fn logbitp<const C: bool>(i: u64, n: u64) -> u64 {
     boolean::<C>((n >> (i.as_fixnum() as u64).min(127)) & 1 == 1)
 }
 
+// ── Predicates, properties and structure types (bliss-gg3i1.7.15.10.2) ──
+//
+// The builtins below were among the hottest calls an SBCL compile still sent
+// through the ordinary named adapter's runtime veneer (~290 ns for a tag test,
+// ~3 us for GET). Each answers exactly as its general arm does for the
+// arguments it accepts and misses on everything else.
+
+/// A cons that may be an interpreter closure, physically `(EGCL::CLOSURE . id)`:
+/// ATOM and LISTP tell those apart on the general path.
+#[inline]
+fn maybe_closure_cons(x: EgclVal) -> bool {
+    // SAFETY: a live cons.
+    let (head, tail) = unsafe {
+        let cell = &*(x.as_ptr() as *const egcl_rt::object::ConsCell);
+        (cell.car, cell.cdr)
+    };
+    head.is_symbol() && tail.is_fixnum()
+}
+
+extern "C" fn atom<const C: bool>(x: u64) -> u64 {
+    let x = EgclVal(x);
+    if !x.is_cons() {
+        single::<C>(T)
+    } else if maybe_closure_cons(x) {
+        MISS
+    } else {
+        single::<C>(NIL)
+    }
+}
+
+extern "C" fn listp<const C: bool>(x: u64) -> u64 {
+    let x = EgclVal(x);
+    if x.is_nil() {
+        single::<C>(T)
+    } else if !x.is_cons() {
+        single::<C>(NIL)
+    } else if maybe_closure_cons(x) {
+        MISS
+    } else {
+        single::<C>(T)
+    }
+}
+
+extern "C" fn symbolp<const C: bool>(x: u64) -> u64 {
+    boolean::<C>(EgclVal(x).is_symbol())
+}
+
+/// PLUSP / MINUSP of an integer; any other real or a non-number misses.
+extern "C" fn plusp<const C: bool>(a: u64) -> u64 {
+    match small_integer(EgclVal(a)) {
+        Some(a) => boolean::<C>(a > 0),
+        None => MISS,
+    }
+}
+
+extern "C" fn minusp<const C: bool>(a: u64) -> u64 {
+    match small_integer(EgclVal(a)) {
+        Some(a) => boolean::<C>(a < 0),
+        None => MISS,
+    }
+}
+
+/// BIT / SBIT of a simple bit vector, as the general arm's `aref` reads it.
+extern "C" fn sbit<const C: bool>(vector: u64, i: u64) -> u64 {
+    let vector = EgclVal(vector);
+    let Some(i) = index(i) else {
+        return MISS;
+    };
+    guarded(|| {
+        if !egcl_rt::types::bit_vector_p(vector) {
+            return MISS;
+        }
+        match egcl_rt::types::bit_vector_ref(vector, i) {
+            Some(bit) => single::<C>(EgclVal::from_fixnum(i64::from(bit))),
+            None => MISS,
+        }
+    })
+}
+
+/// `(get symbol indicator [default])` of a symbol other than NIL and T.
+fn get_property<const C: bool>(symbol: u64, indicator: u64, default: EgclVal) -> u64 {
+    let symbol = EgclVal(symbol);
+    if !symbol.is_symbol() || symbol.is_nil() || symbol == T {
+        return MISS;
+    }
+    guarded(|| {
+        let Some(plist) = symbol
+            .symbol_index()
+            .and_then(egcl_rt::symbols::symbol_plist)
+        else {
+            return MISS;
+        };
+        single::<C>(super::super::plist_lookup(plist, EgclVal(indicator)).unwrap_or(default))
+    })
+}
+
+extern "C" fn get2<const C: bool>(symbol: u64, indicator: u64) -> u64 {
+    get_property::<C>(symbol, indicator, NIL)
+}
+
+extern "C" fn get3<const C: bool>(symbol: u64, indicator: u64, default: u64) -> u64 {
+    get_property::<C>(symbol, indicator, EgclVal(default))
+}
+
+/// `(typep object 'NAME)` and the declaration check
+/// `(egcl::%declaration-typep object 'NAME)` for a structure class NAME. A
+/// class name is never expanded as a DEFTYPE, so both reach the same
+/// structure test on the general path.
+extern "C" fn structure_typep<const C: bool>(object: u64, name: u64) -> u64 {
+    guarded(
+        || match egcl_stdlib::structure_typep_leaf(EgclVal(object), EgclVal(name)) {
+            Some(yes) => boolean::<C>(yes),
+            None => MISS,
+        },
+    )
+}
+
+macro_rules! logical3 {
+    ($name:ident, $op:tt) => {
+        extern "C" fn $name<const C: bool>(a: u64, b: u64, c: u64) -> u64 {
+            let (Some(a), Some(b), Some(c)) = (
+                small_integer(EgclVal(a)),
+                small_integer(EgclVal(b)),
+                small_integer(EgclVal(c)),
+            ) else {
+                return MISS;
+            };
+            integer_result::<C>(a $op b $op c)
+        }
+    };
+}
+
+logical3!(logand3, &);
+logical3!(logior3, |);
+logical3!(logxor3, ^);
+
 /// A helper's two entries: the one that empties the multiple-value buffer
 /// and the one for callers that proved it empty.
 #[derive(Clone, Copy)]
@@ -461,6 +597,25 @@ fn table() -> Vec<(&'static str, u8, Entry, bool)> {
         ("LOGXOR", 2, entry!(logxor, Helper2), false),
         ("ASH", 2, entry!(ash, Helper2), false),
         ("LOGBITP", 2, entry!(logbitp, Helper2), false),
+        ("ATOM", 1, entry!(atom, Helper1), false),
+        ("LISTP", 1, entry!(listp, Helper1), false),
+        ("SYMBOLP", 1, entry!(symbolp, Helper1), false),
+        ("PLUSP", 1, entry!(plusp, Helper1), false),
+        ("MINUSP", 1, entry!(minusp, Helper1), false),
+        ("BIT", 2, entry!(sbit, Helper2), false),
+        ("SBIT", 2, entry!(sbit, Helper2), false),
+        ("GET", 2, entry!(get2, Helper2), false),
+        ("GET", 3, entry!(get3, Helper3), false),
+        ("TYPEP", 2, entry!(structure_typep, Helper2), false),
+        (
+            "EGCL::%DECLARATION-TYPEP",
+            2,
+            entry!(structure_typep, Helper2),
+            false,
+        ),
+        ("LOGAND", 3, entry!(logand3, Helper3), false),
+        ("LOGIOR", 3, entry!(logior3, Helper3), false),
+        ("LOGXOR", 3, entry!(logxor3, Helper3), false),
     ]
 }
 
