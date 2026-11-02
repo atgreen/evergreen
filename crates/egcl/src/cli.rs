@@ -52412,6 +52412,8 @@ mod compiled_closure_lifetime_tests {
 
     fn check_capture_lifetime(cyclic: bool, shared: bool) {
         let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        // Follows each closure's name-keyed captured frame.
+        let _legacy = bytecode::heap_env::legacy_frames_for_test();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
         let bytes = build_bfasl_from_source(

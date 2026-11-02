@@ -31376,6 +31376,30 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             .is_some_and(|context| context.captured_entry_profitable());
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_outer_capture = false;
+    // A heap-environment body that creates no closure (Backpack) keeps its
+    // environment operations semantic too: the ordinary entry reads its
+    // closure environment from the hidden callable, and a declined ordinary
+    // emission falls back to the same legalized mapped clone.
+    let heap_env_body = cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && bf.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::ClosureEnv | Instr::MakeEnv(_) | Instr::EnvRef { .. } | Instr::EnvSet { .. }
+            )
+        })
+        && !bf.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::MakeEnvClosure { .. }
+                    | Instr::MakeClosure { .. }
+                    | Instr::LoadEnvVar(_)
+                    | Instr::StoreEnvVar(_)
+                    | Instr::DefineEnvVar(_)
+                    | Instr::PushEnvChild
+                    | Instr::PopEnvChild
+            )
+        });
+    let ordinary_outer_capture = ordinary_outer_capture || heap_env_body;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let special_binding_body = native_transfer_entry::special_binding_body(bf);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -31384,18 +31408,36 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         // Keep lexical operations semantic for the explicit-callable ordinary
         // adapter. prepare_ordinary_t2 legalizes a separate mapped clone using
         // the retained bytecode scope/BCP protocol if ordinary emission declines.
-        if let Some(snapshot) = &input.snapshot {
+        let transfer = if let Some(snapshot) = &input.snapshot {
             egcl_compiler::t2::build::build_for_transfer_optimization_snapshot_with_inline_options(
                 snapshot,
                 sym,
-                inline_options,
+                inline_options.clone(),
             )
         } else {
             egcl_compiler::t2::build::build_for_transfer_optimization_with_inline_options(
                 bf,
                 sym,
-                inline_options,
+                inline_options.clone(),
             )
+        };
+        match transfer {
+            // A heap-environment body with a construct only the native-scope
+            // build models (a THROW, a closure's named exit, ...) takes that
+            // build, as its name-keyed form always did.
+            Err(error) if heap_env_body => {
+                t2_log!("{name}: transfer build refused ({error:?}); native-scope build");
+                if let Some(snapshot) = &input.snapshot {
+                    egcl_compiler::t2::build::build_for_native_scope_optimization_snapshot_with_inline_options(snapshot, sym, inline_options)
+                } else {
+                    egcl_compiler::t2::build::build_for_native_scope_optimization_with_inline_options(
+                        bf,
+                        sym,
+                        inline_options,
+                    )
+                }
+            }
+            built => built,
         }
     } else if let Some(Ok(ir)) = special_binding_body.then(|| {
         // Special bindings are the body's only dynamic scopes: keep them plain
@@ -33900,6 +33942,8 @@ mod direct_call_invalidation_tests {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Checks the name-keyed frame's LexicalEnvironment scope records.
+        let _legacy = super::heap_env::legacy_frames_for_test();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
         egcl_rt::rooted!(
