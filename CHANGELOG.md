@@ -4,6 +4,10 @@
 
 ### Added
 
+- Compile escaped closures that reference captured local functions through
+  direct calls or `FUNCTION`, preserving definition-site namespace identity
+  ([#985](https://github.com/atgreen/evergreen/pull/985)).
+
 - Add opt-in execution-owned T1 sampling countdowns on x86-64 Linux with
   `EGCL_EXECUTION_T1_HEAT=1`
   ([#983](https://github.com/atgreen/evergreen/pull/983)).
