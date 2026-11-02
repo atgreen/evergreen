@@ -42,6 +42,10 @@
 
 ### Fixed
 
+- Preserve lexical parameter bindings when a global symbol macro has the same
+  symbol, including interpreted reads, assignments and later defaults
+  ([#988](https://github.com/atgreen/evergreen/pull/988)).
+
 - Compile eligible top-level `LET`/`LET*` function creators while preserving
   shared captures, public function names and definition-time macro ordering
   ([#981](https://github.com/atgreen/evergreen/pull/981)).
