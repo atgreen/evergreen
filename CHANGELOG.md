@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compile escaped closures that reference captured local functions through
+  direct calls or `FUNCTION`, preserving definition-site namespace identity
+  ([#985](https://github.com/atgreen/evergreen/pull/985)).
+
 - Standard `MAKE-INSTANCE` initialization recognizes wrapped standard methods
   and avoids generated constant initfunction calls while preserving supplied
   and computed MOP initfunctions
