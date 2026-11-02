@@ -19067,6 +19067,40 @@ fn closure_expansion_ignores_functions(lambda_list: EgclVal, body: EgclVal, env:
     true
 }
 
+/// Reify lexical bindings through their existing per-binding identity cache.
+/// No FunDef/map borrow survives reification (which may collect). The fresh
+/// frame keeps function keys separate from variables and shares the original
+/// lexical locations through its parent. FLET definition-site namespaces and
+/// recursive LABELS scopes remain owned by the canonical callable wrappers;
+/// each wrapper can independently tier through compile_tree_closure later.
+/// This is still a retained host frame, not the final heap-environment ABI.
+fn capture_tree_function_namespace(env: &mut Env, parent: Arc<FrameCell>) -> bool {
+    let names = {
+        let functions = env.funs.borrow();
+        if functions.iter().any(|(name, definition)| {
+            name.starts_with('(')
+                || definition.defining_frame.is_none()
+                || !definition.defining_specials.is_empty()
+        }) {
+            return false;
+        }
+        functions.keys().cloned().collect::<Vec<_>>()
+    };
+    let mut captured = env.child_with_parent(parent);
+    egcl_rt::rooted_ref!(_captured = &mut captured);
+    for name in names {
+        egcl_rt::rooted!(
+            function = match super::local_fn_closure(&mut captured, &name) {
+                Some(function) => function,
+                None => return false,
+            }
+        );
+        captured.define_lexical_local(&closure_fn_binding_key(&name), *function);
+    }
+    env.frame = Arc::clone(&captured.frame);
+    true
+}
+
 /// Compile a hot tree-walker closure `(EGCL::CLOSURE . id)` to bytecode and
 /// reify it as a callable object under a fresh private symbol (bliss-wojl9).
 ///
@@ -19087,7 +19121,7 @@ pub(super) fn compile_tree_closure(
     mut lambda_list: EgclVal,
     mut body: EgclVal,
     compile_env: &Env,
-    frame: Arc<FrameCell>,
+    mut frame: Arc<FrameCell>,
     blocks: &[(String, String)],
     tags: &[(String, String)],
 ) -> Option<EgclVal> {
@@ -19135,31 +19169,41 @@ pub(super) fn compile_tree_closure(
         }
         (lambda_list, body) = cp(rest);
     }
-    // A definition-site FLET can be incidental (for example a factory's
-    // registration helper). Expand with that namespace intact, then discard it
-    // only when no symbol anywhere in the complete expansion can name it.
-    // Including quoted data and shadowed occurrences is deliberately conservative.
+    // Expand with the definition-site namespace intact. Incidental bindings
+    // can be discarded; referenced local functions need actual captured
+    // callable values in the separate FUNCTION namespace.
     let has_local_functions = !compile_env.funs.borrow().is_empty();
     let mut filtered_env = has_local_functions.then(|| compile_env.clone());
     egcl_rt::rooted_ref!(_filtered_env_root = &mut filtered_env);
     let compile_env = if has_local_functions {
-        static UNUSED_FUNCTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*UNUSED_FUNCTIONS
-            .get_or_init(|| std::env::var_os("EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS").is_none())
-            || !*PREEXPAND
-                .get()
-                .expect("closure expansion policy initialized")
-            || !closure_expansion_ignores_functions(lambda_list, body, compile_env)
+        if !*PREEXPAND
+            .get()
+            .expect("closure expansion policy initialized")
         {
-            log_not_compiled(
-                label,
-                "closure references captured local function namespace",
-            );
+            log_not_compiled(label, "captured local namespace requires expansion");
             return None;
         }
         let filtered = filtered_env
             .as_mut()
             .expect("captured function environment");
+        if closure_expansion_ignores_functions(lambda_list, body, compile_env) {
+            static UNUSED_FUNCTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*UNUSED_FUNCTIONS
+                .get_or_init(|| std::env::var_os("EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS").is_none())
+            {
+                return None;
+            }
+        } else {
+            static CAPTURED_FUNCTIONS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if !*CAPTURED_FUNCTIONS.get_or_init(|| {
+                std::env::var_os("EGCL_DISABLE_CAPTURED_CLOSURE_FUNCTIONS").is_none()
+            }) || !capture_tree_function_namespace(filtered, Arc::clone(&frame))
+            {
+                log_not_compiled(label, "unsupported captured local function namespace");
+                return None;
+            }
+            frame = Arc::clone(&filtered.frame);
+        }
         filtered.funs = Arc::new(SharedCell::new(HashMap::new()));
         &*filtered
     } else {
