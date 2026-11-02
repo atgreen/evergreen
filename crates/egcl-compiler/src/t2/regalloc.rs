@@ -353,7 +353,8 @@ struct Adapter {
 }
 
 impl Adapter {
-    fn build(mf: &MachFunc, call_clobbers: PRegSet, stack_call_operands: bool) -> Adapter {
+    fn build(mf: &MachFunc, call_clobbers: PRegSet, calls: CallOperands) -> Adapter {
+        let stack_call_operands = calls == CallOperands::Stack;
         let mut map: HashMap<VReg, usize> = HashMap::new();
         let mut reverse: Vec<VReg> = Vec::new();
         let mut intern = |v: VReg| -> Ra2VReg {
@@ -389,7 +390,7 @@ impl Adapter {
             }
             for &u in &inst.uses {
                 if inst.op == crate::t2::lower::op::INVOKE
-                    || (stack_call_operands && inst.op == crate::t2::lower::op::CALL)
+                    || (calls != CallOperands::Registers && inst.op == crate::t2::lower::op::CALL)
                 {
                     // Invoke and the slice-call framed emitters copy call
                     // arguments from their homes to a scanned slice. Requiring
@@ -638,17 +639,24 @@ fn allocate_framed_mode(mf: &mut MachFunc, ordinary: bool) -> Result<(), Allocat
     // reduced pool genuinely runs out of registers — a retry costs one extra
     // background-thread allocation pass, declining to T1 costs the tier.
     // EGCL_T2_FRAME_ENV=full|reduced pins one environment for debugging.
+    // Ordinary code reads every Lisp call's arguments from their homes
+    // (bliss-gg3i1.7.15.10.4), so a call wider than the register bank is
+    // allocatable there.
+    let calls = if ordinary {
+        CallOperands::HomeUses
+    } else {
+        CallOperands::Registers
+    };
+    let run = |mf: &mut MachFunc, reduced| {
+        allocate_with_call_operand_policy(mf, environment(reduced), x86_call_clobbers(), calls)
+    };
     match std::env::var("EGCL_T2_FRAME_ENV").as_deref() {
-        Ok("full") => return allocate_with_env(mf, environment(false), x86_call_clobbers()),
-        Ok("reduced") => {
-            return allocate_with_env(mf, environment(true), x86_call_clobbers());
-        }
+        Ok("full") => return run(mf, false),
+        Ok("reduced") => return run(mf, true),
         _ => {}
     }
-    match allocate_with_env(mf, environment(true), x86_call_clobbers()) {
-        Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) => {
-            allocate_with_env(mf, environment(false), x86_call_clobbers())
-        }
+    match run(mf, true) {
+        Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) => run(mf, false),
         done => done,
     }
 }
@@ -839,11 +847,40 @@ fn allocate_with_env(
     allocate_with_call_operands(mf, env, call_clobbers, false)
 }
 
+/// How an emitter consumes `CALL` operands.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallOperands {
+    /// Every use in a register.
+    Registers,
+    /// Uses and multiple results through activation slots.
+    Stack,
+    /// Uses read from their homes; results as usual.
+    HomeUses,
+}
+
 fn allocate_with_call_operands(
     mf: &mut MachFunc,
     env: MachineEnv,
     call_clobbers: PRegSet,
     stack_call_operands: bool,
+) -> Result<(), AllocationError> {
+    allocate_with_call_operand_policy(
+        mf,
+        env,
+        call_clobbers,
+        if stack_call_operands {
+            CallOperands::Stack
+        } else {
+            CallOperands::Registers
+        },
+    )
+}
+
+fn allocate_with_call_operand_policy(
+    mf: &mut MachFunc,
+    env: MachineEnv,
+    call_clobbers: PRegSet,
+    calls: CallOperands,
 ) -> Result<(), AllocationError> {
     mf.allocation.clear();
     mf.inst_allocations.clear();
@@ -856,7 +893,7 @@ fn allocate_with_call_operands(
         return Ok(());
     }
 
-    let adapter = Adapter::build(mf, call_clobbers, stack_call_operands);
+    let adapter = Adapter::build(mf, call_clobbers, calls);
     for &vreg in &adapter.reverse {
         let repr = mf
             .value_reprs

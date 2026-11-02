@@ -145,7 +145,9 @@ impl FuncallProbe {
 /// misses. The invalidation epoch and the collection stamp are read first:
 /// a change during selection, which may resolve a cell, retires the entry.
 pub(super) fn record_funcall(state: &State, function: EgclVal, nargs: usize) {
-    if nargs > 3 {
+    // The probe forwards up to its maximum count, the function included
+    // (bliss-gg3i1.7.15.10.4).
+    if nargs >= egcl_compiler::t2::native_transfer::ORDINARY_FUNCALL_PROBE_MAX_COUNT {
         return;
     }
     let Some(probe) = state
