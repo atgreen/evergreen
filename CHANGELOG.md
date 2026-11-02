@@ -4,6 +4,10 @@
 
 ### Added
 
+- Add opt-in execution-owned T1 sampling countdowns on x86-64 Linux with
+  `EGCL_EXECUTION_T1_HEAT=1`
+  ([#983](https://github.com/atgreen/evergreen/pull/983)).
+
 - Add opt-in execution-context linkage for ordinary x86-64 Linux calls with
   `EGCL_R13_CALL_LINKAGE=1`
   ([#982](https://github.com/atgreen/evergreen/pull/982)).
