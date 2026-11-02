@@ -44,7 +44,8 @@
 //! stack; pops must match the top (`WrongPop`, `EmptyPop`), except that
 //! `UnbindSpecial`/`PopEnvChild` may retire the matching record beneath
 //! interleaved bindings and environments (LET* interleaves the two runtime
-//! stacks) but never across a handler or cleanup boundary. Each push with a
+//! stacks) and BLOCK/TAGBODY records (a local exit unbinds before it leaves
+//! them), but never across a handler or cleanup boundary. Each push with a
 //! cold destination (BLOCK and CATCH resume points, HANDLER-CASE clause
 //! bodies, RESTART-CASE resumes, UNWIND-PROTECT cleanup entry) seeds that
 //! destination with the appropriate outer stack, since an escaping call may
@@ -610,10 +611,16 @@ fn remove_auxiliary_scope(
             _ => false,
         })
         .ok_or(ScopeError::EmptyPop { bcp: pc })?;
+    // BLOCK and TAGBODY records hold no dynamic state, so a binding may also
+    // retire beneath them: the lowerer unbinds just before a local exit that
+    // leaves them (bliss-3k0xm).
     if scopes[index + 1..].iter().any(|scope| {
         !matches!(
             scope.kind,
-            ScopeKind::SpecialBinding { .. } | ScopeKind::LexicalEnvironment
+            ScopeKind::SpecialBinding { .. }
+                | ScopeKind::LexicalEnvironment
+                | ScopeKind::Block { .. }
+                | ScopeKind::Tagbody { .. }
         )
     }) {
         return Err(ScopeError::WrongPop { bcp: pc });

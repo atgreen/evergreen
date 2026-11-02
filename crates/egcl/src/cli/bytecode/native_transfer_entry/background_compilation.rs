@@ -59,6 +59,7 @@ pub(in crate::cli::bytecode) struct EmittedTransfer {
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
     _capture: JitBuffer,
     _poll: JitBuffer,
+    _heat_counter: Option<Box<std::sync::atomic::AtomicU32>>,
     _completion: JitBuffer,
     _recursive_prepare: Option<JitBuffer>,
     _deopt_capture: Option<JitBuffer>,
@@ -149,6 +150,7 @@ impl EmittedTransfer {
             _call_entries: self._call_entries,
             _capture: self._capture,
             _poll: self._poll,
+            _heat_counter: self._heat_counter,
             _completion: self._completion,
             _recursive_prepare: self._recursive_prepare,
             _deopt_capture: self._deopt_capture,
@@ -311,11 +313,24 @@ impl EmittedTransfer {
             .collect();
         // Optimized baseline code still needs T1 heat and OSR handling. The
         // construction tier, not IR optimization or deopt metadata, selects this.
-        let poll_fast_path = matches!(tier, CompilationTier::T2)
-            .then_some(context.poll_fast_path)
-            .flatten();
+        let heat_counter = matches!(tier, CompilationTier::T1)
+            .then(|| Box::new(std::sync::atomic::AtomicU32::new(native_poll::heat_batch())));
+        let baseline_heat =
+            heat_counter
+                .as_ref()
+                .map(|counter| egcl_compiler::t2::emit::BaselineHeat {
+                    counter: counter.as_ptr() as u64,
+                    batch: native_poll::heat_batch(),
+                });
+        let poll_fast_path =
+            context
+                .poll_fast_path
+                .map(|fast| egcl_compiler::t2::emit::NativePollFastPath {
+                    baseline_heat,
+                    ..fast
+                });
         let poll_helper = match tier {
-            CompilationTier::T1 => poll_or_transfer,
+            CompilationTier::T1 => poll_t1_or_transfer,
             CompilationTier::T2 => poll_t2_or_transfer,
         };
         let poll = exec(JitBuffer::new(&emit_published_helper_veneer(
@@ -527,7 +542,11 @@ impl EmittedTransfer {
                                     let symbol = ir.inst(inst).aux.named_call_target()?;
                                     let (_, cell) = call_cells.iter().find(|(name, _)| *name == symbol)?;
                                     Some((inst, ordinary_call_target(symbol, cell)))
-                                }).collect::<Option<Vec<_>>>()?;
+                                }).collect::<Option<Vec<_>>>()
+                                .or_else(|| {
+                                    ordinary_declined(&"a call without a named call cell");
+                                    None
+                                })?;
                             egcl_compiler::t2::emit::emit_framed_ordinary_function_with_self_call_facts(
                                 &ir, options, &targets, call_flags, cold.as_ptr() as u64,
                                 egcl_compiler::t2::emit::OrdinaryGuardOptions {
@@ -543,8 +562,15 @@ impl EmittedTransfer {
                                     // T2 is final: `record_loop_heat` has no
                                     // promotion left to request, so an idle
                                     // loop poll need not reach Rust. T1 keeps
-                                    // sampling the heat that promotes it.
-                                    top_tier: matches!(tier, CompilationTier::T2),
+                                    // sampling the heat that promotes it,
+                                    // except in a T1 loop body's ordinary
+                                    // entry (bliss-gg3i1.7.15.10.7): an
+                                    // ordinary frame cannot OSR, so sampling
+                                    // would reach Rust on every back edge.
+                                    // Invocation heat still promotes it.
+                                    top_tier: matches!(tier, CompilationTier::T2)
+                                        || t1_ordinary_tagbody_body(body),
+                                    baseline_heat,
                                 }).inspect_err(|error| t2_log_write(format_args!(
                                     "{}: ordinary entry declined: {error:?}", display_fn_name(&body.name)
                                 ))).ok()
@@ -754,6 +780,7 @@ impl EmittedTransfer {
             .as_ref()
             .ok_or(EmitDecline::NativeCallSites)?
             .iter()
+            .filter(|_| emitted.ordinary_entry.is_none())
             .filter_map(|site| {
                 let egcl_compiler::t2::x64_calls::NativeCallOrigin::LoopPoll(block) = site.origin
                 else {
@@ -842,6 +869,7 @@ impl EmittedTransfer {
             _call_entries: call_entries,
             _capture: capture,
             _poll: poll,
+            _heat_counter: heat_counter,
             _completion: completion,
             _recursive_prepare: recursive_prepare,
             _deopt_capture: deopt_capture,
@@ -940,7 +968,7 @@ impl EmissionContext {
             });
         let keyword_plan = body
             .variadic
-            .then(|| super::super::variadic_plan::VariadicPlan::native_keywords(body))
+            .then(|| super::super::variadic_plan::VariadicPlan::native_binding(body))
             .flatten()
             .map(|plan| {
                 (
@@ -1034,7 +1062,9 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
                 .code
                 .iter()
                 .any(|op| matches!(op, Instr::CheckResult(_)));
-        let has_metadata = scope_free_native_body(body, false) || result_recovery;
+        let has_metadata = scope_free_native_body(body, false)
+            || result_recovery
+            || t1_ordinary_tagbody_body(body);
         let mut cold_guesses = Vec::new();
         let (ir, ordinary_ir, speculations) = if has_metadata {
             let mut ir = egcl_compiler::t2::build::build_for_transfer_optimization_snapshot(
@@ -1042,7 +1072,7 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
                 input.symbol,
             )
             .map_err(EmitDecline::Build)?;
-            if optimize && scope_free_native_body(body, false) {
+            if optimize && (scope_free_native_body(body, false) || t1_ordinary_tagbody_body(body)) {
                 let cold = RefCell::new(Vec::new());
                 egcl_compiler::t2::speculate::speculate_with_feedback(
                     &mut ir,
@@ -1088,6 +1118,16 @@ pub(in crate::cli::bytecode) fn compile_background_t1(input: PreparedT1) -> Opti
             passes.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
             passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
             passes.run(&mut ir);
+            // Match the synchronous baseline's single-frame recovery admission.
+            if optimize
+                && t1_ordinary_tagbody_body(body)
+                && ir.frame_states.iter().any(|(_, state)| {
+                    state.scopes.len() != 1 || state.scopes[0].function != input.symbol
+                })
+            {
+                return Err(EmitDecline::MultiFrameRecovery);
+            }
+
             let ordinary_ir = ir.clone();
             let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(body)
                 .map_err(EmitDecline::Scopes)?;

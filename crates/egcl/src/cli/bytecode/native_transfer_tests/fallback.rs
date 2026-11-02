@@ -63,6 +63,61 @@ fn native_v2_eligible_local_exits_use_direct_native_branches() {
     }
 }
 
+/// A local exit that leaves only special bindings (and blocks or tagbodies)
+/// unbinds them before it leaves, so the native builder admits it and the
+/// bindings are gone afterwards (bliss-3k0xm). cl-ppcre's scanner returns
+/// from a BLOCK around its special bindings this way.
+#[test]
+fn native_v2_local_exits_through_special_bindings_unbind_first() {
+    let _lock = super::super::super::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    super::super::super::read_eval_all_env(
+        "(setq *exit-probe* :outer) (defun exit-probe-read () *exit-probe*)",
+        &mut env,
+    )
+    .unwrap();
+    for source in [
+        "((block exit (let ((*exit-probe* x)) (return-from exit (list (exit-probe-read))))))",
+        "((block exit (let ((*exit-probe* x)) (tagbody top (let ((*exit-probe* (list x))) \
+           (return-from exit (list (car (exit-probe-read)))))))))",
+    ] {
+        egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
+        egcl_rt::rooted!(forms = reader::read_from_string(source).unwrap().0);
+        let body = Arc::new(
+            compile_function("SPECIAL-LOCAL-EXIT", *params, *forms, &env, false, false)
+                .expect("compile special local exit"),
+        );
+        assert!(
+            body.code
+                .iter()
+                .any(|instruction| matches!(instruction, Instr::UnbindSpecial(_))),
+            "{source}"
+        );
+        assert!(
+            egcl_compiler::t2::build::build_from_bytecode_for_native_cleanups(&body).is_ok(),
+            "native builder must admit an exit that only leaves special bindings: {source}"
+        );
+        let code = TransferCode::compile(body).expect("native special local exit");
+        egcl_rt::rooted!(args = vec![EgclVal::from_fixnum(7)]);
+        egcl_rt::rooted!(result = code.run(&args, &mut env));
+        let value = *result.as_ref().unwrap();
+        assert_eq!(
+            super::super::super::cp(value).0,
+            EgclVal::from_fixnum(7),
+            "{source}"
+        );
+        let symbol = resolve_sym("*EXIT-PROBE*").unwrap();
+        assert_eq!(
+            egcl_rt::symbols::symbol_value(symbol.as_symbol_index()),
+            resolve_sym("KEYWORD:OUTER"),
+            "the exit must restore the outer binding: {source}"
+        );
+    }
+}
+
 #[test]
 fn native_v2_fallback_runs_nested_caller_cleanups_and_replacing_transfer() {
     let _lock = super::super::super::heap_test_lock()

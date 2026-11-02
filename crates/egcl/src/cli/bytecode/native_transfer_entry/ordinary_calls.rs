@@ -233,20 +233,22 @@ pub(super) unsafe extern "C" fn cold_call(
                             return Err(invalid_capture());
                         }
                         let boundary = &*boundary;
-                        if boundary.owner.is_null() || (*boundary.owner).ordinary_entry.is_none() {
+                        if boundary.owner().is_null()
+                            || (*boundary.owner()).ordinary_entry.is_none()
+                        {
                             return Err(invalid_capture());
                         }
                         // Both root ingress and published callees reserve an
                         // exact identity. Release the directory borrow before
                         // the GC gate can park; resolve before polling can
                         // replace the public definition.
-                        if (*boundary.owner).native_callable_slot.is_some() {
+                        if (*boundary.owner()).native_callable_slot.is_some() {
                             *self_callable = root_publication::frame_callable(boundary)
                                 .ok_or_else(invalid_capture)?;
                         } else {
                             let retained = boundary
-                                .directory
-                                .callable_for_pc(boundary.cursor.pc)
+                                .directory()
+                                .and_then(|directory| directory.callable_for_pc(boundary.cursor.pc))
                                 .ok_or_else(invalid_capture)?;
                             retained.with_gc_stable_mutator(|value| *self_callable = *value);
                         }

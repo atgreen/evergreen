@@ -13,7 +13,11 @@ fn compiled(name: &str, form: &str, env: &Env) -> Rc<TransferCode> {
     egcl_rt::rooted!(params = reader::read_from_string("(x y)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(form).unwrap().0);
     let body = Arc::new(compile_function(name, *params, *forms, env, false, false).unwrap());
-    Rc::new(TransferCode::compile(body).expect("compiled frame-map fixture"))
+    // The generic mapped baseline: a speculated local-TAGBODY body would take
+    // the ordinary entry's frame layout instead (bliss-tudsy).
+    Rc::new(
+        TransferCode::compile_variant(body, false, true, None).expect("compiled frame-map fixture"),
+    )
 }
 
 #[test]
@@ -21,6 +25,8 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+    let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     let inner = compiled(
@@ -105,8 +111,9 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     words[(outer_saved_rbx - low) / 8] = 0xaaa0;
     words[(saved_rbx - low) / 8] = 0xabc0;
     let boundary = PublishedBoundary {
-        directory: Rc::clone(&directory),
-        owner: Rc::as_ptr(&inner),
+        directory: Rc::as_ptr(&directory),
+        owner: Cell::new(Rc::as_ptr(&inner)),
+        owner_resolved: Cell::new(true),
         context: std::ptr::null_mut(),
         root_owner: Rc::as_ptr(&inner),
         cursor: NativeFrameCursor {
@@ -164,7 +171,7 @@ fn heterogeneous_owners_preserve_composed_register_home_addresses() {
     // A helper can start in B while the segment's root A is unregistered.
     // Publication must retain those two identities separately.
     let foreign = PublishedBoundary {
-        owner: Rc::as_ptr(&outer),
+        owner: Cell::new(Rc::as_ptr(&outer)),
         cursor: second_cursor.unwrap(),
         ..boundary
     };

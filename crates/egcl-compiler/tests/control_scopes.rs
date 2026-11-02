@@ -406,3 +406,51 @@ fn lexical_exit_records_binding_and_environment_restoration() {
     assert!(ScopeMap::analyze(&[Instr::UnbindSpecial(1)]).is_err());
     assert!(ScopeMap::analyze(&[Instr::PopEnvChild]).is_err());
 }
+
+/// The lowerer unbinds before a local exit that leaves special bindings and
+/// environments behind BLOCK and TAGBODY scopes, so a binding may retire
+/// beneath those; the exit then removes only the blocks (bliss-3k0xm). It
+/// still may not retire beneath a handler.
+#[test]
+fn bindings_retire_beneath_blocks_before_a_local_exit() {
+    use egcl_compiler::control_scope::ScopeKind;
+    let code = [
+        block(1, 9),
+        Instr::Const(0),
+        Instr::BindSpecial(1),
+        Instr::PushEnvChild,
+        Instr::PushTag {
+            tagbody_id: 2,
+            sp_restore: 0,
+        },
+        Instr::UnbindSpecial(1),
+        Instr::PopEnvChild,
+        Instr::Const(0),
+        Instr::ReturnFrom { block_id: 1 },
+        Instr::Return,
+    ];
+    let map = ScopeMap::analyze(&code).unwrap();
+    let removed = &map.exit_at(8).unwrap().removed;
+    assert_eq!(removed.len(), 2, "{removed:?}");
+    assert!(matches!(removed[0].kind, ScopeKind::Tagbody { id: 2 }));
+    assert!(matches!(removed[1].kind, ScopeKind::Block { id: 1, .. }));
+    let protected = [
+        block(1, 8),
+        Instr::Const(0),
+        Instr::BindSpecial(1),
+        Instr::Const(0),
+        Instr::PushCatch {
+            resume_bcp: 7,
+            sp_restore: 0,
+        },
+        Instr::UnbindSpecial(1),
+        Instr::Const(0),
+        Instr::ReturnFrom { block_id: 1 },
+        Instr::Return,
+    ];
+    let refused = ScopeMap::analyze(&protected).err();
+    assert!(
+        matches!(refused, Some(ScopeError::WrongPop { bcp: 5 })),
+        "{refused:?}"
+    );
+}

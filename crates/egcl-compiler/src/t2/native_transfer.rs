@@ -81,8 +81,8 @@ pub use generated_call::{
 #[path = "native_transfer_ordinary.rs"]
 mod ordinary;
 pub use ordinary::{
-    ORDINARY_FUNCALL_PROBE_ENTRIES, OrdinaryFuncallProbe, OrdinaryFuncallProbeEntry,
-    emit_ordinary_funcall_probe,
+    ORDINARY_FUNCALL_PROBE_ENTRIES, ORDINARY_FUNCALL_PROBE_MAX_COUNT, OrdinaryFuncallProbe,
+    OrdinaryFuncallProbeEntry, emit_ordinary_funcall_probe,
 };
 pub use ordinary::{
     OrdinaryArityRequest, OrdinaryEntryRequest, OrdinaryHelperOutcome, OrdinaryPublishedHelper,

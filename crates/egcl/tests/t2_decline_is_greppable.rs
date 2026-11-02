@@ -159,10 +159,13 @@ fn run(program: &str, envs: &[(&str, &str)]) -> (String, String) {
 /// these at another construct it still refuses rather than deleting them.
 #[test]
 fn a_function_not_compiled_to_bytecode_explains_itself_in_the_t2_log() {
+    // A special-named parameter followed by an init form that could observe
+    // its binding still declines; without one it binds through a LET in the
+    // body and compiles (bliss-3k0xm).
     let program = "(progn (defvar *kd* 1) \
-                    (defun keyfn (a &key ((:b *kd*) 1)) (+ a *kd*)) \
-                    (defun restfn (a &rest *kd*) (cons a *kd*)) \
-                    (defun reqfn (*kd*) (+ 1 *kd*)) \
+                    (defun keyfn (a &key ((:b *kd*) 1) (c (identity 0))) (+ a *kd* c)) \
+                    (defun restfn (a &rest *kd* &aux (z (identity 0))) (cons (+ a z) *kd*)) \
+                    (defun reqfn (*kd* &aux (z (identity 1))) (+ z *kd*)) \
                     (defun dbkey (form) (destructuring-bind (s &key (at 0)) form (list s at))) \
                     (dotimes (i 50) (keyfn i) (restfn i) (reqfn i) (dbkey (list i))) \
                     (format t \"~a ~a ~a ~a ~a~%\" (keyfn 2 :b 5) (restfn 1 2 3) (reqfn 4) \

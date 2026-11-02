@@ -178,6 +178,10 @@ pub struct OrdinaryFuncallProbeEntry {
 
 pub const ORDINARY_FUNCALL_PROBE_ENTRIES: usize = 4;
 
+/// The largest FUNCALL argument count, the function included, its probe
+/// forwards (bliss-gg3i1.7.15.10.4). Larger calls take the cell's veneer.
+pub const ORDINARY_FUNCALL_PROBE_MAX_COUNT: usize = 16;
+
 /// Addresses a FUNCALL probe reads; each outlives the probe's code.
 #[derive(Clone, Copy)]
 pub struct OrdinaryFuncallProbe {
@@ -193,8 +197,8 @@ pub struct OrdinaryFuncallProbe {
     pub stack_limit: u8,
 }
 
-/// The ordinary entry of the builtin FUNCALL cell: `(funcall f a0 a1 a2)`
-/// arrives as RDI=f, RSI=a0, RDX=a1, [RSP+8]=a2 and RCX=count. When `f` is a
+/// The ordinary entry of the builtin FUNCALL cell: `(funcall f a0 a1 a2 ...)`
+/// arrives as RDI=f, RSI=a0, RDX=a1, [RSP+8]=a2, ... and RCX=count. When `f` is a
 /// function object the runtime recorded in `table` for the current
 /// invalidation epoch, collection and target cell revision, the probe
 /// re-checks the target descriptor's arity and stack bound, shifts the
@@ -221,7 +225,7 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     let hit = a.label();
     a.extend_from_slice(&[0x48, 0x83, 0xf9, 0x01]); // cmp rcx,1
     a.jcc(Cc::L, miss);
-    a.extend_from_slice(&[0x48, 0x83, 0xf9, 0x04]); // cmp rcx,4
+    a.extend_from_slice(&[0x48, 0x83, 0xf9, ORDINARY_FUNCALL_PROBE_MAX_COUNT as u8]); // cmp rcx,max
     a.jcc(Cc::G, miss);
     a.extend_from_slice(&[0x49, 0xba]); // mov r10, table
     a.extend_from_slice(&probe.table.to_le_bytes());
@@ -335,14 +339,26 @@ pub fn emit_ordinary_funcall_probe(probe: OrdinaryFuncallProbe) -> Vec<u8> {
     unsigned_branch(&mut a, 0x82, miss); // jb: wrapped
     a.extend_from_slice(&[0x4d, 0x3b, 0x48, probe.stack_limit]); // cmp r9,[r8+limit]
     unsigned_branch(&mut a, 0x86, miss); // jbe
-    // Commit: drop the function, shift the actuals into place.
-    let no_overflow = a.label();
+    // Commit: drop the function, shift the actuals into place. Each
+    // overflow word moves down one slot within the caller's outgoing area,
+    // which the target's one fewer argument always fits; R8 and R9 are dead.
+    let shifted = a.label();
     a.extend_from_slice(&[0x48, 0x89, 0xf7]); // mov rdi,rsi
     a.extend_from_slice(&[0x48, 0x89, 0xd6]); // mov rsi,rdx
     a.extend_from_slice(&[0x48, 0x83, 0xf9, 0x04]); // cmp rcx,4
-    a.jcc(Cc::Ne, no_overflow);
+    a.jcc(Cc::L, shifted);
     a.extend_from_slice(&[0x48, 0x8b, 0x54, 0x24, 0x08]); // mov rdx,[rsp+8]
-    a.bind(no_overflow);
+    for word in 1..ORDINARY_FUNCALL_PROBE_MAX_COUNT - 3 {
+        // Actual `word + 3` of the target is the call's overflow word
+        // `word + 1`; it exists when the count exceeds `word + 3`.
+        a.extend_from_slice(&[0x48, 0x83, 0xf9, (word + 4) as u8]); // cmp rcx,word+4
+        a.jcc(Cc::L, shifted);
+        let from = ((word + 1) * 8) as u8;
+        let to = (word * 8) as u8;
+        a.extend_from_slice(&[0x4c, 0x8b, 0x44, 0x24, from]); // mov r8,[rsp+from]
+        a.extend_from_slice(&[0x4c, 0x89, 0x44, 0x24, to]); // mov [rsp+to],r8
+    }
+    a.bind(shifted);
     a.extend_from_slice(&[0x48, 0xff, 0xc9]); // dec rcx
     mem(
         &mut a,

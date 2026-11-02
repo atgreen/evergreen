@@ -77,6 +77,7 @@ pub(crate) fn admit_string_char_calls(f: &mut Function, calls: &HashSet<Inst>) {
     if calls.is_empty() {
         return;
     }
+    admit_string_char_invokes(f, calls);
     let mut renamed = HashMap::new();
     let mut slow_exits = Vec::new();
     let mut work = f.block_order().to_vec();
@@ -212,6 +213,132 @@ pub(crate) fn admit_string_char_calls(f: &mut Function, calls: &HashSet<Inst>) {
     f.replace_values(&renamed);
     for (slow, exit) in slow_exits {
         f.set_terminator(slow, exit);
+    }
+}
+
+/// The same fast path for an accessor call built as an `Invoke`, as every call
+/// is in a function compiled with native cleanups -- the mapped tier, which is
+/// where a closure's code runs (bliss-3k0xm). An `Invoke` already ends its
+/// block and hands its result to its normal successor, so no join is needed:
+///
+/// ```text
+/// B:     ...; Invoke CHAR(s, i) -> Normal(r), <exceptional edges>
+/// =>
+/// B:     ...; c = StringCharOrNil(s, i); Brif c -> Fast, Slow
+/// Fast:  ClearMv; Jump Normal(c)
+/// Slow:  Invoke CHAR(s, i) -> Normal(r), <exceptional edges>
+/// ```
+///
+/// The slow arm is the original instruction with its frame state and every
+/// exceptional edge, so all it handled before it still handles.
+fn admit_string_char_invokes(f: &mut Function, calls: &HashSet<Inst>) {
+    for block in f.block_order().to_vec() {
+        let Some(invoke) = f.terminator(block) else {
+            continue;
+        };
+        if !calls.contains(&invoke) {
+            continue;
+        }
+        let data = f.inst(invoke).clone();
+        let shape_ok = data.opcode == Opcode::Invoke
+            && data.args.len() == 2
+            && data.results.len() == 1
+            && data.frame_state.is_some()
+            && matches!(data.aux, AuxData::CallTarget(_))
+            && data
+                .targets
+                .first()
+                .is_some_and(|normal| normal.args == data.results);
+        if !shape_ok {
+            continue;
+        }
+        let normal = data.targets[0].block;
+        let source_pos = data.source_pos;
+        // Inserted in reverse, so the layout reads B, Fast, Slow.
+        let slow = f.make_block_after(block);
+        let fast = f.make_block_after(block);
+        let moved = f.block_mut(block).insts.pop();
+        debug_assert_eq!(moved, Some(invoke));
+        f.block_mut(slow).insts = vec![invoke];
+        let (_, character) = f.push_inst(
+            block,
+            InstData {
+                opcode: Opcode::StringCharOrNil,
+                args: data.args.clone(),
+                results: vec![],
+                aux: AuxData::None,
+                // Ordered after stores to the string; not a guard or call.
+                flags: InstFlags {
+                    effectful: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: None,
+                source_pos,
+            },
+            &[(
+                IRType::of(TypeBits::CHARACTER.join(TypeBits::NULL)),
+                ValueRepresentation::Tagged,
+            )],
+        );
+        let character = character[0];
+        f.set_terminator(
+            block,
+            InstData {
+                opcode: Opcode::Brif,
+                args: vec![character],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![
+                    BlockCall {
+                        block: fast,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: slow,
+                        args: vec![],
+                    },
+                ],
+                frame_state: None,
+                source_pos,
+            },
+        );
+        f.push_inst(
+            fast,
+            InstData {
+                opcode: Opcode::ClearMv,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags {
+                    effectful: true,
+                    call: true,
+                    safepoint: true,
+                    ..InstFlags::default()
+                },
+                targets: vec![],
+                frame_state: data.frame_state,
+                source_pos,
+            },
+            &[],
+        );
+        f.set_terminator(
+            fast,
+            InstData {
+                opcode: Opcode::Jump,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![BlockCall {
+                    block: normal,
+                    args: vec![character],
+                }],
+                frame_state: None,
+                source_pos,
+            },
+        );
     }
 }
 
@@ -351,6 +478,54 @@ mod tests {
             .find(|data| data.opcode == Opcode::GenericEq)
             .expect("EQ reads the join");
         assert_eq!(eq.args[0], f.block(join).params[0]);
+    }
+
+    /// A native-cleanup build makes every call an `Invoke`; the accessor
+    /// still gets its fast arm, which jumps to the invoke's normal successor
+    /// (bliss-3k0xm).
+    #[test]
+    fn an_invoked_accessor_gets_a_fast_arm_too() {
+        for name in ["CHAR", "SCHAR", "ELT"] {
+            let f = super::super::build::build_from_bytecode_for_native_cleanups(&body(
+                accessor_call(name),
+                2,
+            ))
+            .expect("builds");
+            super::super::verify::verify(&f).expect("split IR verifies");
+            assert_eq!(count(&f, Opcode::StringCharOrNil), 1, "{name}");
+            assert_eq!(
+                count(&f, Opcode::Invoke),
+                1,
+                "{name}: the slow arm keeps the invoke"
+            );
+            assert_eq!(
+                count(&f, Opcode::ClearMv),
+                1,
+                "{name}: the fast arm resets values"
+            );
+            let invoke = f
+                .block_order()
+                .iter()
+                .flat_map(|&block| f.block(block).insts.iter())
+                .map(|&inst| f.inst(inst))
+                .find(|data| data.opcode == Opcode::Invoke)
+                .unwrap();
+            let normal = invoke.targets[0].block;
+            let jump = f
+                .block_order()
+                .iter()
+                .filter_map(|&block| f.terminator(block))
+                .map(|inst| f.inst(inst))
+                .find(|data| {
+                    data.opcode == Opcode::Jump
+                        && data
+                            .targets
+                            .first()
+                            .is_some_and(|target| target.block == normal)
+                })
+                .expect("the fast arm joins the invoke's normal successor");
+            assert_eq!(jump.targets[0].args.len(), 1, "{name}");
+        }
     }
 
     #[test]

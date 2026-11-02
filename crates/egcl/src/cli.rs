@@ -44,6 +44,7 @@ use remembered_captures::{FrameCell, FrameWrite};
 mod shake;
 mod slot_access;
 pub mod sprof;
+pub mod tw_census;
 use egcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use egcl_rt::runtime::parse_cli as parse_runtime_cli;
 use egcl_rt::value::{EOF, EgclVal, NIL, T};
@@ -920,6 +921,24 @@ fn write_str_to(stream: EgclVal, s: &str, env: &mut Env) -> Result<(), EgclError
     // Fresh, not interned: an interned string is never reclaimed, so every
     // distinct text written would leak (bliss-4due).
     egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string_fresh(s));
+    write_lisp_string_to(stream, *sv, env)
+}
+
+/// [`write_str_to`] for exact character codes, which may include surrogates.
+fn write_codes_to(stream: EgclVal, codes: &[u32], env: &mut Env) -> Result<(), EgclError> {
+    let mut stream = stream;
+    egcl_rt::rooted_ref!(_stream_root = &mut stream);
+    check_pending_sigpipe_for_output()?;
+    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string_from_codes(codes, false));
+    write_lisp_string_to(stream, *sv, env)
+}
+
+/// Write the whole of a (rooted) Lisp string to a resolved output stream,
+/// dispatching to STREAM-WRITE-STRING for a Gray stream.
+fn write_lisp_string_to(stream: EgclVal, sv: EgclVal, env: &mut Env) -> Result<(), EgclError> {
+    let mut stream = stream;
+    egcl_rt::rooted_ref!(_stream_root = &mut stream);
+    egcl_rt::rooted!(sv = sv);
     if is_gray_stream(stream) {
         invoke_generic_function(
             "STREAM-WRITE-STRING",
@@ -10018,8 +10037,10 @@ fn accessor_call_miss(symbol: u32, args: &[EgclVal], env: &mut Env) -> Result<Eg
 /// name-lookups, the empty-list plumbing in `invoke_standard_methods` /
 /// `invoke_primary_chain`, and the `MethodContext` push/pop. Works from the
 /// cached method-ids alone (METHOD_COMPILED is keyed by method-id), so it never
-/// re-resolves the MethodDef. Returns None to fall through to the general path
-/// (aux methods present, more than one primary, or an uncompiled body).
+/// re-resolves the MethodDef. Less specific primaries are allowed too: a
+/// most specific one that never mentions CALL-NEXT-METHOD cannot reach them
+/// (bliss-3k0xm). Returns None to fall through to the general path (aux
+/// methods present, a next-method mention, or an uncompiled body).
 fn try_single_primary_fast(
     env: &mut Env,
     effective: &GfEffective,
@@ -10178,13 +10199,22 @@ fn generic_is_slot_reader(env: &Env, name: &str) -> bool {
 
 /// Which of the first GF_KEY_MAX_ARGS argument positions some method of `name`
 /// specializes, as a bit mask. Only the dispatch key consults it.
+// Calls wider than the inline cache key are safe only when later arguments
+// have no specializers; preserve the newer dispatch machinery.
+const GF_SPECIALIZED_BEYOND_KEY: u8 = 0x80;
+
 fn generic_specialized_positions(env: &Env, name: &str) -> u8 {
     let mut mask = 0u8;
     if let Some(methods) = env.methods.borrow().get(name) {
         for method in methods {
             for (position, specializer) in method.specializers.iter().enumerate() {
-                if position < GF_KEY_MAX_ARGS && !matches!(specializer, MethodSpecializer::Any) {
+                if matches!(specializer, MethodSpecializer::Any) {
+                    continue;
+                }
+                if position < GF_KEY_MAX_ARGS {
                     mask |= 1 << position;
+                } else {
+                    mask |= GF_SPECIALIZED_BEYOND_KEY;
                 }
             }
         }
@@ -10299,7 +10329,10 @@ const DISPATCH_BIT_EQL_VALUE: u32 = 1 << 24;
 /// The key therefore holds no movable reference and needs no GC tracing.
 #[inline]
 fn gf_dispatch_key(gf: u32, args: &[EgclVal], meta: &GfMeta) -> Option<GfKey> {
-    if !meta.cacheable || args.len() > GF_KEY_MAX_ARGS {
+    if !meta.cacheable
+        || args.len() > usize::from(u8::MAX)
+        || (args.len() > GF_KEY_MAX_ARGS && meta.specialized & GF_SPECIALIZED_BEYOND_KEY != 0)
+    {
         return None;
     }
     let mut classes = [0u64; GF_KEY_MAX_ARGS];
@@ -12649,6 +12682,12 @@ fn eval_named_call_ex(
     let _fiber_frame = egcl_rt::thread::FiberCallFrame::enter_with_args(name, args);
     let _sf = sprof::Frame::name(name, sprof::TREEWALK);
     sprof::maybe_sample();
+    if tw_census::enabled() {
+        tw_census::note(format!(
+            "named-{} {name}",
+            if is_local { "local" } else { "global" }
+        ));
+    }
     // Take the FLET function's captured scope (a shared handle, so this is a
     // refcount bump and not a copy of the map) out from under the env.funs
     // borrow, and if present run the body with env.funs pointing at it,
@@ -13128,7 +13167,7 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
         if val.as_char() == ' ' && !egcl_stdlib::format::print_readably_active() {
             out.push(' ');
         } else {
-            out.push_str(&egcl_stdlib::format::character_name(val.as_char()));
+            out.push_str(&egcl_stdlib::format::character_name(val.char_code()));
         }
     } else if val.is_symbol() {
         let name = sym_name(val);
@@ -14074,14 +14113,14 @@ fn is_base_string_value(v: EgclVal) -> bool {
 /// range an 8-bit `SIMPLE_BASE_STRING` stores (spec §1.6.3). EXTENDED-CHAR is
 /// the rest of CHARACTER.
 fn is_base_char_value(v: EgclVal) -> bool {
-    v.is_character() && (v.as_char() as u32) < 256
+    v.is_character() && v.char_code() < 256
 }
 
 /// STANDARD-CHAR: the 96 standard characters, #\Newline plus the printable
 /// ASCII range (matches boot.lisp STANDARD-CHAR-P).
 fn is_standard_char_value(v: EgclVal) -> bool {
     v.is_character() && {
-        let code = v.as_char() as u32;
+        let code = v.char_code();
         code == 10 || (32..127).contains(&code)
     }
 }
@@ -14449,6 +14488,18 @@ impl egcl_rt::gc::TraceHostRoots for Closure {
 /// allocated; the construction root preserves its captures until publication.
 fn register_tree_closure(mut closure: Closure) -> EgclVal {
     egcl_rt::rooted_ref!(_construction_root = &mut closure);
+    if tw_census::enabled() {
+        // The creator is the innermost recorded Lisp call.
+        let creator = egcl_rt::debug_stack::capture_current(1)
+            .into_iter()
+            .next()
+            .and_then(|frame| frame.function)
+            .unwrap_or_else(|| "<top-level>".to_string());
+        tw_census::note(format!(
+            "closure-created in {creator} {}",
+            tw_census::sketch(closure.body)
+        ));
+    }
     let id = next_closure_id();
     let marker = resolve_sym("EGCL::CLOSURE").unwrap_or(NIL);
     egcl_rt::rooted!(reference = arena_cons(marker, EgclVal::from_fixnum(id as i64)));
@@ -22820,6 +22871,13 @@ fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         return Ok(v);
     }
     let s = if v.is_character() {
+        if egcl_stdlib::characters::is_surrogate_char(v) {
+            // No Rust text holds a surrogate; build the string from its code.
+            return Ok(egcl_stdlib::make_lisp_string_from_codes(
+                &[v.char_code()],
+                false,
+            ));
+        }
         v.as_char().to_string()
     } else {
         val_as_str(v)
@@ -25981,15 +26039,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         expected: "character".into(),
                     });
                 }
-                return Ok(EgclVal::from_fixnum(v.as_char() as i64));
+                return Ok(EgclVal::from_fixnum(i64::from(v.char_code())));
             }
             "CODE-CHAR" => {
                 let (af, _) = cp(cdr);
-                let code = num_val(eval_form(af, env)?)? as u32;
-                return Ok(match char::from_u32(code) {
-                    Some(c) => EgclVal::from_char(c),
-                    None => NIL,
-                });
+                let code = num_val(eval_form(af, env)?)? as i64;
+                return Ok(egcl_stdlib::characters::code_char(code).unwrap_or(NIL));
             }
             "TYPEP" => return eval_builtin_arguments(&name, cdr, env),
             "EQ" => {
@@ -34940,7 +34995,7 @@ fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclErr
     if !base && egcl_stdlib::registered_string(value).is_some() {
         return Ok(value);
     }
-    let mut s = String::new();
+    let mut codes = Vec::new();
     for e in seq_elements(value)? {
         // Every element must fit the string: one that is not a character (or
         // not a BASE-CHAR, for a base string) is a TYPE-ERROR, as in SBCL,
@@ -34951,16 +35006,13 @@ fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclErr
                 expected: if base { "base-char" } else { "character" }.into(),
             });
         }
-        s.push(e.as_char());
+        codes.push(e.char_code());
     }
     // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
     // :element-type character :initial-contents) must be MUTABLE — an
     // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
-    Ok(if base {
-        egcl_stdlib::make_lisp_base_string_fresh(&s)
-    } else {
-        egcl_stdlib::make_lisp_string_fresh(&s)
-    })
+    // Built from the codes, so a surrogate character survives (bliss-5fn6m).
+    Ok(egcl_stdlib::make_lisp_string_from_codes(&codes, base))
 }
 
 /// Resolve DEFTYPE and function designators once, for both call paths.
@@ -35651,14 +35703,38 @@ fn end_earmuff_convention() {
         }
     }
     EARMUFF_CONVENTION.store(false, std::sync::atomic::Ordering::Relaxed);
+    special_answers_changed();
 }
 
 /// Register `sym` as globally special (idempotent). No-op for non-symbols.
 fn proclaim_special(sym: EgclVal) {
     if sym.is_symbol() {
         let full = sym_name_rc(sym).to_string();
-        PROCLAIMED_SPECIAL.borrow_mut().insert(full);
+        let added = PROCLAIMED_SPECIAL.borrow_mut().insert(full);
+        if added {
+            special_answers_changed();
+        }
     }
+}
+
+/// Bumped AFTER every change to what [`is_special_var`] answers -- a new
+/// proclamation, or the end of the earmuff convention -- so a cached answer
+/// computed before the change is never used after it (bliss-3k0xm).
+static SPECIAL_ANSWERS_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn special_answers_changed() {
+    SPECIAL_ANSWERS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+thread_local! {
+    /// Per-thread [`is_special_var`] answers for interned symbols, indexed by
+    /// symbol index: 0 unknown, 1 lexical, 2 special. Valid while the
+    /// generation matches [`SPECIAL_ANSWERS_GENERATION`]. The uncached test
+    /// spells the symbol's name and hashes it into the proclamation set under
+    /// a lock, and native code makes it for every read of a dynamically bound
+    /// special variable, so cl-ppcre's matchers paid it per character.
+    static SPECIAL_ANSWERS: RefCell<(u64, Vec<u8>)> = const { RefCell::new((0, Vec::new())) };
 }
 
 /// True if `name` (a symbol's FULL name, as `sym_name` spells it -- not the bare
@@ -35682,6 +35758,40 @@ fn is_special_var(sym: EgclVal) -> bool {
     if !sym.is_symbol() {
         return false;
     }
+    let idx = sym.as_symbol_index();
+    if sym.is_nil() || sym == T || egcl_rt::symbols::is_uninterned(idx) {
+        return is_special_var_uncached(sym);
+    }
+    // Read the generation BEFORE computing, so an answer racing a
+    // proclamation is filed under the generation it may predate.
+    let generation = SPECIAL_ANSWERS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let cached = SPECIAL_ANSWERS.with(|answers| {
+        let answers = answers.borrow();
+        if answers.0 != generation {
+            return 0;
+        }
+        answers.1.get(idx as usize).copied().unwrap_or(0)
+    });
+    if cached != 0 {
+        return cached == 2;
+    }
+    let special = is_special_var_uncached(sym);
+    SPECIAL_ANSWERS.with(|answers| {
+        let mut answers = answers.borrow_mut();
+        if answers.0 != generation {
+            answers.0 = generation;
+            answers.1.clear();
+        }
+        let i = idx as usize;
+        if i >= answers.1.len() {
+            answers.1.resize(i + 1, 0);
+        }
+        answers.1[i] = if special { 2 } else { 1 };
+    });
+    special
+}
+
+fn is_special_var_uncached(sym: EgclVal) -> bool {
     let full = sym_name_rc(sym);
     let bare = symbol_bare_name(&full);
     let b = bare.as_bytes();
@@ -36843,14 +36953,30 @@ fn string_designator(v: EgclVal) -> String {
     val_as_str(v)
 }
 
-fn string_compare_bounds_values(args: &[EgclVal]) -> Result<(String, String, usize), EgclError> {
+/// [`string_designator`] as exact character codes: a string's or character's
+/// surrogates survive (bliss-5fn6m); other designators go through their text.
+fn string_designator_codes(v: EgclVal) -> Vec<u32> {
+    if v.is_character() {
+        return vec![v.char_code()];
+    }
+    if !v.is_symbol()
+        && let Some(codes) = egcl_stdlib::sequences::string_codes(v)
+    {
+        return codes;
+    }
+    string_designator(v).chars().map(|c| c as u32).collect()
+}
+
+fn string_compare_bounds_values(
+    args: &[EgclVal],
+) -> Result<(Vec<u32>, Vec<u32>, usize), EgclError> {
     if args.len() < 2 {
         return Err(EgclError::ProgramError(
             "string comparison requires two string designators".into(),
         ));
     }
-    let s1: Vec<char> = string_designator(args[0]).chars().collect();
-    let s2: Vec<char> = string_designator(args[1]).chars().collect();
+    let s1 = string_designator_codes(args[0]);
+    let s2 = string_designator_codes(args[1]);
     let kw = &args[2..];
     // ANSI keyword validation (catchable PROGRAM-ERROR): an odd number of
     // keyword arguments, a non-symbol in keyword position, or an unknown
@@ -36909,8 +37035,8 @@ fn string_compare_bounds_values(args: &[EgclVal]) -> Result<(String, String, usi
     let end1 = bound("END1", s1.len()).min(s1.len()).max(start1);
     let start2 = bound("START2", 0).min(s2.len());
     let end2 = bound("END2", s2.len()).min(s2.len()).max(start2);
-    let sub1: String = s1[start1..end1].iter().collect();
-    let sub2: String = s2[start2..end2].iter().collect();
+    let sub1 = s1[start1..end1].to_vec();
+    let sub2 = s2[start2..end2].to_vec();
     Ok((sub1, sub2, start1))
 }
 
@@ -45386,6 +45512,12 @@ fn apply_function_impl(
                         .as_ref()
                         .and_then(|macros| install_lexical_macros(env, macros))
                 );
+                if tw_census::enabled() {
+                    tw_census::note(format!(
+                        "closure-instance {}",
+                        tw_census::sketch(closure.body)
+                    ));
+                }
                 let result =
                     with_special_declarations(env, closure.captured_specials.clone(), |env| {
                         eval_lambda_call_ex(
@@ -45416,6 +45548,9 @@ fn apply_function_impl(
                 ));
             }
             let (params_form, body) = cp(lr);
+            if tw_census::enabled() {
+                tw_census::note(format!("raw-lambda {}", tw_census::sketch(body)));
+            }
             return eval_lambda_call(env, params_form, body, args, Arc::clone(&env.frame));
         }
     }
@@ -45476,6 +45611,30 @@ fn apply_function_impl(
         };
         let params_form = egcl_rt::function::lambda_list(fn_val);
         let body = egcl_rt::function::body(fn_val);
+        if tw_census::enabled() {
+            let fname = egcl_rt::function::name(fn_val);
+            let why = if !fname.is_symbol() || fname.is_nil() {
+                "anonymous"
+            } else if egcl_rt::symbols::symbol_function(fname.as_symbol_index()) != Some(fn_val) {
+                "not-its-symbol's-definition"
+            } else if egcl_rt::function::invoke_count(fn_val) < bytecode::lazy_compile_threshold() {
+                "below-lazy-threshold"
+            } else {
+                "compile-declined"
+            };
+            let reason = if fname.is_symbol() && !fname.is_nil() {
+                tw_census::declined_reason(fname.as_symbol_index())
+                    .map(|r| format!(" <{r}>"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            tw_census::note(format!(
+                "heap-fn [{why}]{reason} {} {}",
+                sym_name(fname),
+                tw_census::sketch(body)
+            ));
+        }
         // A reified capturing closure runs its interpreted body against the
         // captured environment, not the caller's frame (bliss-jtc.23.3). Its
         // BLOCK/TAGBODY exit scope is fresh: a heap interpreted-function is a
@@ -46395,20 +46554,18 @@ fn apply_builtin_fast(
                     expected: "character".into(),
                 }));
             }
-            Some(Ok(EgclVal::from_fixnum(v.as_char() as i64)))
+            Some(Ok(EgclVal::from_fixnum(i64::from(v.char_code()))))
         }
         "CODE-CHAR" if args.len() == 1 => {
             env.clear_mv();
             // Mirrors operator position exactly, including that an out-of-range
-            // or surrogate code answers NIL rather than signalling.
+            // code answers NIL rather than signalling. A surrogate code is a
+            // character, as in SBCL (bliss-5fn6m).
             let code = match num_val(args[0]) {
-                Ok(n) => n as u32,
+                Ok(n) => n as i64,
                 Err(e) => return Some(Err(e)),
             };
-            Some(Ok(match char::from_u32(code) {
-                Some(c) => EgclVal::from_char(c),
-                None => NIL,
-            }))
+            Some(Ok(egcl_stdlib::characters::code_char(code).unwrap_or(NIL)))
         }
         "CHAR-UPCASE" | "CHAR-DOWNCASE" if args.len() == 1 => {
             env.clear_mv();
@@ -46955,9 +47112,7 @@ fn integer_or_float_remainder(a: EgclVal, b: EgclVal, q: i64, av: f64, bv: f64) 
 /// shorter length; `Equal` means identical. Char-based (not byte-based) so it is
 /// correct for non-ASCII. Used by STRING</STRING> to return the ANSI mismatch
 /// index rather than a boolean.
-fn string_mismatch(a: &str, b: &str) -> (usize, std::cmp::Ordering) {
-    let av: Vec<char> = a.chars().collect();
-    let bv: Vec<char> = b.chars().collect();
+fn string_mismatch(av: &[u32], bv: &[u32]) -> (usize, std::cmp::Ordering) {
     let n = av.len().min(bv.len());
     for i in 0..n {
         if av[i] != bv[i] {

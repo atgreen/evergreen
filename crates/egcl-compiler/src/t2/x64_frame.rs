@@ -387,7 +387,7 @@ fn immediate_constant(f: &Function, value: Value) -> Option<EgclVal> {
     match (instruction.opcode, &instruction.aux) {
         (Opcode::ConstFixnum, AuxData::FixnumImm(v)) => Some(EgclVal::from_fixnum(*v)),
         (Opcode::ConstFloat, AuxData::FloatImm(v)) => Some(EgclVal::from_single_float(*v)),
-        (Opcode::ConstChar, AuxData::CharImm(v)) => Some(EgclVal::from_char(*v)),
+        (Opcode::ConstChar, AuxData::CharImm(v)) => Some(EgclVal::from_char_code(*v)),
         (Opcode::ConstSymbol, AuxData::SymbolRef(v)) => Some(EgclVal::from_symbol_index(*v)),
         (Opcode::ConstNil, _) => Some(egcl_rt::value::NIL),
         (Opcode::ConstT, _) => Some(egcl_rt::value::T),

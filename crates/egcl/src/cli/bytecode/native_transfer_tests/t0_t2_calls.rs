@@ -227,7 +227,7 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_reused_bridge() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun t0-t2-observe () (%ordinary-t2-entry-for-test)) (defun t0-t2-inner (a b) (t0-t2-observe) (+ a b)) (defun t0-t2-kw (a &key (b (1+ 0))) (t0-t2-inner a b))",
+        "(defun t0-t2-observe () (%ordinary-t2-entry-for-test)) (defun t0-t2-inner (a b) (t0-t2-observe) (+ a b)) (defun t0-t2-kw (a &key (b (1+ 0)) &aux (aux-z 0)) (t0-t2-inner a b))",
         &mut env,
     )
     .unwrap();
@@ -246,7 +246,7 @@ fn a_mapped_caller_enters_an_ordinary_t2_callee_through_reused_bridge() {
     );
     let (outer, outer_code) = super::ordinary_t2::install(
         "T0-T2-KW",
-        "(a &key (b (1+ 0)))",
+        "(a &key (b (1+ 0)) &aux (aux-z 0))",
         "((t0-t2-inner a b))",
         &mut env,
     );
@@ -341,13 +341,13 @@ fn t2_elt_reads_simple_strings_inline_and_calls_elt_for_anything_else() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun t0-t2-str-elt (s i) (elt s i)) (defun t0-t2-kw-elt (s &key (start (1- 1))) (elt s start))",
+        "(defun t0-t2-str-elt (s i) (elt s i)) (defun t0-t2-kw-elt (s &key (start (1- 1)) &aux (aux-z 0)) (elt s start))",
         &mut env,
     ).unwrap();
     let (leaf, _) = super::ordinary_t2::install("T0-T2-STR-ELT", "(s i)", "((elt s i))", &mut env);
     let (keyed, keyed_code) = super::ordinary_t2::install(
         "T0-T2-KW-ELT",
-        "(s &key (start (1- 1)))",
+        "(s &key (start (1- 1)) &aux (aux-z 0))",
         "((elt s start))",
         &mut env,
     );

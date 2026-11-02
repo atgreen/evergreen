@@ -2348,7 +2348,7 @@ pub fn emit_framed_with_runtime(
                 (Opcode::ConstFloat, AuxData::FloatImm(value)) => {
                     ((value.to_bits() as u64) << 32) | 4
                 }
-                (Opcode::ConstChar, AuxData::CharImm(value)) => EgclVal::from_char(*value).0,
+                (Opcode::ConstChar, AuxData::CharImm(value)) => EgclVal::from_char_code(*value).0,
                 (Opcode::ConstSymbol, AuxData::SymbolRef(value)) => {
                     EgclVal::from_symbol_index(*value).0
                 }

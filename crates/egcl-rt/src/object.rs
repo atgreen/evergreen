@@ -309,7 +309,7 @@ pub unsafe fn write_narrowest_string(ptr: *mut u8, s: &str) {
 /// Write a 32-bit `SIMPLE_CHARACTER_STRING` for `s` into a zeroed, 8-aligned
 /// allocation of at least [`character_string_alloc_size`]`(s)` bytes. The single
 /// write choke point for constructed strings; `read_simple_string` /
-/// `simple_string_char_at` are the matching read choke points.
+/// `simple_string_code_at` are the matching read choke points.
 ///
 /// # Safety
 /// `ptr` must point to a zeroed, 8-byte-aligned allocation of at least
@@ -353,37 +353,37 @@ pub unsafe fn simple_string_char_count(ptr: *const u8) -> usize {
     unsafe { *(ptr.add(simple_string_payload_offset(ptr)) as *const u64) as usize }
 }
 
-/// The character at `index` of a simple string, or `None` if out of range —
-/// O(1). Width is taken from the `type_id`.
+/// The character code at `index` of a simple string, or `None` if out of
+/// range — O(1). Width is taken from the `type_id`. Any code below
+/// `CHAR-CODE-LIMIT` may be stored, surrogates included (bliss-5fn6m).
 ///
 /// # Safety
 /// `ptr` must be a live simple-string object.
 #[inline]
-pub unsafe fn simple_string_char_at(ptr: *const u8, index: usize) -> Option<char> {
+pub unsafe fn simple_string_code_at(ptr: *const u8, index: usize) -> Option<u32> {
     unsafe {
         if index >= simple_string_char_count(ptr) {
             return None;
         }
         let tid = (*(ptr as *const ObjectHeader)).type_id();
         let data = ptr.add(simple_string_payload_offset(ptr) + 8);
-        let cp = if tid == type_id::SIMPLE_CHARACTER_STRING {
+        Some(if tid == type_id::SIMPLE_CHARACTER_STRING {
             *(data.add(index * 4) as *const u32)
         } else {
             *data.add(index) as u32
-        };
-        char::from_u32(cp)
+        })
     }
 }
 
-/// Store `ch` at `index` of a simple string, in place — O(1). Returns `false`
-/// (no write) if `index` is out of range, or if `ch` ≥ 256 does not fit a
-/// `SIMPLE_BASE_STRING` (the caller raises a TYPE-ERROR; a base string never
-/// promotes).
+/// Store the character `code` at `index` of a simple string, in place — O(1).
+/// Returns `false` (no write) if `index` is out of range, or if `code` ≥ 256
+/// does not fit a `SIMPLE_BASE_STRING` (the caller raises a TYPE-ERROR; a base
+/// string never promotes).
 ///
 /// # Safety
 /// `ptr` must be a live simple-string object.
 #[inline]
-pub unsafe fn simple_string_set_char(ptr: *mut u8, index: usize, ch: char) -> bool {
+pub unsafe fn simple_string_set_code(ptr: *mut u8, index: usize, code: u32) -> bool {
     unsafe {
         if index >= simple_string_char_count(ptr) {
             return false;
@@ -391,10 +391,10 @@ pub unsafe fn simple_string_set_char(ptr: *mut u8, index: usize, ch: char) -> bo
         let tid = (*(ptr as *const ObjectHeader)).type_id();
         let data = ptr.add(simple_string_payload_offset(ptr) + 8);
         if tid == type_id::SIMPLE_CHARACTER_STRING {
-            *(data.add(index * 4) as *mut u32) = ch as u32;
+            *(data.add(index * 4) as *mut u32) = code;
             true
-        } else if (ch as u32) < 256 {
-            *data.add(index) = ch as u8;
+        } else if code < 256 {
+            *data.add(index) = code as u8;
             true
         } else {
             false
@@ -402,24 +402,43 @@ pub unsafe fn simple_string_set_char(ptr: *mut u8, index: usize, ch: char) -> bo
     }
 }
 
-/// The characters of a simple string, decoded in place. Each is what
-/// [`read_simple_string`] would push, so the two always agree.
+/// The character codes of a simple string, read in place.
 ///
 /// # Safety
 /// `ptr` must be a live simple-string object, and must stay live and unmoved
 /// while the iterator is used: no allocation may happen until it is dropped.
-pub unsafe fn simple_string_chars(ptr: *const u8) -> impl Iterator<Item = char> {
+pub unsafe fn simple_string_codes(ptr: *const u8) -> impl Iterator<Item = u32> {
     unsafe {
         let len = simple_string_char_count(ptr);
         let wide = (*(ptr as *const ObjectHeader)).type_id() == type_id::SIMPLE_CHARACTER_STRING;
         let data = ptr.add(simple_string_payload_offset(ptr) + 8);
         (0..len).map(move |i| {
             if wide {
-                char::from_u32(*(data.add(i * 4) as *const u32)).unwrap_or('\u{FFFD}')
+                *(data.add(i * 4) as *const u32)
             } else {
-                *data.add(i) as char
+                *data.add(i) as u32
             }
         })
+    }
+}
+
+/// The character codes of a simple string, copied out. Exact, unlike
+/// [`read_simple_string`].
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+pub unsafe fn read_simple_string_codes(ptr: *const u8) -> Vec<u32> {
+    unsafe { simple_string_codes(ptr).collect() }
+}
+
+/// Does the simple string hold a surrogate code (which Rust text cannot)?
+///
+/// # Safety
+/// `ptr` must be a live simple-string object.
+pub unsafe fn simple_string_has_surrogate(ptr: *const u8) -> bool {
+    unsafe {
+        (*(ptr as *const ObjectHeader)).type_id() == type_id::SIMPLE_CHARACTER_STRING
+            && simple_string_codes(ptr).any(crate::text::is_surrogate)
     }
 }
 
@@ -441,7 +460,7 @@ pub unsafe fn simple_strings_eq(a: *const u8, b: *const u8) -> bool {
             let db = b.add(simple_string_payload_offset(b) + 8);
             return std::slice::from_raw_parts(da, len) == std::slice::from_raw_parts(db, len);
         }
-        simple_string_chars(a).eq(simple_string_chars(b))
+        simple_string_codes(a).eq(simple_string_codes(b))
     }
 }
 
@@ -477,6 +496,8 @@ pub unsafe fn simple_string_eq_str(ptr: *const u8, text: &str) -> bool {
 }
 
 /// Decode a simple string into an owned Rust `String`. Width from `type_id`.
+/// LOSSY for a surrogate code, which becomes U+FFFD (see [`crate::text`]); use
+/// [`read_simple_string_codes`] where the exact characters matter.
 ///
 /// # Safety
 /// `ptr` must be a live simple-string object.

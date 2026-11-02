@@ -74,6 +74,7 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
         signal_epoch: &epoch as *const _ as u64,
         observe_forces_cold: true,
         instrument_skips: true,
+        baseline_heat: None,
     };
     let source = BytecodeFunction {
         self_call_sites: Vec::new(),

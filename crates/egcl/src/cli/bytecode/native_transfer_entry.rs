@@ -380,6 +380,8 @@ pub(super) struct TransferCode {
     _call_entries: Vec<(u32, Arc<egcl_rt::call_table::CallCell>, JitBuffer)>,
     _capture: JitBuffer,
     _poll: JitBuffer,
+    /// Baseline loop heat countdown the generated polls address (bliss-tudsy).
+    _heat_counter: Option<Box<std::sync::atomic::AtomicU32>>,
     _completion: JitBuffer,
     _recursive_prepare: Option<JitBuffer>,
     _deopt_capture: Option<JitBuffer>,
@@ -481,6 +483,8 @@ pub(super) enum EmitDecline {
     Build(egcl_compiler::t2::build::BuildError),
     Scopes(egcl_compiler::control_scope::ScopeError),
     Legalize(egcl_compiler::t2::build::BuildError),
+    /// A guard of a local-TAGBODY body would recover more than one frame.
+    MultiFrameRecovery,
     ExecutableMemory,
     FrameTooLarge,
     /// Unboxed values need a T2 native-stack frame without OSR entries.
@@ -507,6 +511,7 @@ impl std::fmt::Display for EmitDecline {
             Self::Build(error) => write!(f, "IR builder: {error:?}"),
             Self::Scopes(error) => write!(f, "control-scope analysis: {error:?}"),
             Self::Legalize(error) => write!(f, "transfer-call legalization: {error:?}"),
+            Self::MultiFrameRecovery => f.write_str("a TAGBODY guard needs multi-frame recovery"),
             Self::ExecutableMemory => f.write_str("no executable memory for a veneer"),
             Self::FrameTooLarge => f.write_str("frame slot count overflows"),
             Self::RawValues => f.write_str("unboxed values outside a T2 native-stack frame"),
@@ -569,6 +574,17 @@ pub(super) fn mapped_t1_decline_reason(symbol: u32, body: &Arc<BytecodeFunction>
 
 pub(super) fn install_baseline_code(symbol: u32, mut code: TransferCode) -> Option<Rc<NativeCode>> {
     code.set_installed_symbol(symbol);
+    if super::t2_log_target().is_some() {
+        super::t2_log_write(format_args!(
+            "{}: T1 installed with {} ABI",
+            super::display_fn_name(&code.body.name),
+            if code.ordinary_entry.is_some() {
+                "ordinary x86-64 Lisp"
+            } else {
+                "mapped"
+            }
+        ));
+    }
     let body = Arc::clone(&code.body);
     let code = Rc::new(code);
     let code_info = code.code_info;
@@ -1011,6 +1027,13 @@ impl TransferCode {
         }
     }
 
+    /// Whether a root activation may take the lean ordinary root. A T1 loop
+    /// body's loops still sample heat and may OSR to T2, which only the
+    /// general activation services (bliss-gg3i1.7.15.10.7).
+    pub(super) fn ordinary_root_allowed(&self) -> bool {
+        self.is_t2 || !t1_ordinary_tagbody_body(&self.body)
+    }
+
     pub(super) fn mapped_entry(&self) -> Option<*const u8> {
         let offset = self.frame_entry.filter(|offset| *offset < self.code_len)?;
         Some(self.code.as_ptr().wrapping_add(offset))
@@ -1333,7 +1356,12 @@ impl TransferCode {
             return Err(EmitDecline::ExecutingIdentity);
         }
         let roots = retain_native_body(&body);
-        let optimize = optimize && scope_free_native_body(&body, false);
+        // A scope-free body apart from local TAGBODYs -- every DOTIMES, DOLIST,
+        // DO and LOOP -- speculates as T2's tagged artifact does. Deopt rebuilds
+        // its local tag records from the exact scope map (bliss-tudsy). The
+        // non-speculating retry keeps the generic native-cleanups build.
+        let local_tags = optimize && t1_ordinary_tagbody_body(&body);
+        let optimize = optimize && (scope_free_native_body(&body, false) || local_tags);
         // Mandatory result guards also need exact recovery metadata in the
         // baseline tier, including when VALUES produced the checked primary.
         // This does not enable speculation for multiple-value bodies.
@@ -1344,6 +1372,7 @@ impl TransferCode {
                 .any(|op| matches!(op, Instr::CheckResult(_)));
         let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false)
             || result_recovery
+            || t1_ordinary_tagbody_body(&body)
         {
             // A method's callable lives in an uninterned symbol whose name,
             // "(METHOD ...)", does not read back; the installed symbol is its
@@ -1403,6 +1432,15 @@ impl TransferCode {
             passes.add(Box::new(egcl_compiler::t2::opt_clear_mv::ClearMvElim));
             passes.add(Box::new(egcl_compiler::t2::opt_dce::Dce));
             passes.run(&mut ir);
+            // Guard recovery reconstructs one logical frame of this body.
+            if local_tags
+                && ir
+                    .frame_states
+                    .iter()
+                    .any(|(_, state)| state.scopes.len() != 1 || state.scopes[0].function != symbol)
+            {
+                return Err(EmitDecline::MultiFrameRecovery);
+            }
             let scopes = egcl_compiler::control_scope::ScopeMap::analyze_function(&body)
                 .map_err(EmitDecline::Scopes)?;
             let ordinary_ir = ir.clone();
@@ -1650,6 +1688,15 @@ impl TransferCode {
         } else {
             function
         };
+        // Ordinary T1 calls keep their generated entry; root loop activations
+        // use the mapped companion so that later T2 code remains reachable by OSR.
+        if !self.is_t2
+            && self.ordinary_entry.is_some()
+            && let Some(companion) = self.osr_companion.as_deref()
+            && self.installed_symbol.is_some_and(t2_may_replace)
+        {
+            return companion.run_activation(args, env, None, function);
+        }
         if let Some(offset) = self.lean_root_entry() {
             return self.run_ordinary_root(offset, function, args, env);
         }
@@ -2277,20 +2324,21 @@ fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
 }
 
-/// Parameters the ordinary entry binds itself: fixed ones, or up to three
-/// positional parameters of which the trailing ones are `&optional`. The
-/// entry pads an omitted one with the unsupplied marker (bliss-6m6ca).
+/// Parameters the ordinary entry binds itself: fixed ones; positional
+/// parameters of which the trailing ones are `&optional`, where the entry
+/// pads an omitted one with the unsupplied marker (bliss-6m6ca), in
+/// registers or, past the third, in its frame (bliss-gg3i1.7.15.10.4); or a
+/// `&rest`/`&key` list whose plan binds every call without evaluation.
 fn ordinary_entry_parameters(body: &BytecodeFunction) -> bool {
     fixed_tagged_parameters(body)
         || ordinary_outer_capture_body(body)
         || (positional_tagged_parameters(body)
             && body.min_args < body.arity
-            && body.arity <= 3
             && body.param_types.iter().all(|ty| ty.is_any()))
         || (body.variadic
             && !body.has_env
             && body.param_types.iter().all(|ty| ty.is_any())
-            && super::variadic_plan::VariadicPlan::native_keywords(body).is_some())
+            && super::variadic_plan::VariadicPlan::native_binding(body).is_some())
 }
 
 pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
@@ -2321,6 +2369,8 @@ fn named_call_symbol(instruction: &Instr) -> Option<u32> {
     match instruction {
         Instr::CallNamed { sym, .. } => Some(*sym),
         Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+        // SetValues is built as its VALUES call.
+        Instr::SetValues(_) => Some(egcl_rt::symbols::intern("VALUES")),
         // A structure constructor is built as its %MAKE-STRUCT call.
         Instr::MakeStruct { .. } => Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT")),
         // A scoped body's structure opcodes are built as their general calls.
@@ -2425,6 +2475,72 @@ fn variadic_slot_parameters(body: &BytecodeFunction) -> bool {
 
 fn scope_free_native_body(body: &BytecodeFunction, allow_values: bool) -> bool {
     !body.has_env && local_control_native_body(body, allow_values, false, false)
+}
+
+// Fixtures for the mapped T1 machinery (publication walks, mapped OSR) use
+// loop bodies, which T1 now gives an ordinary entry. Serialize with
+// `heap_test_lock()`.
+#[cfg(test)]
+static T1_TAGBODY_MAPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keep T1 loop bodies mapped-only while alive, as before
+/// bliss-gg3i1.7.15.10.7. Other ordinary admission is unchanged.
+#[cfg(test)]
+pub(in crate::cli::bytecode) struct T1TagbodyMappedForTest;
+
+#[cfg(test)]
+impl T1TagbodyMappedForTest {
+    pub(in crate::cli::bytecode) fn new() -> Self {
+        T1_TAGBODY_MAPPED.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for T1TagbodyMappedForTest {
+    fn drop(&mut self) {
+        T1_TAGBODY_MAPPED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn t1_tagbody_mapped_for_test() -> bool {
+    T1_TAGBODY_MAPPED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(not(test))]
+fn t1_tagbody_mapped_for_test() -> bool {
+    false
+}
+
+/// A T1 body that is not scope-free but that the ordinary entry may still run
+/// (bliss-gg3i1.7.15.10.7): scope-free apart from local TAGBODYs and primary-
+/// value binders (`TakeValuesToLocals` of one variable, as INCF and PUSH
+/// expand), exactly the shapes `ordinary_native_body` admits for T2. The
+/// ordinary filter still requires specialization to have removed every
+/// binder. T1 builds it with the same
+/// transfer-optimization IR as a scope-free body, so it gets an ordinary
+/// entry beside its mapped one instead of staying a mapped-only tier until
+/// T2 promotion. `EGCL_T1_ORDINARY_TAGBODY=0` keeps such bodies mapped-only.
+pub(super) fn t1_ordinary_tagbody_body(body: &BytecodeFunction) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("EGCL_T1_ORDINARY_TAGBODY").is_none_or(|value| value != "0")
+    }) && !t1_tagbody_mapped_for_test()
+        && !body.has_env
+        && slot_parameters(body, false)
+        && body.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::PushTag { .. }
+                    | Instr::Go { .. }
+                    | Instr::TakeValuesToLocals { nvars: 1, .. }
+            )
+        })
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true)
+                || matches!(op, Instr::PushTag { .. } | Instr::Go { .. })
+        })
 }
 
 /// A body the ordinary x86-64 Lisp entry may run: scope-free, or scope-free
@@ -2593,6 +2709,10 @@ fn ordinary_native_op(op: &Instr) -> bool {
             op,
             Instr::EnvRef { .. } | Instr::EnvSet { .. } | Instr::ClosureEnv | Instr::MakeEnv(_)
         )
+        // VALUES publishes its tuple through a noncollecting leaf and the
+        // ordinary return descriptor (bliss-gg3i1.7.15.10.4).
+        || (matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. })
+            && ordinary_values_enabled())
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
         || (matches!(op, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
             && ordinary_special_bindings_enabled())
@@ -2637,6 +2757,42 @@ pub(in crate::cli::bytecode) fn special_binding_body(body: &BytecodeFunction) ->
         })
 }
 
+/// Ordinary entries produce multiple values (bliss-gg3i1.7.15.10.4).
+/// `EGCL_DISABLE_ORDINARY_VALUES` keeps VALUES-producing bodies on the mapped
+/// entry, for comparison and bisection.
+pub(super) fn ordinary_values_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if MAPPED_VALUES_PINS.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return false;
+    }
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_VALUES").is_none())
+}
+
+#[cfg(test)]
+static MAPPED_VALUES_PINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Keep VALUES-producing bodies on the mapped entry while alive, for the
+/// mapped-protocol fixtures that use VALUES to select it. Compilations on
+/// worker threads observe it too.
+#[cfg(test)]
+pub(in crate::cli::bytecode) struct MappedValuesForTest(());
+
+#[cfg(test)]
+impl MappedValuesForTest {
+    pub(in crate::cli::bytecode) fn new() -> Self {
+        MAPPED_VALUES_PINS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Self(())
+    }
+}
+
+#[cfg(test)]
+impl Drop for MappedValuesForTest {
+    fn drop(&mut self) {
+        MAPPED_VALUES_PINS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub(super) fn ordinary_function_designators_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED
@@ -2645,13 +2801,15 @@ pub(super) fn ordinary_function_designators_enabled() -> bool {
 
 /// Whether specialization removed every primary-value binder the body's
 /// bytecode contains, so the ordinary entry never needs multiple values.
+/// Ordinary code now reads multiple values itself (bliss-gg3i1.7.15.10.4)
+/// unless `EGCL_DISABLE_ORDINARY_VALUES` asks for the old behaviour.
 fn ordinary_primary_transport_eliminated(ir: &egcl_compiler::t2::ir::Function) -> bool {
-    ir.block_order().iter().all(|&block| {
-        ir.block(block)
-            .insts
-            .iter()
-            .all(|&inst| ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals)
-    })
+    ordinary_values_enabled()
+        || ir.block_order().iter().all(|&block| {
+            ir.block(block).insts.iter().all(|&inst| {
+                ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
+            })
+        })
 }
 
 /// The first instruction `ordinary_native_body` refuses, for its decline log.
@@ -4655,6 +4813,18 @@ unsafe extern "C" fn poll_t2_or_transfer(
     native_poll::refresh();
 }
 
+/// A baseline poll: a spent heat batch, an OSR-entry visit that samples no
+/// heat, or any poll whose idle guard found pending work. Refresh the guard's
+/// snapshots as T2's polls do.
+unsafe extern "C" fn poll_t1_or_transfer(
+    request: *mut u8,
+    out: *mut egcl_rt::native_transfer::NativeOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    unsafe { poll_or_transfer(request, out, image) };
+    native_poll::refresh();
+}
+
 unsafe extern "C" fn poll_or_transfer(
     request: *mut u8,
     out: *mut egcl_rt::native_transfer::NativeOutcome,
@@ -4918,6 +5088,11 @@ unsafe fn prepare_osr(image: *const SysvTransferCapture) -> bool {
         relocate_condition_clusters(context, delta);
     }
     for (slot, value) in frame.locals.iter().enumerate() {
+        // A parameter that is dead at the header keeps its original argument
+        // for backtraces: an optimized baseline names only live locals.
+        if *value == egcl_rt::value::UNBOUND && slot < usize::from(code.body.arity) {
+            continue;
+        }
         unsafe { slot_set(context.frame, slot as u16, *value) };
     }
     // End the local root before moving the box; the source activation now
@@ -4981,7 +5156,13 @@ pub(in crate::cli::bytecode) unsafe fn poll_or_transfer_unpublished(
     egcl_rt::safepoint::poll_safepoint();
     if request as usize & 1 != 0
         && let Err(error) = guard_c2i(|| {
-            record_loop_heat();
+            // Bit 2: generated code counted a batch of visits (bliss-tudsy).
+            let visits = if request as usize & 4 != 0 {
+                native_poll::heat_batch()
+            } else {
+                1
+            };
+            record_loop_heat(visits);
             Ok(NIL)
         })
     {
@@ -5012,7 +5193,7 @@ thread_local! {
 /// Attribute sampled loop visits only to the exact installed definition.
 /// Publication may replace future entry points while this activation retains
 /// its code; it cannot turn the running mapped frame into a legacy OSR frame.
-fn record_loop_heat() {
+fn record_loop_heat(visits: u32) {
     if profiling_disabled() {
         return;
     }
@@ -5057,9 +5238,13 @@ fn record_loop_heat() {
             observe();
         }
     });
-    let count = egcl_rt::function::record_back_edges(*function, 1);
+    let count = egcl_rt::function::record_back_edges(*function, visits);
     let threshold = t2_backedge_threshold().max(1);
-    if !t2_enabled() || count < threshold || count % threshold != 0 {
+    // Request at each threshold multiple this sample reached or passed.
+    if !t2_enabled()
+        || count < threshold
+        || count / threshold == count.saturating_sub(visits) / threshold
+    {
         return;
     }
     poll_t2_completions();

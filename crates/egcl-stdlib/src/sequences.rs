@@ -42,7 +42,7 @@ pub fn string_set_char(s: EgclVal, index: usize, ch: EgclVal) -> Result<EgclVal,
             expected: "character".into(),
         });
     }
-    let new_char = ch.as_char();
+    let new_code = ch.char_code();
     unsafe {
         let ptr = s.as_ptr();
         let len = egcl_rt::object::simple_string_char_count(ptr);
@@ -59,7 +59,7 @@ pub fn string_set_char(s: EgclVal, index: usize, ch: EgclVal) -> Result<EgclVal,
         // O(1) in-place store (SBCL model, spec §1.6.3). A CHARACTER string
         // (the default) holds any code point; storing a code point >= 256 into
         // a BASE string is a TYPE-ERROR (base strings never promote).
-        if !egcl_rt::object::simple_string_set_char(ptr, index, new_char) {
+        if !egcl_rt::object::simple_string_set_code(ptr, index, new_code) {
             return Err(EgclError::TypeError {
                 datum: ch,
                 expected: "base-char (a character < code point 256) for a base string".into(),
@@ -125,17 +125,54 @@ pub(crate) fn string_content(v: EgclVal) -> Option<String> {
     v.is_string().then(|| v.as_string())
 }
 
-/// The character (not byte) at `index` of a string sequence, or `None` if `v`
+/// The exact character codes of a string value -- simple, fill-pointer,
+/// adjustable, displaced or registry-backed -- or `None` for a non-string.
+/// Unlike [`string_content`], this keeps surrogate characters (bliss-5fn6m).
+pub fn string_codes(v: EgclVal) -> Option<Vec<u32>> {
+    if crate::pathnames::is_pathname(v) {
+        return None;
+    }
+    if let Some(s) = crate::pathnames::registered_string(v) {
+        return Some(s.chars().map(|c| c as u32).collect());
+    }
+    if let Some(codes) = cvec_char_codes(v) {
+        return Some(codes);
+    }
+    // Safety: a string value is a live simple-string object.
+    v.is_string()
+        .then(|| unsafe { egcl_rt::object::read_simple_string_codes(v.as_ptr()) })
+}
+
+/// Does the string value hold a surrogate character, which Rust text (and so
+/// any UTF-8 encoding) cannot carry? `false` for a non-string.
+pub fn string_has_surrogate(v: EgclVal) -> bool {
+    if v.is_string() && !crate::pathnames::is_pathname(v) {
+        // Safety: a live simple string; nothing here allocates.
+        return unsafe { egcl_rt::object::simple_string_has_surrogate(v.as_ptr()) };
+    }
+    cvec_char_codes(v).is_some_and(|codes| codes.into_iter().any(egcl_rt::text::is_surrogate))
+}
+
+/// The codes of character-string elements; a non-character slot (an unset
+/// complex-string element) reads as code 0, as in [`cvec_char_contents`].
+pub(crate) fn element_codes(elements: &[EgclVal]) -> Vec<u32> {
+    elements
+        .iter()
+        .map(|e| if e.is_character() { e.char_code() } else { 0 })
+        .collect()
+}
+
+/// The character code at `index` of a string sequence, or `None` if `v`
 /// is not a string or `index` is out of range. This is the single choke point
 /// for character indexing (CHAR/SCHAR/ELT/AREF on a string). Simple strings
 /// use their fixed-width payload for O(1) access, including registered strings.
-pub fn string_char_at(v: EgclVal, index: usize) -> Option<char> {
+pub fn string_code_at(v: EgclVal, index: usize) -> Option<u32> {
     if v.is_string() {
         // Registration caches content; the object itself is still a real
         // simple string. No allocation or safepoint occurs during this read.
-        return unsafe { egcl_rt::object::simple_string_char_at(v.as_ptr(), index) };
+        return unsafe { egcl_rt::object::simple_string_code_at(v.as_ptr(), index) };
     }
-    string_content(v).and_then(|s| s.chars().nth(index))
+    string_codes(v).and_then(|codes| codes.get(index).copied())
 }
 
 /// The character (not byte) length of a string sequence, or `None` if `v` is
@@ -290,10 +327,10 @@ fn collect_elements(sequence: EgclVal) -> Result<Vec<EgclVal>, EgclError> {
         return Ok(elems);
     }
     if is_char_seq(sequence) {
-        return Ok(string_content(sequence)
+        return Ok(string_codes(sequence)
             .unwrap_or_default()
-            .chars()
-            .map(EgclVal::from_char)
+            .into_iter()
+            .map(EgclVal::from_char_code)
             .collect());
     }
     Err(EgclError::TypeError {
@@ -956,6 +993,20 @@ pub fn cvec_char_contents(v: EgclVal) -> Option<String> {
     }
     Some(s)
 }
+
+/// [`cvec_char_contents`] as exact character codes, surrogates included.
+pub fn cvec_char_codes(v: EgclVal) -> Option<Vec<u32>> {
+    if !is_complex_vector(v) || !cvec_is_string(v) {
+        return None;
+    }
+    let n = cvec_fill_pointer(v);
+    let mut codes = Vec::with_capacity(n);
+    for i in 0..n {
+        let e = cvec_elt(v, i).ok()?;
+        codes.push(if e.is_character() { e.char_code() } else { 0 });
+    }
+    Some(codes)
+}
 /// `array-total-size` — the capacity of the backing storage, or a displaced
 /// array's own recorded total size (its base's size is not its own).
 #[inline]
@@ -1055,7 +1106,7 @@ fn rebuilt_storage(base_chars: bool, elements: &[EgclVal]) -> Result<EgclVal, Eg
     for &e in elements {
         if e.is_nil() {
             text.push('\0');
-        } else if e.is_character() && (e.as_char() as u32) < 256 {
+        } else if e.is_character() && e.char_code() < 256 {
             text.push(e.as_char());
         } else {
             return Err(EgclError::TypeError {
@@ -1480,7 +1531,7 @@ pub fn vector_push_extend(
     }
     let base_chars = cvec_holds_base_chars(v);
     // Refuse a character the 8-bit storage cannot hold before growing it.
-    if base_chars && !(value.is_character() && (value.as_char() as u32) < 256) {
+    if base_chars && !(value.is_character() && value.char_code() < 256) {
         return Err(EgclError::TypeError {
             datum: value,
             expected: "BASE-CHAR".into(),
@@ -2050,8 +2101,8 @@ pub fn elt(sequence: EgclVal, index: usize) -> Result<EgclVal, EgclError> {
         };
     }
     if is_char_seq(sequence) {
-        match string_char_at(sequence, index) {
-            Some(c) => return Ok(EgclVal::from_char(c)),
+        match string_code_at(sequence, index) {
+            Some(code) => return Ok(EgclVal::from_char_code(code)),
             None => {
                 return Err(EgclError::TypeError {
                     datum: sequence,
@@ -2403,9 +2454,9 @@ pub fn fill_direct(
         if end > len {
             return Err(out_of_bounds(len));
         }
-        let ch = item.as_char();
+        let code = item.char_code();
         for index in start + 1..end {
-            unsafe { egcl_rt::object::simple_string_set_char(ptr, index, ch) };
+            unsafe { egcl_rt::object::simple_string_set_code(ptr, index, code) };
         }
         return Ok(true);
     }
@@ -2486,14 +2537,14 @@ pub fn search_direct(
         Box::new(start2..=last)
     };
     let found = if pat.is_string() && seq.is_string() {
-        let chars: Vec<char> = (start1..end1)
-            .map(|i| string_char_at(pat, i).expect("bounds checked by SEARCH"))
+        let chars: Vec<u32> = (start1..end1)
+            .map(|i| string_code_at(pat, i).expect("bounds checked by SEARCH"))
             .collect();
         positions.find(|&i| {
             chars
                 .iter()
                 .enumerate()
-                .all(|(k, &c)| string_char_at(seq, i + k) == Some(c))
+                .all(|(k, &c)| string_code_at(seq, i + k) == Some(c))
         })
     } else {
         let elements = (start1..end1)
@@ -2548,11 +2599,10 @@ pub fn copy_seq(sequence: EgclVal) -> Result<EgclVal, EgclError> {
         return Ok(build_bit_vector_from_vals(&elems));
     }
     if is_char_seq(sequence) {
-        let s: String = collect_elements(sequence)?
-            .iter()
-            .map(|&c| c.as_char())
-            .collect();
-        return Ok(crate::streams::make_lisp_string_fresh_like(sequence, &s));
+        let codes = element_codes(&collect_elements(sequence)?);
+        return Ok(crate::streams::make_lisp_string_from_codes_like(
+            sequence, &codes,
+        ));
     }
     // A general (non-character) fill-pointer / adjustable vector — char-typed ones
     // are handled by the is_char_seq branch above (bliss-w5t).
@@ -2626,10 +2676,7 @@ pub fn subseq(sequence: EgclVal, start: usize, end: Option<usize>) -> Result<Egc
         return Ok(result);
     }
     if is_char_seq(sequence) {
-        let chars: Vec<char> = string_content(sequence)
-            .unwrap_or_default()
-            .chars()
-            .collect();
+        let chars: Vec<u32> = string_codes(sequence).unwrap_or_default();
         let len = chars.len();
         let actual_end = end.unwrap_or(len);
         if start > actual_end {
@@ -2644,7 +2691,7 @@ pub fn subseq(sequence: EgclVal, start: usize, end: Option<usize>) -> Result<Egc
                 expected: format!("end ({}) <= length ({})", actual_end, len),
             });
         }
-        let sub = chars[start..actual_end].iter().collect::<String>();
+        let sub = &chars[start..actual_end];
         // SUBSEQ (and COPY-SEQ, which is (subseq seq 0)) must return a FRESH,
         // independent, mutable string — not the interned/shared one. make_lisp_string
         // interns by content, so `(copy-seq s)` returned an object EQ to `s` (a no-op)
@@ -2653,7 +2700,9 @@ pub fn subseq(sequence: EgclVal, start: usize, end: Option<usize>) -> Result<Egc
         // this also un-breaks the default-EQL set ops over COPY-SEQ'd strings that
         // ansi-test's CONS chapter exercises (bliss-9kxg). Same width as the
         // input: a base string's subsequence is a base string (COPY-SEQ.20).
-        return Ok(crate::streams::make_lisp_string_fresh_like(sequence, &sub));
+        return Ok(crate::streams::make_lisp_string_from_codes_like(
+            sequence, sub,
+        ));
     }
     let len = length(sequence)?;
     let actual_end = end.unwrap_or(len);
@@ -2733,8 +2782,10 @@ pub fn reverse(sequence: EgclVal) -> Result<EgclVal, EgclError> {
     } else if is_char_seq(sequence) {
         // REVERSE of a string is a string (ANSI): same element type as input,
         // width included (REVERSE-STRING.5).
-        let s: String = elems.iter().map(|&c| c.as_char()).collect();
-        Ok(crate::streams::make_lisp_string_fresh_like(sequence, &s))
+        Ok(crate::streams::make_lisp_string_from_codes_like(
+            sequence,
+            &element_codes(&elems),
+        ))
     } else if is_bit_seq(sequence) {
         // REVERSE of a bit-vector is a bit-vector (bliss-8z5f).
         Ok(build_bit_vector_from_vals(&elems))
@@ -3238,7 +3289,7 @@ pub fn build_result_sequence(
     }
     if result_type_is_string(result_type) {
         let base = result_type_is_base_string(result_type);
-        let mut out = String::with_capacity(elems.len());
+        let mut out = Vec::with_capacity(elems.len());
         for &elem in elems {
             if !elem.is_character() {
                 return Err(EgclError::TypeError {
@@ -3247,16 +3298,13 @@ pub fn build_result_sequence(
                 });
             }
             // A BASE-STRING holds code points below 256 and never promotes.
-            if base && (elem.as_char() as u32) >= 256 {
+            if base && elem.char_code() >= 256 {
                 return Err(EgclError::TypeError {
                     datum: elem,
                     expected: "base-char".to_string(),
                 });
             }
-            out.push(elem.as_char());
-        }
-        if base {
-            return Ok(crate::streams::make_lisp_base_string_fresh(&out));
+            out.push(elem.char_code());
         }
         // FRESH, not interned. make_lisp_string interns by content, so two
         // CONCATENATE (or MAP) calls producing the same characters answered the
@@ -3267,7 +3315,7 @@ pub fn build_result_sequence(
         // builds a string this way can break an unrelated later one. SUBSEQ,
         // COPY-SEQ and REVERSE already use the fresh constructor for exactly
         // this reason (bliss-9kxg); this path did not.
-        return Ok(crate::streams::make_lisp_string_fresh(&out));
+        return Ok(crate::streams::make_lisp_string_from_codes(&out, base));
     }
     if result_type_is_bit_vector(result_type) {
         // Every element must be a BIT; the generic builder maps any non-zero to
@@ -3723,7 +3771,7 @@ fn compare_with_predicate(
     } else if ka.is_double_float() && kb.is_double_float() {
         ka.as_double_float().total_cmp(&kb.as_double_float())
     } else if ka.is_character() && kb.is_character() {
-        ka.as_char().cmp(&kb.as_char())
+        ka.char_code().cmp(&kb.char_code())
     } else {
         // Fallback: compare raw bits for a stable total order.
         ka.to_raw().cmp(&kb.to_raw())

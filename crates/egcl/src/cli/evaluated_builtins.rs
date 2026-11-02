@@ -20,6 +20,42 @@ fn is_standard_reader_stand_in(function: EgclVal, installed: EgclVal, stand_in: 
         || installed_function(index).is_some_and(|f| f == installed)
 }
 
+/// WRITE-STRING / WRITE-LINE of a simple string to a built-in stream: hand the
+/// string and its `:start`/`:end` bounds to the stream, which reads the
+/// characters in place. No intermediate Rust text, so a surrogate character
+/// reaches a string output stream intact (bliss-5fn6m). Answers `false`, having
+/// done nothing, for anything else (a complex string, a Gray stream).
+fn write_simple_string_direct(
+    operator: &str,
+    args: &[EgclVal],
+    newline: bool,
+    env: &mut Env,
+) -> Result<bool, EgclError> {
+    let string = args[0];
+    if !string.is_string() {
+        return Ok(false);
+    }
+    let (stream, kv_from) = if args.len() > 1 && !is_keyword_arg(args[1]) {
+        (args[1], 2)
+    } else {
+        (NIL, 1)
+    };
+    let mut out = resolve_output_stream(stream, env);
+    if is_gray_stream(out) {
+        return Ok(false);
+    }
+    let len = egcl_stdlib::string_char_count(string).unwrap_or(0);
+    let (start, end) = read_start_end_keys_checked(operator, &args[kv_from..], len)?;
+    egcl_rt::rooted_ref!(_output_root = &mut out);
+    check_pending_sigpipe_for_output()?;
+    // Re-read the string from the caller's rooted arguments.
+    egcl_stdlib::stream_write_string(out, args[0], start, Some(end))?;
+    if newline {
+        egcl_stdlib::stream_terpri(out)?;
+    }
+    Ok(true)
+}
+
 fn ordinary_standard_reader_name(ch: char) -> Option<&'static str> {
     Some(match ch {
         '(' => "EGCL::%STANDARD-LIST-READER",
@@ -386,6 +422,12 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Err(EgclError::ProgramError("PRINC requires an object".into()));
             }
             egcl_stdlib::format::with_princ_bindings(|| {
+                if let Some(codes) = egcl_stdlib::format::surrogate_print_codes(args[0], false) {
+                    let stream = if args.len() > 1 { args[1] } else { NIL };
+                    let out = resolve_output_stream(stream, env);
+                    write_codes_to(out, &codes, env)?;
+                    return Ok(args[0]);
+                }
                 let mut s = String::new();
                 princ_val_env(args[0], env, &mut s);
                 let stream = if args.len() > 1 { args[1] } else { NIL };
@@ -403,6 +445,12 @@ fn resolve(name: &str) -> Option<Handler> {
 
             if args.is_empty() {
                 return Err(EgclError::ProgramError("PRIN1 requires an object".into()));
+            }
+            if let Some(codes) = egcl_stdlib::format::surrogate_print_codes(args[0], true) {
+                let stream = if args.len() > 1 { args[1] } else { NIL };
+                let out = resolve_output_stream(stream, env);
+                write_codes_to(out, &codes, env)?;
+                return Ok(args[0]);
             }
             let rendered = format_val_env(args[0], env, true);
             let stream = if args.len() > 1 { args[1] } else { NIL };
@@ -586,7 +634,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 }
                 j += 2;
             }
-            let mut fill = ' ';
+            let mut fill = u32::from(b' ');
             let mut fill_val = NIL;
             let mut fill_set = false;
             // :element-type BASE-CHAR (or STANDARD-CHAR) asks for the 8-bit
@@ -618,7 +666,7 @@ fn resolve(name: &str) -> Option<Handler> {
                                     expected: "character".into(),
                                 });
                             }
-                            fill = val.as_char();
+                            fill = val.char_code();
                             fill_val = val;
                             fill_set = true;
                         }
@@ -668,18 +716,15 @@ fn resolve(name: &str) -> Option<Handler> {
             }
             // A base string never promotes: a wide :initial-element is the
             // TYPE-ERROR the store would signal, raised before any store.
-            if base && (fill as u32) >= 256 {
+            if base && fill >= 256 {
                 return Err(EgclError::TypeError {
                     datum: fill_val,
                     expected: "base-char".into(),
                 });
             }
-            let content: String = std::iter::repeat_n(fill, size.as_fixnum() as usize).collect();
-            Ok(if base {
-                egcl_stdlib::make_lisp_base_string_fresh(&content)
-            } else {
-                egcl_stdlib::make_lisp_string_fresh(&content)
-            })
+            // Built from the code, so a surrogate fill survives (bliss-5fn6m).
+            let content = vec![fill; size.as_fixnum() as usize];
+            Ok(egcl_stdlib::make_lisp_string_from_codes(&content, base))
         }),
 
         "MAKE-BROADCAST-STREAM" => Some(|_operator, args, _env| {
@@ -3286,7 +3331,7 @@ fn resolve(name: &str) -> Option<Handler> {
             egcl_rt::rooted_ref!(_stream_root = &mut in_stream);
             let skip_ws = peek_type == T;
             let until = if peek_type.is_character() {
-                Some(peek_type.as_char())
+                Some(peek_type.char_code())
             } else {
                 None
             };
@@ -3313,7 +3358,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 // defines it, not a fixed character set (ansi PEEK-CHAR.20/.21).
                 let stop = match (skip_ws, until) {
                     (true, _) => !reader::is_whitespace_syntax(ch),
-                    (false, Some(u)) => ch == u,
+                    (false, Some(u)) => c.char_code() == u,
                     (false, None) => true,
                 };
                 if stop {
@@ -6052,10 +6097,12 @@ fn resolve(name: &str) -> Option<Handler> {
                         expected: "CHARACTER".into(),
                     });
                 }
-                Ok(match egcl_compiler::reader::char_name(args[0].as_char()) {
-                    Some(name) => egcl_stdlib::make_lisp_string_fresh(&name),
-                    None => NIL,
-                })
+                Ok(
+                    match egcl_compiler::reader::char_name(args[0].char_code()) {
+                        Some(name) => egcl_stdlib::make_lisp_string_fresh(&name),
+                        None => NIL,
+                    },
+                )
             })
         }
         // (dims-list storage): a multidimensional array over an existing
@@ -6101,10 +6148,11 @@ fn resolve(name: &str) -> Option<Handler> {
                         "EGCL-INTERNAL:%NAME-CHAR requires one string designator".into(),
                     ));
                 }
+                if args[0].is_character() {
+                    return Ok(args[0]);
+                }
                 let name = if is_string_value(args[0]) {
                     val_as_str(args[0])
-                } else if args[0].is_character() {
-                    args[0].as_char().to_string()
                 } else if args[0].is_symbol() {
                     sym_bare_name_rc(args[0]).to_string()
                 } else {
@@ -6114,7 +6162,7 @@ fn resolve(name: &str) -> Option<Handler> {
                     });
                 };
                 Ok(match egcl_compiler::reader::char_from_name(&name) {
-                    Some(c) => EgclVal::from_char(c),
+                    Some(c) => EgclVal::from_char_code(c),
                     None if name.chars().count() == 1 => {
                         EgclVal::from_char(name.chars().next().unwrap())
                     }
@@ -6986,6 +7034,9 @@ fn resolve(name: &str) -> Option<Handler> {
                     "WRITE-STRING requires an argument".into(),
                 ));
             }
+            if write_simple_string_direct("WRITE-STRING", &args, false, env)? {
+                return Ok(args[0]);
+            }
             let full = val_as_str(args[0]);
             // A second positional argument is the stream designator, unless
             // it is a keyword (the start of &key start/end options).
@@ -7029,6 +7080,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Err(EgclError::Internal(
                     "WRITE-LINE requires an argument".into(),
                 ));
+            }
+            if write_simple_string_direct("WRITE-LINE", &args, true, env)? {
+                return Ok(args[0]);
             }
             let full = val_as_str(args[0]);
             let (stream, kv_from) = if args.len() > 1 && !is_keyword_arg(args[1]) {

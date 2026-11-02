@@ -140,14 +140,8 @@ pub(crate) fn simple_string_ptr(v: EgclVal) -> Option<*const u8> {
         .then_some(ptr)
 }
 
-pub(crate) fn string_text(v: EgclVal) -> Option<String> {
-    if crate::pathnames::is_pathname(v) {
-        return None;
-    }
-    if let Some(s) = crate::pathnames::registered_string(v) {
-        return Some(s);
-    }
-    crate::sequences::string_content(v)
+pub(crate) fn string_codes(v: EgclVal) -> Option<Vec<u32>> {
+    crate::sequences::string_codes(v)
 }
 
 /// The active length of a bit vector, simple or complex.
@@ -250,7 +244,7 @@ pub fn equal(a: EgclVal, b: EgclVal) -> bool {
     if let (Some(x), Some(y)) = (bit_vector_length(a), bit_vector_length(b)) {
         return x == y && (0..x).all(|i| bit_vector_bit(a, i) == bit_vector_bit(b, i));
     }
-    match (string_text(a), string_text(b)) {
+    match (string_codes(a), string_codes(b)) {
         (Some(x), Some(y)) => x == y,
         _ => false,
     }
@@ -305,7 +299,7 @@ pub fn equalp(a: EgclVal, b: EgclVal) -> bool {
         return number_equal(a, b);
     }
     if a.is_character() && b.is_character() {
-        return crate::characters::char_equal(a.as_char(), b.as_char());
+        return crate::characters::code_equal(a.char_code(), b.char_code());
     }
     if !a.is_heap_object() || !b.is_heap_object() {
         return false;
@@ -315,11 +309,11 @@ pub fn equalp(a: EgclVal, b: EgclVal) -> bool {
             && crate::pathnames::is_pathname(b)
             && crate::pathnames::pathnames_equal(a, b);
     }
-    if let (Some(x), Some(y)) = (string_text(a), string_text(b)) {
-        return x.chars().count() == y.chars().count()
-            && x.chars()
-                .zip(y.chars())
-                .all(|(p, q)| crate::characters::char_equal(p, q));
+    if let (Some(x), Some(y)) = (string_codes(a), string_codes(b)) {
+        return x.len() == y.len()
+            && x.iter()
+                .zip(&y)
+                .all(|(&p, &q)| crate::characters::code_equal(p, q));
     }
     if vectorp(a) && vectorp(b) {
         let (Ok(n), Ok(m)) = (crate::sequences::length(a), crate::sequences::length(b)) else {

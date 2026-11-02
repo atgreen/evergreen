@@ -76,9 +76,12 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
             registry
                 .borrow()
                 .get(&symbol)
+                // A baseline's mapped companion runs runtime entries and OSR
+                // imports under the same installed version (bliss-tudsy).
                 .filter(|native| {
                     matches!(&native._storage, NativeCodeStorage::Mapped(mapped)
-                    if std::ptr::eq(mapped.as_ref(), code))
+                    if std::ptr::eq(mapped.as_ref(), code)
+                        || (!native.is_t2 && std::ptr::eq(mapped.osr_destination(), code)))
                 })
                 .cloned()
                 .map(|native| (symbol, native))
@@ -1702,7 +1705,7 @@ unsafe fn resume_native_guard_unpublished(request: *mut u8, out: *mut NativeOutc
         // Copy geometry, never retain a mutable GC-scanned context borrow.
         let (owner, cursor, bounds) = unsafe {
             (
-                (*boundary).owner,
+                (*boundary).owner(),
                 (*boundary).cursor,
                 (*boundary).bounds.clone(),
             )
@@ -2124,10 +2127,10 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         return Err(invalid_capture());
     }
     let boundary = unsafe { &*boundary };
-    if boundary.owner.is_null() || boundary.context != context {
+    if boundary.owner().is_null() || boundary.context != context {
         return Err(invalid_capture());
     }
-    let code = unsafe { &*boundary.owner };
+    let code = unsafe { &*boundary.owner() };
     egcl_rt::rooted!(
         _active_code_owner =
             super::super::ActiveCodeOwnerRoot(code.native_callable_slot.and(code.installed_symbol))
@@ -2299,7 +2302,7 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
     // Equal code owners can occur in different physical activations. Only the
     // actual root frame is allowed to reuse the managed anchor's callable/state.
     let is_root = !unsafe { (*context).ordinary_bridge }
-        && boundary.owner == unsafe { (*context).owner }
+        && boundary.owner() == unsafe { (*context).owner }
         && (step.caller.call_sp, step.caller.pc)
             == unsafe { ((*segment).saved_sp, (*segment).return_pc()) };
     if is_root {
@@ -2350,8 +2353,8 @@ pub(super) unsafe fn resume_ordinary_guard(request: *mut u8) -> Result<EgclVal, 
         *callable = root_publication::frame_callable(boundary).ok_or_else(invalid_capture)?;
     } else {
         let retained = boundary
-            .directory
-            .callable_for_pc(boundary.cursor.pc)
+            .directory()
+            .and_then(|directory| directory.callable_for_pc(boundary.cursor.pc))
             .ok_or_else(invalid_capture)?;
         retained.with_gc_stable_mutator(|value| *callable = *value);
     }
@@ -2454,7 +2457,7 @@ unsafe fn resume_guard_with_arguments(
             None
         } else {
             let boundary = root_publication::ACTIVE.with(Cell::get);
-            if boundary.is_null() || unsafe { (*boundary).owner != owner } {
+            if boundary.is_null() || unsafe { (*boundary).owner() != owner } {
                 return Err(invalid_capture());
             }
             let base = code.code.as_ptr() as usize;
@@ -3088,6 +3091,13 @@ mod tests {
             root_publication::OBSERVE.with(|hook| hook.get().is_none()),
             "observer-forced publication cannot prove baseline poll selection"
         );
+        assert!(
+            replacement._native_calls.iter().any(|site| matches!(
+                site.origin,
+                egcl_compiler::t2::x64_calls::NativeCallOrigin::StraightPoll(_)
+            )),
+            "the refreshed baseline retains its straight-line polls"
+        );
         reset_poll_paths_for_test();
         for _ in 0..12 {
             assert_eq!(
@@ -3098,10 +3108,13 @@ mod tests {
             );
         }
         let (idle, published) = take_poll_paths_for_test();
-        assert_eq!(idle, 0, "refreshed optimized baseline polls must publish");
-        assert!(
-            published >= 12,
-            "each refreshed call must execute a real straight-line poll: {published}"
+        assert_eq!(idle, 0, "baseline polls never take the T2 Rust preflight");
+        // A baseline straight-line poll samples no heat and services only
+        // runtime requests; with none pending it skips the runtime, as the
+        // final tier's polls do (bliss-tudsy).
+        assert_eq!(
+            published, 0,
+            "idle baseline straight-line polls skip publication"
         );
         assert_eq!(
             replacement.deopt_count(),

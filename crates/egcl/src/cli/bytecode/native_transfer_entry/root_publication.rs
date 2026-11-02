@@ -51,16 +51,25 @@ impl PublishedAdapter {
 }
 
 /// One suspended native caller, valid for the dynamic extent of the helper
-/// that published it. `owner` is frozen at machine-helper entry, before the
-/// logical CAPTURE context can change; `segment` is the active native anchor
-/// whose `saved_sp`/`return_pc` end the physical walk.
+/// that published it: its frame anchor. Linking it is a handful of stores.
+/// The code owner of the exact return PC is resolved only when something
+/// actually walks the frame -- a collection, backtrace, deopt, profiler sample
+/// or self-identity query -- never on the helper's entry. The root context is
+/// frozen at machine-helper entry, before the logical CAPTURE context can
+/// change; `segment` is the active native anchor whose `saved_sp`/`return_pc`
+/// end the physical walk.
 pub(super) struct PublishedBoundary {
-    pub(super) owner: *const TransferCode,
+    /// Code owner of `cursor.pc` once `owner_resolved` is set. Until then it
+    /// holds `root_owner`, the only owner known without a lookup.
+    owner: Cell<*const TransferCode>,
+    owner_resolved: Cell<bool>,
     /// Root activation's owner, which need not be the innermost code owner.
     root_owner: *const TransferCode,
-    // Captured on publication so stopped-fiber walks never consult the
-    // collector's execution-local directory.
-    pub(super) directory: std::rc::Rc<super::super::call_table::OrdinaryCodeDirectory>,
+    /// The publishing execution's ordinary code directory, captured on
+    /// publication so stopped-fiber walks never consult the collector's
+    /// execution-local directory. The execution owns it for its whole life,
+    /// and the enclosing segment lease retains every in-flight code owner.
+    directory: *const super::super::call_table::OrdinaryCodeDirectory,
     pub(super) context: *mut CaptureContext,
     pub(super) cursor: NativeFrameCursor,
     /// Actual native stack ownership: from the capture image up to the segment
@@ -80,6 +89,85 @@ pub(super) struct PublishedBoundary {
     pub(super) visited: Cell<usize>,
 }
 
+impl PublishedBoundary {
+    /// The exact code owner of the published return PC, or null when no
+    /// retained owner with an exact value map holds it. Resolved on first use,
+    /// either by the publishing execution itself or by a collector/debugger
+    /// with that execution stopped; nothing else writes the cache.
+    pub(super) fn owner(&self) -> *const TransferCode {
+        if !self.owner_resolved.get() {
+            self.owner.set(self.resolve_owner());
+            self.owner_resolved.set(true);
+        }
+        self.owner.get()
+    }
+
+    fn resolve_owner(&self) -> *const TransferCode {
+        let pc = self.cursor.pc;
+        let mapped = |code: &TransferCode| {
+            pc.checked_sub(code.code.as_ptr() as usize)
+                .filter(|offset| *offset < code.code_len)
+                .is_some_and(|offset| code._native_calls.value_map(offset).is_some())
+        };
+        if let Some(root) = unsafe { self.root_owner.as_ref() }
+            && pc
+                .checked_sub(root.code.as_ptr() as usize)
+                .is_some_and(|offset| offset < root.code_len)
+        {
+            return if mapped(root) {
+                self.root_owner
+            } else {
+                std::ptr::null()
+            };
+        }
+        let Some(directory) = self.directory() else {
+            return std::ptr::null();
+        };
+        // The segment lease retains this owner after the lookup handle drops.
+        directory
+            .code_for_pc(pc)
+            .filter(|code| mapped(code))
+            .map_or(std::ptr::null(), |code| std::rc::Rc::as_ptr(&code))
+    }
+
+    /// The publishing execution's ordinary code directory.
+    pub(super) fn directory(&self) -> Option<&super::super::call_table::OrdinaryCodeDirectory> {
+        unsafe { self.directory.as_ref() }
+    }
+
+    /// A boundary whose owner is already known exactly: fixtures, and the
+    /// generated mapped publication, whose PC always lies in its root owner.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn resolved(
+        owner: *const TransferCode,
+        root_owner: *const TransferCode,
+        directory: *const super::super::call_table::OrdinaryCodeDirectory,
+        context: *mut CaptureContext,
+        cursor: NativeFrameCursor,
+        bounds: Range<usize>,
+        segment: *mut NativeSegment,
+        stack: *const egcl_rt::stack::EgclStack,
+        previous: *mut PublishedBoundary,
+        profile_shadow_depth: usize,
+    ) -> Self {
+        Self {
+            owner: Cell::new(owner),
+            owner_resolved: Cell::new(true),
+            root_owner,
+            directory,
+            context,
+            cursor,
+            bounds,
+            segment,
+            stack,
+            previous,
+            profile_shadow_depth,
+            #[cfg(test)]
+            visited: Cell::new(0),
+        }
+    }
+}
+
 // SAFETY: only the owning execution links or unlinks its chain; the collector
 // reads it with every mutator stopped. A boundary lives on its helper's stack
 // and is unlinked before that frame returns, so no dangling link survives.
@@ -92,6 +180,29 @@ pub(super) static ACTIVE: egcl_rt::execution_local::ExecutionLocal<Cell<*mut Pub
 pub(in crate::cli::bytecode) fn native_only_root_for_test(marker: i64) -> Option<*mut EgclVal> {
     let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
     tests::native_only_slot_for(published, marker)
+}
+
+/// The innermost publication's anchor state: whether its code owner had been
+/// resolved before this call, and that exact owner (resolving it now).
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn active_anchor_for_test() -> Option<(bool, usize)> {
+    let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
+    let resolved = published.owner_resolved.get();
+    Some((resolved, published.owner() as usize))
+}
+
+/// Anchor state without resolving its owner, so a parked-fiber regression can
+/// require the collector to cache the owner from another execution.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn active_anchor_snapshot_for_test() -> Option<(bool, usize)> {
+    let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
+    Some((published.owner_resolved.get(), published.cursor.pc))
+}
+
+/// Whether any publication is linked on this execution.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn any_publication_for_test() -> bool {
+    !ACTIVE.with(Cell::get).is_null()
 }
 
 /// Test hook fired inside a published poll, after linking and before the real
@@ -129,7 +240,7 @@ pub(in super::super) fn native_poll_origin_for_test()
 -> Option<egcl_compiler::t2::x64_calls::NativeCallOrigin> {
     use egcl_compiler::t2::x64_calls::NativeCallOrigin;
     let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
-    let owner = unsafe { &*published.owner };
+    let owner = unsafe { &*published.owner() };
     let offset = published
         .cursor
         .pc
@@ -167,7 +278,7 @@ pub(in super::super) fn published_frame_has_owner_for_test(owner: usize) -> bool
 pub(in super::super) fn native_poll_root_for_test(marker: i64) -> Option<*mut EgclVal> {
     use egcl_compiler::t2::x64_calls::NativeCallOrigin;
     let published = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
-    let owner = unsafe { &*published.owner };
+    let owner = unsafe { &*published.owner() };
     let offset = published
         .cursor
         .pc
@@ -355,7 +466,7 @@ pub(in crate::cli::bytecode) fn take_adapter_crossings() -> usize {
 }
 
 #[cfg(test)]
-pub(super) fn take_foreign_walk_counts() -> (usize, usize) {
+pub(in crate::cli::bytecode) fn take_foreign_walk_counts() -> (usize, usize) {
     use std::sync::atomic::Ordering::Relaxed;
     (
         FOREIGN_WALKS.swap(0, Relaxed),
@@ -444,45 +555,21 @@ unsafe fn publish_with<R>(
         !root_owner.is_null(),
         "native publication needs its root owner"
     );
-    let root = unsafe { &*root_owner };
-    let directory = super::super::call_table::active_ordinary_directory();
-    let retained_owner = if cursor
-        .pc
-        .checked_sub(root.code.as_ptr() as usize)
-        .is_some_and(|offset| offset < root.code_len)
-    {
-        None
-    } else {
-        Some(
-            directory
-                .code_for_pc(cursor.pc)
-                .expect("native publication PC needs a retained code owner"),
-        )
-    };
-    let owner = retained_owner
-        .as_ref()
-        .map_or(root_owner, std::rc::Rc::as_ptr);
-    let code = unsafe { &*owner };
-    let offset = cursor
-        .pc
-        .checked_sub(code.code.as_ptr() as usize)
-        .filter(|offset| *offset < code.code_len)
-        .expect("native publication PC must belong to its retained owner");
-    assert!(
-        code._native_calls.value_map(offset).is_some(),
-        "native publication PC must have an exact value map"
-    );
+    // Lazy publication (bliss-gg3i1.7.15.10.8): record only the anchor. The
+    // exact code owner of `cursor.pc` and its value map are looked up when a
+    // walk needs them; most helper calls never collect or walk at all.
     let profile_depth = crate::cli::sprof::enabled().then(crate::cli::sprof::shadow_depth);
     let mut boundary = PublishedBoundary {
-        owner,
+        owner: Cell::new(root_owner),
+        owner_resolved: Cell::new(false),
         root_owner,
-        directory,
+        directory: super::super::call_table::active_ordinary_directory_ptr(),
         context,
         cursor,
         bounds: low..saved_sp,
         segment,
         stack: egcl_rt::current_stack(),
-        previous: ACTIVE.with(Cell::get),
+        previous: std::ptr::null_mut(),
         profile_shadow_depth: profile_depth.unwrap_or(0),
         #[cfg(test)]
         visited: Cell::new(0),
@@ -491,7 +578,14 @@ unsafe fn publish_with<R>(
         low < cursor.call_sp && cursor.call_sp <= saved_sp,
         "machine storage, caller RSP and segment entry must nest"
     );
-    ACTIVE.with(|slot| slot.set(&mut boundary));
+    // The eager publication's invariant, checked where it costs nothing in
+    // production: the exact PC has a retained owner with an exact value map.
+    // It deliberately leaves the cache unresolved, so tests observe laziness.
+    debug_assert!(
+        !boundary.resolve_owner().is_null(),
+        "native publication PC needs a retained owner with an exact value map"
+    );
+    boundary.previous = ACTIVE.with(|slot| slot.replace(&mut boundary));
     let _linked = Linked(&mut boundary);
     #[cfg(test)]
     if let Some(observe) = PROFILE_OBSERVE.with(Cell::get) {
@@ -503,7 +597,7 @@ unsafe fn publish_with<R>(
     let result = body();
     #[cfg(test)]
     ordinary_calls::YIELD_AFTER_RETURN_TO_OWNER.with(|target| {
-        if target.get() == owner as usize {
+        if target.get() == boundary.owner() as usize {
             target.set(0);
             // This exact caller is about to resume. Nested root adapters that
             // borrow its publication must not consume the one-shot injection.
@@ -604,11 +698,11 @@ pub(super) unsafe fn verify_dual_homes() -> (usize, usize, usize) {
     let mut boundary = ACTIVE.with(Cell::get);
     while !boundary.is_null() {
         let published = unsafe { &*boundary };
-        if published.owner.is_null() || published.segment.is_null() || published.stack.is_null() {
+        if published.owner().is_null() || published.segment.is_null() || published.stack.is_null() {
             boundary = published.previous;
             continue;
         }
-        let code = unsafe { &*published.owner };
+        let code = unsafe { &*published.owner() };
         let base = code.code.as_ptr() as usize;
         let segment = unsafe { &*published.segment };
         let walk = Walk::new(published.bounds.clone(), unsafe { &*published.stack });
@@ -918,7 +1012,7 @@ pub(super) unsafe fn with_leaf_callable<R>(
 /// Exact identity of this physical suspended frame. A code address alone is
 /// insufficient when several closures share one immutable template.
 pub(super) fn frame_callable(boundary: &PublishedBoundary) -> Option<EgclVal> {
-    let code = unsafe { boundary.owner.as_ref() }?;
+    let code = unsafe { boundary.owner().as_ref() }?;
     let walk = Walk::new(boundary.bounds.clone(), unsafe { &*boundary.stack });
     let step = code._native_calls.unwind(
         code.code.as_ptr() as usize,
@@ -935,8 +1029,8 @@ unsafe fn walk_boundary_frames(
     _count_gc_walks: bool,
     visit: &mut NativeFrameVisitor<'_>,
 ) -> usize {
-    if boundary.owner.is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
-        note_bail(if boundary.owner.is_null() {
+    if boundary.owner().is_null() || boundary.segment.is_null() || boundary.stack.is_null() {
+        note_bail(if boundary.owner().is_null() {
             Bail::NullOwner
         } else if boundary.segment.is_null() {
             Bail::NullSegment
@@ -963,11 +1057,11 @@ unsafe fn walk_boundary_frames_to(
     visit: &mut NativeFrameVisitor<'_>,
 ) -> usize {
     let root_owner = unsafe { &*boundary.root_owner };
-    let mut code = unsafe { &*boundary.owner };
+    let mut code = unsafe { &*boundary.owner() };
     // Hold the selected owner while visiting its maps, independently of any
     // later lookup. The directory itself retains all in-flight revisions.
     let mut _retained_owner = None;
-    let mut context = if boundary.owner == boundary.root_owner {
+    let mut context = if boundary.owner() == boundary.root_owner {
         boundary.context
     } else {
         std::ptr::null_mut()
@@ -992,7 +1086,7 @@ unsafe fn walk_boundary_frames_to(
                 context = boundary.context;
                 continue;
             }
-            if let Some(owner) = boundary.directory.code_for_pc(cursor.pc) {
+            if let Some(owner) = boundary.directory().and_then(|d| d.code_for_pc(cursor.pc)) {
                 if cursor
                     .pc
                     .checked_sub(owner.code.as_ptr() as usize)
@@ -1567,7 +1661,7 @@ mod tests {
             "publish before the helper can collect"
         );
         let published = unsafe { &*publication };
-        let code = unsafe { &*published.owner };
+        let code = unsafe { &*published.owner() };
         let offset = published.cursor.pc - code.code.as_ptr() as usize;
         let step = code
             ._native_calls
@@ -1625,7 +1719,7 @@ mod tests {
         eprintln!("  dual-home check: values={checked} dual-homed={dual} mismatches={mismatches}");
         assert_eq!(mismatches, 0, "a value's shadow and native home disagree");
         assert!(checked > 0, "the fixture must exercise mapped heap values");
-        let code = unsafe { &*publication.owner };
+        let code = unsafe { &*publication.owner() };
         let offset = publication.cursor.pc - code.code.as_ptr() as usize;
         let Some(NativeCallValues::Frame(map)) = code._native_calls.value_map(offset) else {
             panic!("inner poll needs a frame map");
@@ -1707,6 +1801,8 @@ mod tests {
         let _lock = crate::cli::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+        let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
@@ -2461,7 +2557,7 @@ mod tests {
             published.previous.is_null(),
             "native self-calls publish no Rust frame"
         );
-        let code = unsafe { &*published.owner };
+        let code = unsafe { &*published.owner() };
         let base = code.code.as_ptr() as usize;
         let segment = unsafe { &*published.segment };
         let mut cursor = published.cursor;
@@ -3034,11 +3130,12 @@ mod tests {
         let probe = probe();
         let real = ACTIVE.with(Cell::get);
         let published = unsafe { &*real };
-        let code = unsafe { &*published.owner };
+        let code = unsafe { &*published.owner() };
         let malformed = |owner, pc, bounds, stack| PublishedBoundary {
-            owner,
+            owner: Cell::new(owner),
+            owner_resolved: Cell::new(true),
             root_owner: published.root_owner,
-            directory: std::rc::Rc::clone(&published.directory),
+            directory: published.directory,
             context: published.context,
             cursor: NativeFrameCursor {
                 pc,
@@ -3060,7 +3157,7 @@ mod tests {
                 "PC outside the owner",
                 Bail::PcOutsideOwner,
                 malformed(
-                    published.owner,
+                    published.owner(),
                     past_the_code,
                     published.bounds.clone(),
                     published.stack,
@@ -3069,7 +3166,12 @@ mod tests {
             (
                 "empty stack bounds",
                 Bail::UnwindRefused,
-                malformed(published.owner, published.cursor.pc, 0..0, published.stack),
+                malformed(
+                    published.owner(),
+                    published.cursor.pc,
+                    0..0,
+                    published.stack,
+                ),
             ),
             (
                 "no owner",
@@ -3085,7 +3187,7 @@ mod tests {
                 "no managed stack",
                 Bail::NullStack,
                 malformed(
-                    published.owner,
+                    published.owner(),
                     published.cursor.pc,
                     published.bounds.clone(),
                     std::ptr::null(),
@@ -3132,6 +3234,8 @@ mod tests {
         let _lock = crate::cli::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+        let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
         egcl_rt::rooted!(params = reader::read_from_string("(x)").unwrap().0);
@@ -3189,24 +3293,23 @@ pub(super) unsafe fn prepare_mapped_publication(
 ) -> PreparedMappedPublication {
     use egcl_compiler::t2::native_transfer::GeneratedPublication;
     let owner = unsafe { (*context).owner };
-    let mut boundary = Box::new(PublishedBoundary {
+    // Generated code stores this boundary's PC, which always lies in `owner`.
+    let mut boundary = Box::new(PublishedBoundary::resolved(
         owner,
-        root_owner: owner,
-        directory: super::super::call_table::active_ordinary_directory(),
+        owner,
+        std::rc::Rc::as_ptr(&super::super::call_table::active_ordinary_directory()),
         context,
-        cursor: NativeFrameCursor {
+        NativeFrameCursor {
             pc: 0,
             call_sp: 0,
             registers: [Some(0); 6],
         },
-        bounds: 0..0,
-        segment: std::ptr::null_mut(),
-        stack: egcl_rt::current_stack(),
-        previous: std::ptr::null_mut(),
-        profile_shadow_depth: crate::cli::sprof::shadow_depth(),
-        #[cfg(test)]
-        visited: Cell::new(0),
-    });
+        0..0,
+        std::ptr::null_mut(),
+        egcl_rt::current_stack(),
+        std::ptr::null_mut(),
+        crate::cli::sprof::shadow_depth(),
+    ));
     let binding = GeneratedPublication {
         active: ACTIVE.with(Cell::as_ptr).cast(),
         boundary: std::ptr::from_mut(&mut *boundary) as usize,

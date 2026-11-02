@@ -25,7 +25,9 @@ pub(super) use ordinary::private_probe_target;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use ordinary::take_root_identities_for_test;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub(super) use ordinary::{active_ordinary_directory, enter_ordinary_segment};
+pub(super) use ordinary::{
+    active_ordinary_directory, active_ordinary_directory_ptr, enter_ordinary_segment,
+};
 
 #[derive(Clone)]
 enum Target {

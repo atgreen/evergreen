@@ -113,6 +113,8 @@ fn ordinary_mapped_osr_preserves_inherited_handler_catch_and_cleanup() {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_mapped_osr_entry_guard_resumes_after_committed_effects() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     exercise_ordinary_osr(false, true, false);
 }
 
@@ -126,6 +128,8 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
+    // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+    let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     if inherited_scopes {
@@ -268,7 +272,8 @@ fn exercise_ordinary_osr(inherited_scopes: bool, fail_entry_guard: bool, replace
             replacement: Some(next),
             replacement_function: replace_definition
                 .then(|| std::ptr::from_ref(&*replacement_function)),
-            first_owner: Rc::as_ptr(first_mapped) as usize,
+            // Runtime entries run the baseline's OSR-capable mapped code.
+            first_owner: first_mapped.osr_target() as usize,
             next_owner,
             ..Observation::default()
         }
@@ -572,6 +577,8 @@ impl Drop for ChildOsrObserveScope {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_mapped_child_osr_retains_parent_and_current_child_activation() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());

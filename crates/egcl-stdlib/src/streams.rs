@@ -35,8 +35,13 @@ pub fn read_character_literal(stream: EgclVal, suppress: bool) -> Result<EgclVal
     if first == EOF {
         return Err(EgclError::StreamError("unexpected end after #\\".into()));
     }
+    // Only an alphabetic start introduces a name; any other character is the
+    // literal itself -- returned as read, so a surrogate keeps its code.
+    if !first.as_char().is_ascii_alphabetic() {
+        return Ok(if suppress { NIL } else { first });
+    }
     let mut token = vec![first.as_char()];
-    if token[0].is_ascii_alphabetic() {
+    {
         loop {
             let next = stream_read_char(*stream)?;
             if next == EOF {
@@ -410,14 +415,16 @@ impl StreamMutableState {
 
 enum StreamInner {
     StringInput {
-        chars: Vec<char>,
+        /// Character codes, so a surrogate character survives (bliss-5fn6m).
+        chars: Vec<u32>,
         position: usize,
         end: usize,
         line: u64,
         col: u64,
-        unread: Option<char>,
+        unread: Option<u32>,
     },
     StringOutput {
+        /// WTF-8 (see `egcl_rt::text`): UTF-8 that also carries surrogates.
         buffer: Vec<u8>,
         line: u64,
         col: u64,
@@ -469,7 +476,7 @@ enum StreamInner {
     /// with UNREAD-CHAR. It was echoed when first read, so the next read takes
     /// it from here and does not echo it again (CLHS MAKE-ECHO-STREAM; ansi
     /// UNREAD-CHAR.3).
-    Echo { unread: Option<char> },
+    Echo { unread: Option<u32> },
     /// Components: `[symbol]`.
     Synonym,
     /// The process standard input, connected to the real terminal / pipe.
@@ -1317,9 +1324,34 @@ fn file_flush_write_buf(file: &mut impl Write, write_buf: &mut Vec<u8>) -> Resul
 /// fixed-width layout). Owned because the on-heap elements are the type's
 /// fixed-width chars, not UTF-8 bytes.
 fn extract_string_str(val: EgclVal) -> Result<String, EgclError> {
+    let codes = extract_string_codes(val)?;
+    Ok(codes.into_iter().map(egcl_rt::text::char_lossy).collect())
+}
+
+/// The object pointer of a simple string, else a TYPE-ERROR.
+fn simple_string_ptr(val: EgclVal) -> Result<*const u8, EgclError> {
+    let not_a_string = || EgclError::TypeError {
+        datum: val,
+        expected: "string".into(),
+    };
+    if !val.is_heap_object() {
+        return Err(not_a_string());
+    }
+    unsafe {
+        let ptr = val.as_ptr() as *const u8;
+        let tid = (*(ptr as *const ObjectHeader)).type_id();
+        if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
+            return Err(not_a_string());
+        }
+        Ok(ptr)
+    }
+}
+
+/// Exact codes, including an empty NIL-element string.
+fn extract_string_codes(val: EgclVal) -> Result<Vec<u32>, EgclError> {
     if crate::sequences::is_nil_sequence(val) {
         return if crate::sequences::length(val)? == 0 {
-            Ok(String::new())
+            Ok(Vec::new())
         } else {
             Err(EgclError::TypeError {
                 datum: val,
@@ -1327,23 +1359,8 @@ fn extract_string_str(val: EgclVal) -> Result<String, EgclError> {
             })
         };
     }
-    if !val.is_heap_object() {
-        return Err(EgclError::TypeError {
-            datum: val,
-            expected: "string".into(),
-        });
-    }
-    unsafe {
-        let ptr = val.as_ptr();
-        let tid = (*(ptr as *const ObjectHeader)).type_id();
-        if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
-            return Err(EgclError::TypeError {
-                datum: val,
-                expected: "string".into(),
-            });
-        }
-        Ok(egcl_rt::object::read_simple_string(ptr))
-    }
+    let ptr = simple_string_ptr(val)?;
+    Ok(unsafe { egcl_rt::object::read_simple_string_codes(ptr) })
 }
 
 // ── GrayStream implementation on StreamMutableState ────────────────
@@ -1363,20 +1380,20 @@ impl GrayStream for StreamMutableState {
                 unread,
             } => {
                 if let Some(c) = unread.take() {
-                    return Ok(EgclVal::from_char(c));
+                    return Ok(EgclVal::from_char_code(c));
                 }
                 if *position >= *end {
                     return Ok(EOF);
                 }
                 let c = chars[*position];
                 *position += 1;
-                if c == '\n' {
+                if c == u32::from(b'\n') {
                     *line += 1;
                     *col = 0;
                 } else {
                     *col += 1;
                 }
-                Ok(EgclVal::from_char(c))
+                Ok(EgclVal::from_char_code(c))
             }
             StreamInner::FileInput {
                 file,
@@ -1432,7 +1449,7 @@ impl GrayStream for StreamMutableState {
             }
             StreamInner::Echo { unread } => {
                 if let Some(c) = unread.take() {
-                    return Ok(EgclVal::from_char(c));
+                    return Ok(EgclVal::from_char_code(c));
                 }
                 let inp = comps[0];
                 let result = crate::streams::stream_read_char(inp)?;
@@ -1479,6 +1496,9 @@ impl GrayStream for StreamMutableState {
 
     fn stream_unread_char(&mut self, ch: EgclVal) -> Result<(), EgclError> {
         self.check_input()?;
+        let code = ch.char_code();
+        // File and terminal input decodes UTF-8, which never yields a
+        // surrogate, so their unread slot is a Rust char.
         let c = ch.as_char();
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
@@ -1486,7 +1506,7 @@ impl GrayStream for StreamMutableState {
             StreamInner::StringInput {
                 unread, line, col, ..
             } => {
-                *unread = Some(c);
+                *unread = Some(code);
                 if c == '\n' {
                     // Can't perfectly restore col after newline unread, but decrement line
                     if *line > 0 {
@@ -1520,7 +1540,7 @@ impl GrayStream for StreamMutableState {
             }
             StreamInner::TwoWay => crate::streams::stream_unread_char(comps[0], ch),
             StreamInner::Echo { unread } => {
-                *unread = Some(c);
+                *unread = Some(code);
                 Ok(())
             }
             StreamInner::Concatenated { cursor } => {
@@ -1619,7 +1639,7 @@ impl GrayStream for StreamMutableState {
                 if ch == EOF {
                     Ok(EOF)
                 } else {
-                    Ok(EgclVal::from_fixnum(ch.as_char() as i64))
+                    Ok(EgclVal::from_fixnum(i64::from(ch.char_code())))
                 }
             }
         }
@@ -1627,6 +1647,8 @@ impl GrayStream for StreamMutableState {
 
     fn stream_write_char(&mut self, ch: EgclVal) -> Result<(), EgclError> {
         self.check_output()?;
+        // Every external encoding sees the Rust char, a surrogate becoming
+        // U+FFFD; only a string output stream keeps the exact code.
         let c = ch.as_char();
         let mut comps = self.components().to_vec();
         egcl_rt::rooted_ref!(_components_root = &mut comps);
@@ -1643,9 +1665,7 @@ impl GrayStream for StreamMutableState {
                         expected: "NIL".into(),
                     });
                 }
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                buffer.extend_from_slice(encoded.as_bytes());
+                egcl_rt::text::push_wtf8(buffer, ch.char_code());
                 if c == '\n' {
                     *line += 1;
                     *col = 0;
@@ -1867,6 +1887,43 @@ impl GrayStream for StreamMutableState {
         let mut string = string;
         egcl_rt::rooted_ref!(_string_root = &mut string);
         self.check_output()?;
+        // Preserve empty NIL-element strings and reject impossible contents.
+        if crate::sequences::is_nil_sequence(string) {
+            extract_string_codes(string)?;
+            return Ok(());
+        }
+        // String streams preserve exact codes; external streams remain lossy.
+        if let StreamInner::StringOutput {
+            buffer,
+            line,
+            col,
+            element,
+        } = &mut self.inner
+        {
+            let ptr = simple_string_ptr(string)?;
+            let len = unsafe { egcl_rt::object::simple_string_char_count(ptr) };
+            let actual_end = end.unwrap_or(len).min(len);
+            if *element == StringOutputElement::Nil && start < actual_end {
+                let code = unsafe { egcl_rt::object::simple_string_code_at(ptr, start) }.unwrap();
+                return Err(EgclError::TypeError {
+                    datum: EgclVal::from_char_code(code),
+                    expected: "NIL".into(),
+                });
+            }
+            for code in unsafe { egcl_rt::object::simple_string_codes(ptr) }
+                .take(actual_end)
+                .skip(start)
+            {
+                egcl_rt::text::push_wtf8(buffer, code);
+                if code == u32::from(b'\n') {
+                    *line += 1;
+                    *col = 0;
+                } else {
+                    *col += 1;
+                }
+            }
+            return Ok(());
+        }
         // Extract string as &str so we can index by character position.
         let s = extract_string_str(string)?;
         let char_count = s.chars().count();
@@ -2214,7 +2271,7 @@ impl GrayStream for StreamMutableState {
         // character actually read is echoed (ansi PEEK-CHAR.17).
         if let StreamInner::Echo { unread } = &self.inner {
             if let Some(c) = *unread {
-                return Ok(EgclVal::from_char(c));
+                return Ok(EgclVal::from_char_code(c));
             }
             let input = self.components()[0];
             return crate::streams::stream_peek_char(input);
@@ -2262,22 +2319,20 @@ impl GrayStream for StreamMutableState {
                 );
             }
         }
-        let mut chars = Vec::new();
+        let mut codes = Vec::new();
         loop {
             let ch = self.stream_read_char()?;
             if ch == EOF {
-                if chars.is_empty() {
+                if codes.is_empty() {
                     return Ok((EOF, true));
                 }
-                let s: String = chars.into_iter().collect();
-                return Ok((make_lisp_string_fresh(&s), true));
+                return Ok((make_lisp_string_from_codes(&codes, false), true));
             }
-            let c = ch.as_char();
-            if c == '\n' {
-                let s: String = chars.into_iter().collect();
-                return Ok((make_lisp_string_fresh(&s), false));
+            let code = ch.char_code();
+            if code == u32::from(b'\n') {
+                return Ok((make_lisp_string_from_codes(&codes, false), false));
             }
-            chars.push(c);
+            codes.push(code);
         }
     }
 
@@ -2499,6 +2554,35 @@ pub fn make_lisp_string_fresh_like(like: EgclVal, s: &str) -> EgclVal {
     } else {
         make_lisp_string_fresh(s)
     }
+}
+
+/// A fresh string holding exactly the character `codes`, which may include
+/// surrogates (bliss-5fn6m): an 8-bit base string when `base` is set and every
+/// code is below 256, else a 32-bit CHARACTER string. Same GC contract as
+/// [`make_lisp_string_fresh`].
+pub fn make_lisp_string_from_codes(codes: &[u32], base: bool) -> EgclVal {
+    if base && codes.iter().all(|&code| code < 256) {
+        let bytes: Vec<u8> = codes.iter().map(|&code| code as u8).collect();
+        egcl_rt::gc::alloc_base_string_bytes(&bytes)
+    } else {
+        egcl_rt::gc::alloc_character_string_codes(codes)
+    }
+}
+
+/// [`make_lisp_string_fresh_like`] for exact character codes.
+pub fn make_lisp_string_from_codes_like(like: EgclVal, codes: &[u32]) -> EgclVal {
+    let base = !crate::pathnames::is_registered_string(like)
+        && like.is_heap_object()
+        && crate::sequences::string_storage_is_base(like);
+    make_lisp_string_from_codes(codes, base)
+}
+
+/// The codes of a sequence of character values; a non-character is `None`.
+pub fn character_codes(elements: &[EgclVal]) -> Option<Vec<u32>> {
+    elements
+        .iter()
+        .map(|e| e.is_character().then(|| e.char_code()))
+        .collect()
 }
 
 // ── Core-image serialization of interned strings (bliss-x0f2 off-heap M3) ──
@@ -3339,8 +3423,7 @@ pub fn make_string_input_stream(
     start: usize,
     end: Option<usize>,
 ) -> Result<EgclVal, EgclError> {
-    let s = extract_string_str(string)?;
-    let chars: Vec<char> = s.chars().collect();
+    let chars = extract_string_codes(string)?;
     let len = chars.len();
     if start > len {
         return Err(EgclError::StreamError("start beyond string length".into()));
@@ -3415,8 +3498,7 @@ pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
             line,
             element,
         } => {
-            let s = std::str::from_utf8(buffer)
-                .map_err(|_| EgclError::StreamError("invalid UTF-8 in output buffer".into()))?;
+            let codes: Vec<u32> = egcl_rt::text::wtf8_codes(buffer).collect();
             // A fresh heap string: CLHS requires a new string, and an interned
             // one lived off-heap forever, leaking every distinct result
             // (bliss-4due). It keeps the stream's element type: a BASE-CHAR
@@ -3424,12 +3506,8 @@ pub fn get_output_stream_string(stream: EgclVal) -> Result<EgclVal, EgclError> {
             // as long as everything written to it really is a base char.
             let result = if *element == StringOutputElement::Nil {
                 egcl_rt::nil_array::make(0)?
-            } else if *element == StringOutputElement::BaseChar
-                && egcl_rt::object::is_all_base_char(s)
-            {
-                make_lisp_base_string_fresh(s)
             } else {
-                make_lisp_string_fresh(s)
+                make_lisp_string_from_codes(&codes, *element == StringOutputElement::BaseChar)
             };
             buffer.clear();
             *col = 0;
@@ -3505,11 +3583,13 @@ pub fn input_text_snapshot(stream: EgclVal) -> Result<Option<Vec<char>>, EgclErr
                 unread,
                 ..
             } => {
+                // The reader works on Rust chars: a surrogate reads as U+FFFD.
                 result = Some(
                     unread
                         .iter()
                         .copied()
                         .chain(chars[*position..*end].iter().copied())
+                        .map(egcl_rt::text::char_lossy)
                         .collect(),
                 );
             }
@@ -4003,7 +4083,7 @@ pub fn stream_peek_char(stream: EgclVal) -> Result<EgclVal, EgclError> {
     let peek = with_stream(*stream, |guard| {
         guard.check_input()?;
         Ok(match &guard.inner {
-            StreamInner::Echo { unread: Some(c) } => (Some(EgclVal::from_char(*c)), None),
+            StreamInner::Echo { unread: Some(c) } => (Some(EgclVal::from_char_code(*c)), None),
             StreamInner::Echo { unread: None } => (None, Some(guard.components()[0])),
             _ => (None, None),
         })

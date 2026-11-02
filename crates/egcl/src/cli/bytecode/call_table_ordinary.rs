@@ -551,6 +551,19 @@ pub(in crate::cli::bytecode) fn active_ordinary_directory() -> Rc<OrdinaryCodeDi
     })
 }
 
+/// [`active_ordinary_directory`] without the handle, for a frame anchor. The
+/// execution owns its directory for its whole life, so the address stays
+/// valid for any publication that execution links.
+pub(in crate::cli::bytecode) fn active_ordinary_directory_ptr() -> *const OrdinaryCodeDirectory {
+    DIRECTORY.with(|directory| {
+        debug_assert!(
+            directory.retained.borrow().segments > 0,
+            "native publication needs a segment lease"
+        );
+        Rc::as_ptr(directory)
+    })
+}
+
 /// Owns a lease for the whole segment, including suspension and Rust callbacks.
 /// Drop uses the saved directory, never whichever execution is currently cached.
 pub(in crate::cli::bytecode) struct OrdinarySegmentGuard {
@@ -756,9 +769,11 @@ pub(in crate::cli::bytecode) unsafe fn publish_ordinary_with_heat(
 
 /// The entry-word claim accompanying an ordinary publication, when lean
 /// named callers may enter this code (bliss-gg3i1.7.15.10.1): a lean entry
-/// for one plain global function with a fixed arity, taking no closure
-/// environment and needing no caller-side heat accounting. Everything else
-/// keeps the descriptor admission.
+/// for one plain global function, taking no closure environment and needing
+/// no caller-side heat accounting. Everything else keeps the descriptor
+/// admission. A lean caller passes its actual count unchecked, so an entry
+/// accepting any count (`&optional`, `&rest`, `&key`) qualifies too: it
+/// validates the count itself before binding (bliss-gg3i1.7.15.10.4).
 fn entry_claim(
     descriptor: &OrdinaryEntryDescriptor,
     code: &TransferCode,
@@ -768,7 +783,6 @@ fn entry_claim(
 ) -> Option<egcl_rt::call_table::EntryClaimRequest> {
     if profiled
         || descriptor.environment != linkage::ORDINARY_ENV_NONE
-        || descriptor.arity == linkage::ORDINARY_ARITY_ANY
         || !egcl_rt::function::is_interpreted_function(function)
         || egcl_rt::function::is_closure_instance(function)
         // A template's prototype word is its dispatch stub (stage 3).

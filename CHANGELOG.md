@@ -4,6 +4,10 @@
 
 ### Added
 
+- Extend character and string storage to preserve surrogate character codes,
+  with remaining stream, reader and formatting limitations
+  ([#980](https://github.com/atgreen/evergreen/pull/980)).
+
 - Add an experimental iOS Xcode project generator with bundled Lisp source,
   host-worker UI integration and SDK-selected static-runtime linking. Generated
   projects and Apple execution remain unvalidated
@@ -645,6 +649,17 @@
 
 ### Performance
 
+- Add experimental lazy native-frame publication, broader T1 loop entries
+  and batched polling, native closure string access, and wider generic-call
+  caches ([#980](https://github.com/atgreen/evergreen/pull/980)).
+
+- More functions compile instead of running in the interpreter on every
+  call: functions with a parameter named by a special variable (such as
+  `(&key ((:lossage-fun *lossage-fun*)))`), inline `((lambda (x &aux ...))
+  ...)` applications, and DESTRUCTURING-BIND inside a lambda in compiled
+  top-level code. A special parameter is still bound dynamically and
+  restored on exit. Keyword-default visibility remains experimental.
+  ([#980](https://github.com/atgreen/evergreen/pull/980))
 - On x86-64 Linux, optimized code answers ATOM, LISTP, SYMBOLP, PLUSP,
   MINUSP, BIT, SBIT, GET, three-argument LOGAND/LOGIOR/LOGXOR, and TYPEP of a
   structure type name without the general runtime call: about 11 ns a call
@@ -673,6 +688,17 @@
   functions on the previous representation. The image format is now version
   20; images saved by earlier versions must be saved again.
   ([#973](https://github.com/atgreen/evergreen/pull/973))
+- On x86-64 Linux, more optimized functions use the fast native calling
+  convention instead of a slower entry that goes through the runtime:
+  functions with `&rest` lists, with `&optional` parameters beyond the
+  third, or with `&key` lists of any size (including `&allow-other-keys`);
+  calls passing eight or more arguments; functions that return multiple
+  values with `VALUES`; and callers that bind multiple values with
+  `MULTIPLE-VALUE-BIND`. `FUNCALL` of a compiled function with up to 15
+  arguments also stays native.
+  `EGCL_DISABLE_ORDINARY_VALUES=1` keeps multiple-value functions on the old
+  path for comparison.
+  ([#980](https://github.com/atgreen/evergreen/pull/980))
 - On x86-64 Linux, a compiled call from one optimized function to another
   named, fixed-arity, optimized function is cheaper. The function object now
   carries its own native entry, so the caller loads the name's current

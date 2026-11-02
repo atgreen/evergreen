@@ -66,11 +66,45 @@ fn char_key(v: EgclVal, key: CharKey) -> Result<u32, CharCmpError> {
     if !v.is_character() {
         return Err(CharCmpError::NotACharacter(v));
     }
-    let c = v.as_char();
+    let code = v.char_code();
     Ok(match key {
-        CharKey::Exact => c as u32,
-        CharKey::Folded => char_upcase(c) as u32,
+        CharKey::Exact => code,
+        CharKey::Folded => code_upcase(code),
     })
+}
+
+/// `CODE-CHAR`: the character with `code`, for every code below
+/// `CHAR-CODE-LIMIT` -- surrogates included, as in SBCL (Babel's UTF-8B maps
+/// undecodable octets to `#xDC80`-`#xDCFF`) -- else `None` (bliss-5fn6m).
+#[inline]
+pub fn code_char(code: i64) -> Option<EgclVal> {
+    (0..egcl_rt::text::CHAR_CODE_LIMIT as i64)
+        .contains(&code)
+        .then(|| EgclVal::from_char_code(code as u32))
+}
+
+/// [`char_upcase`] on a character code. A surrogate has no case.
+#[inline]
+pub fn code_upcase(code: u32) -> u32 {
+    char::from_u32(code).map_or(code, |c| char_upcase(c) as u32)
+}
+
+/// [`char_downcase`] on a character code. A surrogate has no case.
+#[inline]
+pub fn code_downcase(code: u32) -> u32 {
+    char::from_u32(code).map_or(code, |c| char_downcase(c) as u32)
+}
+
+/// [`char_equal`] on character codes.
+#[inline]
+pub fn code_equal(a: u32, b: u32) -> bool {
+    a == b || code_upcase(a) == code_upcase(b)
+}
+
+/// True if `v` is a character that Rust text cannot hold (a surrogate).
+#[inline]
+pub fn is_surrogate_char(v: EgclVal) -> bool {
+    v.is_character() && egcl_rt::text::is_surrogate(v.char_code())
 }
 
 #[inline]
@@ -214,11 +248,11 @@ pub fn convert_case(v: EgclVal, up: bool) -> Result<EgclVal, CharCmpError> {
     if !v.is_character() {
         return Err(CharCmpError::NotACharacter(v));
     }
-    let c = v.as_char();
-    Ok(EgclVal::from_char(if up {
-        char_upcase(c)
+    let code = v.char_code();
+    Ok(EgclVal::from_char_code(if up {
+        code_upcase(code)
     } else {
-        char_downcase(c)
+        code_downcase(code)
     }))
 }
 

@@ -386,6 +386,18 @@ mod inline_leaf;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use inline_leaf::{LeafBuiltin, LeafHelpers, install_leaf_helpers};
 
+/// The VALUES helper for an ordinary call to VALUES (bliss-gg3i1.7.15.10.4),
+/// or `None` on targets without one.
+fn ordinary_values_call(data: &crate::t2::ir::InstData) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    return inline_leaf::ordinary_values_helper(data);
+    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+    {
+        let _ = data;
+        None
+    }
+}
+
 /// The CLI's test for a globally special variable (bliss-csc8v). Proclamations
 /// live above this crate; the test must stay true once it is true.
 static SPECIAL_VARIABLE_TEST: std::sync::OnceLock<fn(u32) -> bool> = std::sync::OnceLock::new();
@@ -495,6 +507,15 @@ fn alu_rr(a: &mut Asm, opcode: u8, dst: u8, src: u8) {
 /// Stack an ordinary `&key` entry reserves below its entry RSP for binding.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const KEYWORD_BIND_STACK: usize = 4096;
+
+/// Whether an ordinary entry binds its arguments after building its frame
+/// (bliss-gg3i1.7.15.10.4): a helper-bound `&key`/`&rest` entry or an
+/// `&optional` entry with more than three parameters. One with at most
+/// three binds them in registers before the frame, which is cheaper.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn framed_binding(options: &OrdinaryLispEntryOptions) -> bool {
+    options.binding.is_some() && options.arity > 3
+}
 
 fn mov_rr(a: &mut Asm, dst: u8, src: u8) {
     if dst != src {
@@ -1532,6 +1553,37 @@ pub struct NativePollFastPath {
     pub signal_epoch: u64,
     pub observe_forces_cold: bool,
     pub instrument_skips: bool,
+    /// Baseline (T1) code: its loop-header heat and OSR-entry polls reach the
+    /// runtime, which counts heat and enters ready optimized code. Every other
+    /// poll in the loop body takes the idle guard (bliss-tudsy).
+    pub baseline_heat: Option<BaselineHeat>,
+}
+
+/// Baseline loop heat sampling (bliss-tudsy). Generated code counts
+/// loop-header visits down in a code-owned `u32` at `counter`; when it runs out,
+/// or the idle guard finds pending work, it reloads `batch` and calls the
+/// runtime poll with request bit 2, which records `batch` visits.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub struct BaselineHeat {
+    pub counter: u64,
+    pub batch: u32,
+}
+
+/// Count one visit; branch to `slow` once the batch is spent.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_countdown(a: &mut Asm, heat: BaselineHeat, slow: egcl_rt::asm::Label) {
+    mov_imm64(a, RAX, heat.counter as i64);
+    a.extend_from_slice(&[0x83, 0x28, 0x01]); // sub dword [rax],1
+    a.jcc(Cc::Le, slow);
+}
+
+/// The slow edge of a counted poll: restart the batch it samples.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_reload(a: &mut Asm, heat: BaselineHeat) {
+    mov_imm64(a, RAX, heat.counter as i64);
+    a.extend_from_slice(&[0xc7, 0x00]); // mov dword [rax],batch
+    a.extend_from_slice(&heat.batch.to_le_bytes());
 }
 
 /// One acquire observation of the running execution's pending work. The slot
@@ -1560,6 +1612,7 @@ fn emit_idle_poll_guard(
     fast: NativePollFastPath,
     home: FramedHome,
     idle: egcl_rt::asm::Label,
+    heat: Option<BaselineHeat>,
 ) {
     use std::mem::offset_of;
     let slow = a.label();
@@ -1588,6 +1641,9 @@ fn emit_idle_poll_guard(
         a.jcc(Cc::Ne, slow);
         a.bind(no_observer);
     }
+    if let Some(heat) = heat {
+        emit_heat_countdown(a, heat, slow);
+    }
     if fast.instrument_skips {
         load_mem64_disp(
             a,
@@ -1601,13 +1657,20 @@ fn emit_idle_poll_guard(
     }
     a.jmp(idle);
     a.bind(slow);
+    if let Some(heat) = heat {
+        emit_heat_reload(a, heat);
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct PollFrame {
     fast_path: Option<(NativePollFastPath, FramedHome)>,
-    /// Ordinary final-tier code: skip an idle poll by testing R13's slot.
+    /// Ordinary code: skip an idle poll by testing R13's slot.
     execution_idle: bool,
+    /// Baseline code: heat and OSR-entry polls implement tier transfer.
+    baseline_heat: bool,
+    /// Baseline code's loop heat counter, when its idle polls can skip.
+    heat_counter: Option<BaselineHeat>,
     arguments: Vec<(crate::t2::ir::Value, u32)>,
     native_frame_mode: bool,
     spill_area: NativeValueArea,
@@ -1628,26 +1691,43 @@ fn emit_mapped_poll(
     frame: &PollFrame,
     veneer: u64,
     heat: bool,
+    osr_entry: bool,
 ) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
-    let idle = frame
-        .fast_path
-        .map(|(fast, home)| {
-            let idle = a.label();
-            emit_idle_poll_guard(a, fast, home, idle);
-            idle
-        })
-        .or_else(|| {
-            frame.execution_idle.then(|| {
-                // The ordinary entry holds the current execution in R13 for its
-                // whole extent; ordinary call admission reads this same slot.
+    // Baseline heat and OSR polls implement tier transfer; the remaining
+    // polls only service runtime requests. A baseline heat header skips the
+    // call until its sampled batch runs out; an OSR entry that samples no
+    // heat calls on every visit (bliss-tudsy).
+    let tiering = (heat || osr_entry) && frame.baseline_heat;
+    let counter = frame.heat_counter.filter(|_| tiering && heat);
+    let idle = if tiering && counter.is_none() {
+        None
+    } else {
+        frame
+            .fast_path
+            .map(|(fast, home)| {
                 let idle = a.label();
-                let slow = a.label();
-                emit_execution_poll_guard(a, 13, slow);
-                a.jmp(idle);
-                a.bind(slow);
+                emit_idle_poll_guard(a, fast, home, idle, counter);
                 idle
             })
-        });
+            .or_else(|| {
+                frame.execution_idle.then(|| {
+                    // The ordinary entry holds the current execution in R13 for its
+                    // whole extent; ordinary call admission reads this same slot.
+                    let idle = a.label();
+                    let slow = a.label();
+                    emit_execution_poll_guard(a, 13, slow);
+                    if let Some(heat) = counter {
+                        emit_heat_countdown(a, heat, slow);
+                    }
+                    a.jmp(idle);
+                    a.bind(slow);
+                    if let Some(heat) = counter {
+                        emit_heat_reload(a, heat);
+                    }
+                    idle
+                })
+            })
+    };
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -1703,7 +1783,12 @@ fn emit_mapped_poll(
     } else {
         load_home(a, 7, frame.base, 0);
     }
-    if heat && frame.fast_path.is_none() && !frame.execution_idle {
+    // Only a poll that always calls the runtime samples heat, one visit per
+    // call. A counted poll samples its whole batch (bit 2); pending work that
+    // ends a batch early also counts as one, since heat is an estimate.
+    if heat && counter.is_some() && idle.is_some() {
+        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x05]); // or rdi,5
+    } else if heat && idle.is_none() {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
@@ -6960,7 +7045,7 @@ fn emit_framed_inner(
                     const_tagged.insert(r, ((v.to_bits() as u64) << 32) | 0b100);
                 }
                 (Opcode::ConstChar, AuxData::CharImm(c)) => {
-                    const_tagged.insert(r, egcl_rt::value::EgclVal::from_char(*c).0);
+                    const_tagged.insert(r, egcl_rt::value::EgclVal::from_char_code(*c).0);
                 }
                 (Opcode::ConstSymbol, AuxData::SymbolRef(idx)) => {
                     const_tagged.insert(r, egcl_rt::value::EgclVal::from_symbol_index(*idx).0);
@@ -7835,6 +7920,42 @@ fn emit_framed_inner(
                 .map(move |(index, &value)| (value, base + index as u32))
         })
         .collect();
+    // A binding entry binds after its frame exists (bliss-gg3i1.7.15.10.4):
+    // four words keep the incoming RDI, RSI, RDX and RCX for a decline, and
+    // one word per bound value receives the binding the body is entered
+    // with. Nothing reads these slots once the parameters have moved to
+    // their homes, and no value map names them.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    let binding_scratch = ordinary.filter(framed_binding).map(|options| {
+        let base = next_stack;
+        next_stack += 4 + options.arity as u32;
+        base
+    });
+    // An ordinary frame has no activation slots for multiple-value bindings;
+    // the MV helper writes them to these frame words, from which each moves
+    // to its home (bliss-gg3i1.7.15.10.4). No value map names them.
+    let take_values_scratch = ordinary_call_mode
+        .then(|| {
+            f.block_order()
+                .iter()
+                .flat_map(|&block| f.block(block).insts.iter())
+                .filter_map(|&inst| match f.inst(inst).aux {
+                    AuxData::ValuesLocals { nvars, .. }
+                        if f.inst(inst).opcode == Opcode::TakeValuesToLocals =>
+                    {
+                        Some(u32::from(nvars))
+                    }
+                    _ => None,
+                })
+                .max()
+        })
+        .flatten()
+        .filter(|&words| words != 0)
+        .map(|words| {
+            let base = next_stack;
+            next_stack += words;
+            base
+        });
     let native_spill_slots = next_stack;
     let regalloc_spill_slots = machine.num_spill_slots;
     let allocation_edits = machine.allocation_edits.len();
@@ -8209,7 +8330,34 @@ fn emit_framed_inner(
         }
         let offset = a.here();
         let accepted = a.label();
-        if let Some(OrdinaryArgumentBinding::Keywords(keywords)) = options.binding {
+        // Saved incoming registers, then the bound values, in this frame.
+        let framed_binding_entry = binding_scratch.map(|scratch| (a.label(), scratch));
+        if let Some((binding_entry, _)) = framed_binding_entry {
+            // A framed binding entry binds after the frame below exists. It
+            // checks only what can be rejected with every incoming value
+            // intact: a wide `&optional` entry's count range here, and a
+            // helper-bound entry's whole argument list in its helper.
+            if let Some(OrdinaryArgumentBinding::Optional(optional)) = options.binding {
+                if optional.min_arity >= options.arity {
+                    return Err(EmitError::UnsupportedOp(0xFA));
+                }
+                let rejected = a.label();
+                let in_range = a.label();
+                alu_r_imm(&mut a, 7, 1, optional.min_arity as i32);
+                a.jcc(Cc::L, rejected); // the count is a small nonnegative integer
+                alu_r_imm(&mut a, 7, 1, options.arity as i32);
+                a.jcc(Cc::Le, in_range);
+                a.bind(rejected);
+                mov_imm64(&mut a, 11, options.arity_error_veneer as i64);
+                a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
+                a.bind(in_range);
+            }
+            a.jmp(binding_entry);
+        }
+        if let Some(OrdinaryArgumentBinding::Keywords(keywords)) =
+            options.binding.filter(|_| framed_binding_entry.is_none())
+        {
+            // At most three bound values: bind before the frame, in registers.
             // Every count needs binding, even one equal to `arity`. The bind
             // helper is a noncollecting, nonsignalling C leaf: nothing here
             // is a safepoint, and callee-saved registers (R13 included) keep
@@ -8249,7 +8397,7 @@ fn emit_framed_inner(
             mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
             mov_imm64(&mut a, 11, keywords.decline as i64);
             a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
-        } else {
+        } else if framed_binding_entry.is_none() {
             // Declared parameter types are checked here for every caller except
             // proven self calls, which check at their call site and enter at
             // `ordinary_self_entry`. A failed check reaches the same rooted
@@ -8378,6 +8526,92 @@ fn emit_framed_inner(
             })
             .collect::<Result<Vec<_>, EmitError>>()?;
         parallel_home_move(&mut a, &moves);
+        if let Some((binding_entry, scratch)) = framed_binding_entry {
+            let parameters_moved = a.label();
+            a.jmp(parameters_moved);
+            a.bind(binding_entry);
+            emit_prologue(&mut a);
+            let slot = |index: usize| FramedHome::Stack(scratch + index as u32);
+            let value = |index: usize| slot(4 + index);
+            match options.binding {
+                Some(OrdinaryArgumentBinding::Keywords(keywords)) => {
+                    // The bind helper is a noncollecting, nonsignalling C leaf,
+                    // so nothing between entry and the moves below is a
+                    // safepoint. Callee-saved registers, R13 included, survive
+                    // it; the frame keeps RSP aligned for the call.
+                    for (index, reg) in [7u8, 6, 2, 1].into_iter().enumerate() {
+                        store_home(&mut a, slot(index), reg, 0);
+                    }
+                    let saved = framed_stack_disp(scratch);
+                    let bound = saved + 32;
+                    a.extend_from_slice(&[0x48, 0x8d, 0xb4, 0x24]); // lea rsi,[rsp+saved]
+                    a.extend_from_slice(&saved.to_le_bytes());
+                    a.extend_from_slice(&[0x48, 0x8d, 0x55, 0x10]); // lea rdx,[rbp+16]: overflow
+                    a.extend_from_slice(&[0x4c, 0x8d, 0x84, 0x24]); // lea r8,[rsp+bound]
+                    a.extend_from_slice(&bound.to_le_bytes());
+                    mov_imm64(&mut a, 7, keywords.plan as i64); // rcx is still the count
+                    mov_imm64(&mut a, RAX, keywords.bind as i64);
+                    a.extend_from_slice(&[0xff, 0xd0]); // call rax
+                    let bound_ok = a.label();
+                    a.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax,rax
+                    a.jcc(Cc::Ne, bound_ok);
+                    // Declined: leave the frame with every incoming value as it
+                    // arrived; the veneer completes the call rooted.
+                    for (index, reg) in [7u8, 6, 2, 1].into_iter().enumerate() {
+                        load_home(&mut a, reg, slot(index), 0);
+                    }
+                    emit_epilogue(&mut a);
+                    mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+                    mov_imm64(&mut a, 11, keywords.decline as i64);
+                    a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11
+                    a.bind(bound_ok);
+                }
+                Some(OrdinaryArgumentBinding::Optional(optional)) => {
+                    // The count is already in range. Each omitted trailing
+                    // parameter is the unsupplied marker, as the managed entry
+                    // binds it; only supplied overflow words are read.
+                    for index in 0..options.arity {
+                        let source = if index < incoming.len() {
+                            FramedHome::Reg(incoming[index])
+                        } else {
+                            FramedHome::Stack(
+                                u32::try_from(incoming_stack + index - 3)
+                                    .map_err(|_| EmitError::BadBranch)?,
+                            )
+                        };
+                        if index < optional.min_arity {
+                            load_home(&mut a, 10, source, 0);
+                        } else {
+                            let supplied = a.label();
+                            let store = a.label();
+                            alu_r_imm(&mut a, 7, 1, index as i32);
+                            a.jcc(Cc::G, supplied); // count > index: argument `index` arrived
+                            mov_imm64(&mut a, 10, optional.unsupplied as i64);
+                            a.jmp(store);
+                            a.bind(supplied);
+                            load_home(&mut a, 10, source, 0);
+                            a.bind(store);
+                        }
+                        store_home(&mut a, value(index), 10, 0);
+                    }
+                }
+                None => return Err(EmitError::UnsupportedOp(0xFA)),
+            }
+            let bound_moves = f
+                .block(entry)
+                .params
+                .iter()
+                .enumerate()
+                .map(|(index, parameter)| {
+                    Ok((
+                        *homes.get(parameter).ok_or(EmitError::UnsupportedOp(0xF2))?,
+                        HomeMoveSrc::Home(value(index)),
+                    ))
+                })
+                .collect::<Result<Vec<_>, EmitError>>()?;
+            parallel_home_move(&mut a, &bound_moves);
+            a.bind(parameters_moved);
+        }
         if ordinary_call_mode {
             mov_imm64(&mut a, RAX, 0);
             store_home(&mut a, frame_base_home.unwrap(), RAX, 0);
@@ -8405,7 +8639,22 @@ fn emit_framed_inner(
         .zip(activation_slots)
         .map(|(base, activation_slots)| PollFrame {
             fast_path: poll_fast_path.zip(poll_control_home),
-            execution_idle: ordinary_call.is_some_and(|call| call.self_facts.top_tier),
+            // Every ordinary ingress holds the execution in R13; a baseline's
+            // non-tiering polls skip an idle runtime as final-tier polls do.
+            execution_idle: ordinary_call.is_some_and(|call| {
+                call.self_facts.top_tier || call.self_facts.baseline_heat.is_some()
+            }),
+            baseline_heat: poll_fast_path.is_some_and(|fast| fast.baseline_heat.is_some())
+                || ordinary_call.is_some_and(|call| {
+                    !call.self_facts.top_tier && call.self_facts.baseline_heat.is_some()
+                }),
+            heat_counter: poll_fast_path
+                .and_then(|fast| fast.baseline_heat)
+                .or_else(|| {
+                    ordinary_call
+                        .filter(|call| !call.self_facts.top_tier)
+                        .and_then(|call| call.self_facts.baseline_heat)
+                }),
             arguments: native_arguments.clone(),
             native_frame_mode,
             spill_area,
@@ -8471,6 +8720,7 @@ fn emit_framed_inner(
                 poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                 poll_veneer,
                 heat_headers.contains(&b),
+                f.osr_entries.iter().any(|osr| osr.block == b),
             )?;
             native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
             let origin = match bounded_polls.get(&b) {
@@ -8584,6 +8834,7 @@ fn emit_framed_inner(
                     &homes,
                     poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                     poll_veneer,
+                    false,
                     false,
                 )?;
                 native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
@@ -8780,6 +9031,24 @@ fn emit_framed_inner(
                     slots,
                     d.opcode == Opcode::FloatAdd && raw_add_needs_zero_fixup(f, &d.args),
                 );
+            } else if ordinary_call_mode
+                && d.opcode == Opcode::Call
+                && ordinary_values_call(&d).is_some()
+            {
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                {
+                    let NativeValueArea::NativeStack(base) = outgoing_area else {
+                        return Err(EmitError::UnsupportedOp(0xFD));
+                    };
+                    inline_leaf::emit_ordinary_values(
+                        &mut a,
+                        &d,
+                        &homes,
+                        &const_tagged,
+                        base,
+                        ordinary_values_call(&d).unwrap(),
+                    )?;
+                }
             } else if ordinary_call_mode && d.opcode == Opcode::Call {
                 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                 {
@@ -10163,37 +10432,54 @@ fn emit_framed_inner(
                         let home = *homes.get(&primary).ok_or(EmitError::UnsupportedOp(0xF2))?;
                         load_home(&mut a, 7, home, 0);
                     }
-                    let frame_base = frame_base_home
-                        .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
-                    load_home(&mut a, 6, frame_base, 0);
-                    alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
-                    mov_imm64(&mut a, 2, i64::from(nvars));
-                    mov_imm64(&mut a, 0, c2i_mv_addr as i64);
-                    if transfer_mode {
-                        // The mapped MV helper is a noncollecting, nonsignaling leaf.
-                        // No exceptional-status poll follows its successful return.
-                        a.extend_from_slice(&[0xff, 0xd0]);
+                    if let Some(scratch) = take_values_scratch {
+                        // Ordinary code: the leaf copies the tuple into frame
+                        // words. Nothing here collects, so the moves below
+                        // need no value map.
+                        let at = framed_stack_disp(scratch);
+                        a.extend_from_slice(&[0x48, 0x8d, 0xb4, 0x24]); // lea rsi,[rsp+at]
+                        a.extend_from_slice(&at.to_le_bytes());
+                        mov_imm64(&mut a, 2, i64::from(nvars));
+                        mov_imm64(&mut a, 0, c2i_mv_addr as i64);
+                        a.extend_from_slice(&[0xff, 0xd0]); // call rax
+                        for (offset, &result) in d.results.iter().enumerate() {
+                            load_home(&mut a, RAX, FramedHome::Stack(scratch + offset as u32), 0);
+                            let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                            store_home(&mut a, home, RAX, 0);
+                        }
                     } else {
-                        inst_calls.push(emit_runtime_helper_call(
-                            &mut a,
-                            c2i_recovery_toggle_addr,
-                            transfer_check,
-                        ));
-                    }
+                        let frame_base = frame_base_home
+                            .ok_or(EmitError::UnsupportedOp(op_tag(Opcode::TakeValuesToLocals)))?;
+                        load_home(&mut a, 6, frame_base, 0);
+                        alu_r_imm(&mut a, 0, 6, i32::from(slot_base) * 8); // rsi = first local
+                        mov_imm64(&mut a, 2, i64::from(nvars));
+                        mov_imm64(&mut a, 0, c2i_mv_addr as i64);
+                        if transfer_mode {
+                            // The mapped MV helper is a noncollecting, nonsignaling leaf.
+                            // No exceptional-status poll follows its successful return.
+                            a.extend_from_slice(&[0xff, 0xd0]);
+                        } else {
+                            inst_calls.push(emit_runtime_helper_call(
+                                &mut a,
+                                c2i_recovery_toggle_addr,
+                                transfer_check,
+                            ));
+                        }
 
-                    // The helper writes the activation slots. Materialise each SSA
-                    // result into its stable home one at a time; this also handles
-                    // arbitrarily many bindings without exhausting temp registers.
-                    load_home(&mut a, SCRATCH, frame_base, 0);
-                    for (offset, &result) in d.results.iter().enumerate() {
-                        load_mem64_disp(
-                            &mut a,
-                            RAX,
-                            SCRATCH,
-                            (i32::from(slot_base) + offset as i32) * 8,
-                        );
-                        let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
-                        store_home(&mut a, home, RAX, 0);
+                        // The helper writes the activation slots. Materialise each SSA
+                        // result into its stable home one at a time; this also handles
+                        // arbitrarily many bindings without exhausting temp registers.
+                        load_home(&mut a, SCRATCH, frame_base, 0);
+                        for (offset, &result) in d.results.iter().enumerate() {
+                            load_mem64_disp(
+                                &mut a,
+                                RAX,
+                                SCRATCH,
+                                (i32::from(slot_base) + offset as i32) * 8,
+                            );
+                            let home = *homes.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
+                            store_home(&mut a, home, RAX, 0);
+                        }
                     }
                 }
             } else {
@@ -11492,9 +11778,11 @@ fn emit_framed_inner(
                 leaf_bound
             }
             .max(if ordinary_bound_entry.is_some() {
-                // The keyword entry's 56-byte area, its call's return address and
-                // the bind helper's own Rust frame, which this bounds generously.
-                KEYWORD_BIND_STACK
+                // The bind helper runs below the entry's frame: its call's
+                // return address and its own Rust frame, bounded generously.
+                frame_bytes
+                    .checked_add(KEYWORD_BIND_STACK)
+                    .ok_or(EmitError::BadBranch)?
             } else {
                 0
             }),
@@ -14504,6 +14792,8 @@ mod poll_map_tests {
                 &PollFrame {
                     fast_path: None,
                     execution_idle: false,
+                    baseline_heat: false,
+                    heat_counter: None,
                     arguments: Vec::new(),
                     native_frame_mode: false,
                     spill_area: NativeValueArea::Activation(0),
@@ -14514,6 +14804,7 @@ mod poll_map_tests {
                     native_slots: 3,
                 },
                 0x12345678,
+                false,
                 false,
             )
             .unwrap();
@@ -14710,6 +15001,8 @@ mod poll_map_tests {
                 &PollFrame {
                     fast_path: None,
                     execution_idle: false,
+                    baseline_heat: false,
+                    heat_counter: None,
                     arguments: Vec::new(),
                     native_frame_mode: false,
                     spill_area: if native_storage {
@@ -14724,6 +15017,7 @@ mod poll_map_tests {
                     native_slots: 5,
                 },
                 veneer.as_ptr() as u64,
+                false,
                 false,
             )
             .unwrap();

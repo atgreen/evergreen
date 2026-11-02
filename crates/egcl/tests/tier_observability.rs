@@ -336,19 +336,21 @@ fn t1_to_t2_osr_deopt_preserves_dynamic_state() {
 /// OSRs from T1 to T2 and then deopts back to T0. GC stress/poison forces
 /// moving collections around allocation-heavy setup and deopt completion; if
 /// the transition loses the `root` slot, the final CAR/LENGTH check will crash
-/// or read poison.
+/// or read poison. T1 speculates the fixnum sum too, so the sum overflows only
+/// near the end of a call long enough for T2 to land and be entered first
+/// (bliss-tudsy); an earlier overflow would deopt T1 itself.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn t1_to_t2_osr_deopt_keeps_heap_roots_under_gc_stress() {
     let program = "\
         (defun gc-osr-loop (root n) \
-          (let ((sum 1152921504606845000)) \
+          (let ((sum (- most-positive-fixnum 19999000))) \
             (dotimes (i n root) (setq sum (+ sum 1))))) \
         (let ((root (list (quote anchor) (cons 1 2) \"payload\"))) \
           (gc-osr-loop root 1) (gc-osr-loop root 2) \
           (format t \"~a~%\" (egcl-ext:function-tier (quote gc-osr-loop))) \
           (let ((before (egcl-ext:deopt-count)) \
-                (r (gc-osr-loop root 5000))) \
+                (r (gc-osr-loop root 20000000))) \
             (format t \"~a ~a ~a ~a ~a~%\" \
               (car r) (length r) \
               (egcl-ext:function-tier (quote gc-osr-loop)) \

@@ -299,6 +299,8 @@ fn poll_latency_acknowledges_request_after_later_epoch_activity() {
 #[test]
 #[ignore = "requires actual x86 mapped T2 execution; reports instrumentation-inclusive latency"]
 fn ordinary_t2_generated_poll_request_observation_latency() {
+    // This fixture's VALUES selects the mapped entry it exercises.
+    let _mapped_values = crate::cli::bytecode::native_transfer_entry::MappedValuesForTest::new();
     let _lock = super::super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());

@@ -1973,6 +1973,36 @@ fn escape_string_body(s: &str) -> String {
     out
 }
 
+/// The exact printed codes of `v` when it is a character or string holding a
+/// surrogate, else `None`. The printers build Rust text, which turns a
+/// surrogate into U+FFFD; PRINC and PRIN1 of such an object use these codes
+/// instead, so the character survives to a string stream (bliss-5fn6m). A
+/// surrogate character prints readably by name (`#\UD800`), which the
+/// ordinary printer already spells exactly.
+pub fn surrogate_print_codes(v: EgclVal, escapep: bool) -> Option<Vec<u32>> {
+    if v.is_character() {
+        return (!escapep && egcl_rt::text::is_surrogate(v.char_code()))
+            .then(|| vec![v.char_code()]);
+    }
+    if !crate::sequences::string_has_surrogate(v) {
+        return None;
+    }
+    let codes = crate::sequences::string_codes(v)?;
+    if !escapep {
+        return Some(codes);
+    }
+    let mut out = Vec::with_capacity(codes.len() + 2);
+    out.push(u32::from(b'"'));
+    for code in codes {
+        if code == u32::from(b'"') || code == u32::from(b'\\') {
+            out.push(u32::from(b'\\'));
+        }
+        out.push(code);
+    }
+    out.push(u32::from(b'"'));
+    Some(out)
+}
+
 fn egclval_to_print_string(v: EgclVal, escapep: bool) -> String {
     egclval_to_print_string_with_dispatch(v, escapep, true)
 }
@@ -2212,7 +2242,7 @@ fn egclval_to_print_body(mut v: EgclVal, escapep: bool) -> String {
             // (CLHS 22.1.3.2) — must match cli print_val, which was correct while
             // the stdlib printer emitted `#\` + the literal char.
             let mut s = String::from("#\\");
-            s.push_str(&character_name(c));
+            s.push_str(&character_name(v.char_code()));
             s
         } else {
             format!("{}", c)
@@ -2924,7 +2954,7 @@ fn to_roman(n: i64, old: bool) -> String {
 /// Return EGCL's preferred reader-compatible name for a character, or the
 /// character itself when it has no name.  The implementation-defined names
 /// match SBCL for compatibility with libraries such as cl-str (bliss-rr9q).
-pub fn character_name(c: char) -> String {
+pub fn character_name(code: u32) -> String {
     // CLHS 22.1.3.2: a graphic character prints as itself; a non-graphic one
     // prints by name.
     //
@@ -2935,10 +2965,15 @@ pub fn character_name(c: char) -> String {
     // everything from U+00A0 up. SBCL prints #\NO-BREAK_SPACE and
     // #\IDEOGRAPHIC_SPACE for them (bliss-nbsp-name). A whitespace character
     // with no name in the table still falls through and prints as itself.
+    // A surrogate has no Rust text, so it always prints by its `UD800` name,
+    // as in SBCL (bliss-5fn6m).
+    let Some(c) = char::from_u32(code) else {
+        return egcl_compiler::reader::char_name(code).unwrap_or_default();
+    };
     if !c.is_whitespace() && graphic_char_p(c) {
         return c.to_string();
     }
-    egcl_compiler::reader::char_name(c).unwrap_or_else(|| c.to_string())
+    egcl_compiler::reader::char_name(code).unwrap_or_else(|| c.to_string())
 }
 
 /// GRAPHIC-CHAR-P as the printer sees it: the printing ASCII characters and
@@ -3860,6 +3895,22 @@ pub fn format(
     let mut destination = destination;
     egcl_rt::rooted_ref!(_destination_root = &mut destination);
     let target = format_destination(destination)?;
+    // Preserve lone surrogate objects through the common ~A/~S string path.
+    // Compound layout output still uses Rust text and is lossy for surrogates.
+    if args.len() == 1
+        && (target.to_string || target.to_stream)
+        && matches!(control_string, "~A" | "~a" | "~S" | "~s")
+        && let Some(codes) = surrogate_print_codes(args[0], control_string.ends_with(['S', 's']))
+    {
+        LAST_CONSUMED.with(|c| c.set(1));
+        if target.to_string {
+            return Ok(crate::streams::make_lisp_string_from_codes(&codes, false));
+        }
+        for code in codes {
+            crate::streams::stream_write_char(destination, EgclVal::from_char_code(code))?;
+        }
+        return Ok(NIL);
+    }
     let to_stream = target.to_stream;
     let start_column = if to_stream {
         crate::streams::stream_line_column(destination).unwrap_or(0) as usize
@@ -4481,7 +4532,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                         // A `v` parameter standing in for a padchar (e.g.
                         // `~v,vd` with #\0) is a character; hand back its code
                         // point, which the padchar sites turn back into a char.
-                        Ok(v.as_char() as i64)
+                        Ok(v.char_code() as i64)
                     } else if let Some((negative, _)) = integer_magnitude(v, 10) {
                         // A bignum parameter is a legal integer; clamp it, so a
                         // hugely negative MINCOL pads nothing (ansi format.d.29).
@@ -5261,7 +5312,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                     if c != ' ' && graphic_char_p(c) {
                         output.character(c);
                     } else {
-                        output.text(&character_name(c));
+                        output.text(&character_name(val.char_code()));
                     }
                 } else if at_sign {
                     // ~@C prints the character as the reader would read it.
@@ -5269,7 +5320,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                     if c == ' ' && !print_readably_active() {
                         output.character(' ');
                     } else {
-                        output.text(&character_name(c));
+                        output.text(&character_name(val.char_code()));
                     }
                 } else {
                     output.character(c);

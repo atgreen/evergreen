@@ -150,7 +150,7 @@ pub use sequences::{
     cvec_has_fill_pointer, cvec_is_bit, cvec_is_string, elt, find, is_complex_vector, length, map,
     nreverse, position, reduce, remove, result_type_is_base_string, result_type_is_bit_vector,
     result_type_is_string, reverse, set_aref, set_elt, set_fill_pointer, sort, stable_sort,
-    string_char_at, string_char_count, string_set_char, string_storage_is_base, subseq, substitute,
+    string_char_count, string_code_at, string_set_char, string_storage_is_base, subseq, substitute,
     vector_pop, vector_push, vector_push_extend,
 };
 pub use streams::GrayStream;
@@ -159,7 +159,8 @@ pub use streams::{
     ExternalFormat, StreamDirection, StreamElementType, close, file_length_fn, file_position,
     get_output_stream_string, input_stream_p, interactive_stream_p, is_byte_stream,
     make_broadcast_stream, make_concatenated_stream, make_echo_stream, make_lisp_base_string_fresh,
-    make_lisp_string, make_lisp_string_fresh, make_lisp_string_fresh_like, make_stderr, make_stdin,
+    make_lisp_string, make_lisp_string_fresh, make_lisp_string_fresh_like,
+    make_lisp_string_from_codes, make_lisp_string_from_codes_like, make_stderr, make_stdin,
     make_stdout, make_string_input_stream, make_string_output_stream, make_synonym_stream,
     make_two_way_stream, open, open_stream_p, output_stream_p, set_file_position,
     set_file_position_to_end, socket_accept, socket_close_listener, socket_connect, socket_listen,

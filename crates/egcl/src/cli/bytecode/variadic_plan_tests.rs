@@ -137,7 +137,7 @@ fn the_plan_matches_the_general_binder() {
         &mut env,
     );
     assert_eq!(results, ["(1 5 NIL)", "(1 2 2)"]);
-    assert_eq!(fallbacks, 1);
+    assert_eq!(fallbacks, 0);
     both(
         "(x &optional (y x) &rest r)",
         "x y r",

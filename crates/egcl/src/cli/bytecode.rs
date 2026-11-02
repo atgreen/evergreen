@@ -135,6 +135,8 @@ mod call_table;
 #[cfg(test)]
 #[path = "bytecode/declined_dispatch_tests.rs"]
 mod declined_dispatch_tests;
+#[path = "bytecode/exit_unwind.rs"]
+mod exit_unwind;
 mod leaf_builtins;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
@@ -1500,8 +1502,16 @@ fn lambda_form_application(op: EgclVal, args: EgclVal) -> LowerResult<Option<Egc
     }
     egcl_rt::rooted!(params = list_to_vec(params));
     egcl_rt::rooted!(body = body);
-    let simple = params.len() == args.len()
-        && params
+    // Required parameters, then optionally `&aux` specs: SBCL's
+    // MAKE-MACRO-LAMBDA binds a user's &WHOLE that way, and DEF-IR1-TRANSLATOR
+    // and DEF-TYPE-TRANSLATOR apply that lambda inline (IR1-CONVERT-SETQ,
+    // PARSE-<SATISFIES>; bliss-gg3i1.7.15.7).
+    let aux_at = params
+        .iter()
+        .position(|p| p.is_symbol() && sym_name(*p) == "&AUX")
+        .unwrap_or(params.len());
+    let simple = aux_at == args.len()
+        && params[..aux_at]
             .iter()
             .all(|p| p.is_symbol() && !p.is_nil() && *p != T && !sym_name(*p).starts_with('&'));
     if !simple {
@@ -1509,9 +1519,67 @@ fn lambda_form_application(op: EgclVal, args: EgclVal) -> LowerResult<Option<Egc
     }
     let let_sym = resolve_sym("LET").ok_or(Bail)?;
     egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
-    for i in 0..params.len() {
+    for i in 0..aux_at {
         let binding = form_list(&[params[i], args[i]]);
         bindings.push(binding);
+    }
+    if aux_at < params.len() {
+        // `(let ((p a)*) (let* (aux*) . body))`: the arguments are evaluated
+        // outside every binding, and each &AUX init form sees the parameters
+        // and earlier &AUX variables (CLHS 3.4.1.5). The body's declarations
+        // move into the LET*; a SPECIAL one would then miss the parameter
+        // bindings, so keep the original path for it.
+        // Flattened (var, init) pairs; an init form is a heap object.
+        egcl_rt::rooted!(aux = Vec::<EgclVal>::new());
+        for spec in &params[aux_at + 1..] {
+            let (var, init) = if spec.is_symbol() {
+                (*spec, NIL)
+            } else if spec.is_cons() {
+                let items = list_to_vec(*spec);
+                if items.is_empty() || items.len() > 2 {
+                    return Ok(None);
+                }
+                (items[0], items.get(1).copied().unwrap_or(NIL))
+            } else {
+                return Ok(None);
+            };
+            if !var.is_symbol() || var.is_nil() || var == T || sym_name(var).starts_with('&') {
+                return Ok(None);
+            }
+            aux.extend([var, init]);
+        }
+        egcl_rt::rooted!(forms = list_to_vec(*body));
+        let mut start = 0;
+        while start < forms.len() {
+            let form = forms[start];
+            let declaration =
+                form.is_cons() && cp(form).0.is_symbol() && sym_name(cp(form).0) == "DECLARE";
+            if declaration && declares_special(form) {
+                return Ok(None);
+            }
+            // A docstring is only one when more forms follow it.
+            let docstring = start == 0 && form.is_string() && forms.len() > 1;
+            if !declaration && !docstring {
+                break;
+            }
+            start += 1;
+        }
+        egcl_rt::rooted!(aux_bindings = Vec::<EgclVal>::new());
+        for pair in 0..aux.len() / 2 {
+            let binding = form_list(&[aux[pair * 2], aux[pair * 2 + 1]]);
+            aux_bindings.push(binding);
+        }
+        let let_star = resolve_sym("LET*").ok_or(Bail)?;
+        egcl_rt::rooted!(inner = vec![let_star, form_list(&aux_bindings)]);
+        let inner_forms: Vec<EgclVal> = forms
+            .iter()
+            .enumerate()
+            .filter(|(index, form)| *index >= start || !form.is_string())
+            .map(|(_, form)| *form)
+            .collect();
+        inner.extend(inner_forms);
+        egcl_rt::rooted!(inner = form_list(&inner));
+        *body = arena_cons(*inner, NIL);
     }
     egcl_rt::rooted!(binding_list = form_list(&bindings));
     egcl_rt::rooted!(rest = arena_cons(*binding_list, *body));
@@ -2951,6 +3019,7 @@ fn bail_reason_wanted() -> bool {
     t2_log_target().is_some()
         || egcl_rt::log::enabled("compile", egcl_rt::log::TRACE)
         || super::handoff_census::enabled()
+        || super::tw_census::enabled()
 }
 
 fn reset_last_bail_reason() {
@@ -3343,6 +3412,7 @@ struct Lowerer<'e> {
     // Match BytecodeFunction's shared nested templates; lowering transfers
     // this vector directly into the completed function.
     nested_functions: Vec<Arc<BytecodeFunction>>,
+    exit_unwind_sites: Vec<usize>,
     /// Portable BFASL compilation may lower quasiquote to explicit allocation;
     /// the ordinary opportunistic compiler keeps the tree-walker as its oracle.
     portable: bool,
@@ -3556,6 +3626,7 @@ impl<'e> Lowerer<'e> {
             names: Vec::new(),
             restart_cases: Vec::new(),
             nested_functions: Vec::new(),
+            exit_unwind_sites: Vec::new(),
             portable: false,
             env,
         }
@@ -3753,7 +3824,10 @@ impl<'e> Lowerer<'e> {
         // Root `form` across the allocating lower_expr_inner recursion (moving GC; bliss-wlf).
         egcl_rt::rooted_ref!(_form_root = &mut form);
         let result = self.lower_expr_inner(form);
-        if result.is_err() && bail_trace_on() && last_bail_reason().is_none() {
+        if result.is_err()
+            && (bail_trace_on() || bail_reason_wanted())
+            && last_bail_reason().is_none()
+        {
             let label = if form.is_cons() {
                 let op = cp(form).0;
                 if op.is_symbol() {
@@ -5916,6 +5990,7 @@ impl<'e> Lowerer<'e> {
     fn emit_return_from(&mut self, name: &str) -> LowerResult<()> {
         if let Some((_, id)) = self.block_scope.iter().rev().find(|(n, _)| n == name) {
             let block_id = *id;
+            self.emit_exit_unwind(exit_unwind::ExitTarget::Block(block_id));
             self.emit(Instr::ReturnFrom { block_id });
             return Ok(());
         }
@@ -6143,6 +6218,7 @@ impl<'e> Lowerer<'e> {
                 return Err(Bail);
             }
         };
+        self.emit_exit_unwind(exit_unwind::ExitTarget::Tagbody(tagbody_id));
         self.emit(Instr::Go {
             tagbody_id,
             target_bcp: 0,
@@ -8784,7 +8860,18 @@ impl<'e> Lowerer<'e> {
         // recovered, so its own reason must not displace one recorded earlier.
         let outer_reason = LAST_BAIL_REASON.with(|last| last.borrow_mut().take());
         let (params_form, body) = cp(*lambda_tail);
-        let attempt = self.emit_portable_closure(params_form, body, captured);
+        let mut attempt = self.emit_portable_closure(params_form, body, captured);
+        if attempt.is_err() && !slot_captured {
+            // Some forms lower only in portable mode (DESTRUCTURING-BIND),
+            // and a hot DEFUN that bails retries that way (`compile_defun`).
+            // Give a nested lambda the same retry before handing it to the
+            // tree-walker: SBCL's cold-setup `(lambda (whole env)
+            // (destructuring-bind ...))` macro was the case (bliss-gg3i1.7.15.7).
+            let (params_form, body) = cp(*lambda_tail);
+            let portable = std::mem::replace(&mut self.portable, true);
+            attempt = self.emit_portable_closure(params_form, body, captured);
+            self.portable = portable;
+        }
         let reason = LAST_BAIL_REASON.with(|last| {
             let mut last = last.borrow_mut();
             let reason = last.take();
@@ -9518,6 +9605,10 @@ fn compile_local_function(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    if !bind_special_parameters_in_body(&mut params_form, &mut fbody) {
+        let _ = record_bail(|| "lambda-list:special-parameter-name".to_string());
+        return None;
+    }
     if let Some((params, body)) = aux_entry_prologue(params_form, fbody) {
         params_form = params;
         fbody = body;
@@ -9620,6 +9711,10 @@ fn compile_capturing_local(
     // Root the source subforms across the allocating lowering (moving GC; bliss-wlf).
     egcl_rt::rooted_ref!(_params_root = &mut params_form);
     egcl_rt::rooted_ref!(_fbody_root = &mut fbody);
+    if !bind_special_parameters_in_body(&mut params_form, &mut fbody) {
+        let _ = record_bail(|| "lambda-list:special-parameter-name".to_string());
+        return None;
+    }
     if let Some((params, body)) = aux_entry_prologue(params_form, fbody) {
         params_form = params;
         fbody = body;
@@ -11010,6 +11105,249 @@ pub(super) fn optional_range(body: &BytecodeFunction) -> bool {
     !body.variadic && body.min_args < body.arity
 }
 
+/// Lambda-list parameters whose names are special variables (CLHS 3.1.2.1.1;
+/// bliss-gg3i1.7.15.7). Rename each such parameter to a fresh lexical and bind
+/// the special to it in a LET around the body, so the dynamic binding is an
+/// ordinary special LET binding that every tier saves and restores on all
+/// exits (#961). SBCL's `(defun valid-fun-use (call type &key
+/// ((:lossage-fun *lossage-fun*)) ...) ...)` is the hot case.
+///
+/// `(lambda (a *x* &key ((:p *p*) d)) . body)` becomes
+///
+/// ```lisp
+/// (lambda (a #:sp-0 &key ((:p #:sp-1) d))
+///   (let ((*x* #:sp-0) (*p* #:sp-1)) . body))
+/// ```
+///
+/// The rename moves each dynamic binding after the evaluation of every later
+/// default form. A later variable or FUNCTION lookup can signal to a live
+/// condition handler, or hide a symbol-macro read of the renamed special.
+/// Admit only self-evaluating literals and QUOTE after any renamed binding;
+/// all other later defaults keep the original binder. Returns `Ok(None)` when
+/// no parameter is special, and `Err` when the rewrite would be unsound.
+fn special_parameter_rewrite(
+    params_form: EgclVal,
+    body: EgclVal,
+) -> Result<Option<(EgclVal, EgclVal)>, ()> {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Mode {
+        Req,
+        Opt,
+        Rest,
+        Key,
+        Aux,
+    }
+    // An init form evaluated after a renamed special was (originally) bound
+    // must not be able to observe that binding. Read-only.
+    fn init_safe(form: EgclVal, after_special: bool) -> bool {
+        if !after_special {
+            return true;
+        }
+        if form.is_symbol() {
+            return form.is_nil() || form == T || super::is_keyword_arg(form);
+        }
+        if !form.is_cons() {
+            return true;
+        }
+        let (op, rest) = cp(form);
+        if !op.is_symbol() || !rest.is_cons() || !cp(rest).1.is_nil() {
+            return false;
+        }
+        super::sym_name_rc(op).as_ref() == "QUOTE"
+    }
+    if !lambda_list_names_special(params_form) {
+        return Ok(None);
+    }
+    egcl_rt::rooted!(params = list_to_vec(params_form));
+    egcl_rt::rooted!(body = body);
+    egcl_rt::rooted!(new_params = Vec::<EgclVal>::new());
+    // Flattened (special, fresh) pairs, in binding order. Symbols are
+    // immediates, but keep the vector rooted like its siblings.
+    egcl_rt::rooted!(renamed = Vec::<EgclVal>::new());
+    let mut counter = 0usize;
+    // Rename `var` if it is special; returns the symbol to use in its place.
+    let mut rename = |var: EgclVal, renamed: &mut Vec<EgclVal>| -> EgclVal {
+        if !special_lambda_variable(var) {
+            return var;
+        }
+        let fresh =
+            egcl_rt::symbols::make_uninterned(&format!("%EGCL-SPECIAL-PARAMETER-{counter}"));
+        counter += 1;
+        renamed.extend([var, fresh]);
+        fresh
+    };
+    let mut mode = Mode::Req;
+    for index in 0..params.len() {
+        let item = params[index];
+        if item.is_symbol() && !item.is_nil() {
+            let name = super::sym_name_rc(item);
+            let next = match &*name {
+                "&OPTIONAL" => Some(Mode::Opt),
+                "&REST" | "&BODY" => Some(Mode::Rest),
+                "&KEY" => Some(Mode::Key),
+                "&AUX" => Some(Mode::Aux),
+                "&ALLOW-OTHER-KEYS" => Some(mode),
+                _ if name.starts_with('&') => return Err(()),
+                _ => None,
+            };
+            if let Some(next) = next {
+                mode = next;
+                new_params.push(item);
+                continue;
+            }
+        }
+        match mode {
+            Mode::Req | Mode::Rest => {
+                if !item.is_symbol() || item.is_nil() {
+                    return Err(());
+                }
+                let fresh = rename(item, &mut renamed);
+                new_params.push(fresh);
+            }
+            Mode::Opt | Mode::Aux | Mode::Key => {
+                let spec = if item.is_cons() {
+                    list_to_vec(item)
+                } else {
+                    vec![item]
+                };
+                if spec.is_empty() || spec.len() > 3 || (mode == Mode::Aux && spec.len() > 2) {
+                    return Err(());
+                }
+                egcl_rt::rooted!(spec = spec);
+                // The variable, and for &KEY its explicit keyword.
+                let (keyword, var) = if mode == Mode::Key && spec[0].is_cons() {
+                    let pair = list_to_vec(spec[0]);
+                    if pair.len() != 2 || !pair[1].is_symbol() {
+                        return Err(());
+                    }
+                    (Some(pair[0]), pair[1])
+                } else {
+                    (None, spec[0])
+                };
+                if !var.is_symbol() || var.is_nil() {
+                    return Err(());
+                }
+                if spec.len() > 1 && !init_safe(spec[1], !renamed.is_empty()) {
+                    return Err(());
+                }
+                let fresh = rename(var, &mut renamed);
+                let supplied = if spec.len() == 3 {
+                    if !spec[2].is_symbol() || spec[2].is_nil() {
+                        return Err(());
+                    }
+                    Some(rename(spec[2], &mut renamed))
+                } else {
+                    None
+                };
+                if fresh == var && supplied.is_none_or(|s| s == spec[2]) {
+                    new_params.push(item);
+                    continue;
+                }
+                egcl_rt::rooted!(head = fresh);
+                if mode == Mode::Key {
+                    // A plain `&key *x*` is keyed by :*X*; keep that keyword.
+                    let keyword = match keyword {
+                        Some(keyword) => keyword,
+                        None => egcl_compiler::reader::intern_keyword_symbol(
+                            &super::sym_bare_name_rc(var),
+                        ),
+                    };
+                    *head = form_list(&[keyword, fresh]);
+                }
+                egcl_rt::rooted!(rebuilt = vec![*head]);
+                if spec.len() > 1 {
+                    rebuilt.push(spec[1]);
+                }
+                if let Some(supplied) = supplied {
+                    rebuilt.push(supplied);
+                }
+                let rebuilt = if rebuilt.len() == 1 && mode != Mode::Key {
+                    rebuilt[0]
+                } else {
+                    form_list(&rebuilt)
+                };
+                new_params.push(rebuilt);
+            }
+        }
+    }
+    if renamed.is_empty() {
+        return Ok(None);
+    }
+    // Split off the docstring and leading declarations; the declarations move
+    // into the LET, where they apply to the special bindings they name.
+    egcl_rt::rooted!(forms = list_to_vec(*body));
+    let mut start = 0;
+    let mut seen_doc = false;
+    while start < forms.len() {
+        let form = forms[start];
+        let declaration = form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "DECLARE";
+        if form.is_string() && !seen_doc && start + 1 < forms.len() {
+            seen_doc = true;
+        } else if !declaration {
+            break;
+        }
+        start += 1;
+    }
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    for pair in 0..renamed.len() / 2 {
+        let binding = form_list(&[renamed[pair * 2], renamed[pair * 2 + 1]]);
+        bindings.push(binding);
+    }
+    let let_op = resolve_sym("LET").ok_or(())?;
+    egcl_rt::rooted!(let_form = vec![let_op, form_list(&bindings)]);
+    let_form.extend(
+        forms[..start]
+            .iter()
+            .copied()
+            .filter(|form| !form.is_string()),
+    );
+    let_form.extend(forms[start..].iter().copied());
+    egcl_rt::rooted!(wrapped = form_list(&let_form));
+    egcl_rt::rooted!(new_body = arena_cons(*wrapped, NIL));
+    let new_params = form_list(&new_params);
+    Ok(Some((new_params, *new_body)))
+}
+
+/// Whether `v` names a special variable a lambda list would bind dynamically.
+fn special_lambda_variable(v: EgclVal) -> bool {
+    v.is_symbol() && !v.is_nil() && v != T && is_special_name(&var_name(v))
+}
+
+/// Whether any variable an ordinary lambda list binds is a special variable.
+/// Read-only: allocates nothing.
+fn lambda_list_names_special(params_form: EgclVal) -> bool {
+    let mut cursor = params_form;
+    while cursor.is_cons() {
+        let (item, rest) = cp(cursor);
+        cursor = rest;
+        if item.is_symbol() {
+            if !super::sym_name_rc(item).starts_with('&') && special_lambda_variable(item) {
+                return true;
+            }
+        } else if item.is_cons() {
+            let (head, tail) = cp(item);
+            let var = if head.is_cons() {
+                let (_, after) = cp(head);
+                if after.is_cons() { cp(after).0 } else { NIL }
+            } else {
+                head
+            };
+            if special_lambda_variable(var) {
+                return true;
+            }
+            if tail.is_cons() {
+                let (_, after) = cp(tail);
+                if after.is_cons() && special_lambda_variable(cp(after).0) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Lower ordinary &AUX initialization in the same lexical function namespace
 /// as the compiled body. The general lambda-list binder evaluates source forms
 /// and does not carry the lowerer's local-function bindings. LET* also preserves
@@ -11219,6 +11557,458 @@ fn optional_entry_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclV
     egcl_rt::rooted!(new_body = new_body);
     let params_list = form_list(&new_params);
     Some((params_list, *new_body, required_count))
+}
+
+/// Whether `form` evaluates to itself or a quoted datum, with no effect and no
+/// dependence on any binding: NIL, T, a keyword, a non-symbol atom, or QUOTE.
+fn is_binding_independent_constant(form: EgclVal) -> bool {
+    if form.is_nil() || form == T {
+        return true;
+    }
+    if form.is_symbol() {
+        return super::sym_name_rc(form).starts_with("KEYWORD:");
+    }
+    if form.is_cons() {
+        let (head, _) = cp(form);
+        return head.is_symbol() && super::sym_name_rc(head).as_ref() == "QUOTE";
+    }
+    true
+}
+
+/// Bind special-named parameters through a LET instead of the lambda list
+/// (bliss-3k0xm). A parameter whose name is special -- earmuffed, proclaimed,
+/// or declared SPECIAL at the head of the body -- must be a dynamic binding,
+/// which the compiled lambda-list binder cannot make. Rename each such
+/// parameter to a fresh lexical one and bind the special name to it around
+/// the body:
+///
+/// ```lisp
+/// (lambda (x &key ((:k *k*) nil)) (declare (fixnum x)) . body)
+/// =>
+/// (lambda (x &key ((:k #:p) nil)) (declare (fixnum x))
+///   (let ((*k* #:p)) (declare (special *k*)) . body))
+/// ```
+///
+/// The dynamic binding then starts after the whole lambda list is bound
+/// instead of at its own position, which only an init form (or supplied-p
+/// test) LATER in the lambda list could observe. So every init form after the
+/// first renamed parameter must be a constant; otherwise return `None` and the
+/// caller keeps declining to the tree-walker. A parameter's own init form is
+/// evaluated before its binding either way. Also `None` when no parameter is
+/// special or the lambda list has a shape this does not parse.
+///
+/// Docstring and declarations stay at the head of the lambda body, where they
+/// still apply to the parameters they name; each renamed variable is declared
+/// SPECIAL again inside the LET, which a bound declaration needs.
+fn rename_special_parameters(
+    params_form: EgclVal,
+    mut body: EgclVal,
+) -> Option<(EgclVal, EgclVal)> {
+    egcl_rt::rooted_ref!(_body_root = &mut body);
+    #[derive(PartialEq, Clone, Copy)]
+    enum Mode {
+        Req,
+        Opt,
+        Rest,
+        Key,
+        Aux,
+    }
+    let declared = body_declared_special(body);
+    let special = |symbol: EgclVal| {
+        symbol.is_symbol()
+            && !symbol.is_nil()
+            && symbol != T
+            && !egcl_rt::symbols::is_uninterned(symbol.as_symbol_index())
+            && {
+                let name = sym_name(symbol);
+                is_special_name(&name) || declared.contains(&name)
+            }
+    };
+    egcl_rt::rooted!(params = list_to_vec(params_form));
+    // A dotted lambda list is not one this parses.
+    if !list_tail(params_form).is_nil() {
+        return None;
+    }
+    let any_special = params.iter().any(|&p| {
+        if p.is_cons() {
+            list_to_vec(p).into_iter().any(|item| {
+                special(item) || (item.is_cons() && list_to_vec(item).into_iter().any(special))
+            })
+        } else {
+            special(p)
+        }
+    });
+    if !any_special {
+        return None;
+    }
+    let quote_free = |form: EgclVal| is_binding_independent_constant(form);
+    egcl_rt::rooted!(new_params = Vec::<EgclVal>::new());
+    // (special-name fresh-name) pairs, in lambda-list order.
+    egcl_rt::rooted!(renamed = Vec::<EgclVal>::new());
+    let mut mode = Mode::Req;
+    for index in 0..params.len() {
+        let element = params[index];
+        let any_renamed = !renamed.is_empty();
+        if element.is_symbol() {
+            let name = super::sym_name_rc(element);
+            let keyword = match name.as_ref() {
+                "&OPTIONAL" => Some(Mode::Opt),
+                "&REST" | "&BODY" => Some(Mode::Rest),
+                "&KEY" => Some(Mode::Key),
+                "&AUX" => Some(Mode::Aux),
+                "&ALLOW-OTHER-KEYS" => Some(mode),
+                _ if name.starts_with('&') => return None,
+                _ => None,
+            };
+            drop(name);
+            if let Some(next) = keyword {
+                mode = next;
+                new_params.push(element);
+                continue;
+            }
+            if !special(element) {
+                new_params.push(element);
+                continue;
+            }
+            egcl_rt::rooted!(
+                fresh =
+                    egcl_rt::symbols::make_uninterned(&format!("%EGCL-SPECIAL-PARAMETER-{index}"))
+            );
+            // Read the element afresh: the symbol is immediate, never moved.
+            let replacement = if mode == Mode::Key {
+                // `&key *k*` keeps its keyword, :*K*.
+                let bare = super::symbol_bare_name(&sym_name(element));
+                let keyword = EgclVal::from_symbol_index(egcl_rt::symbols::intern(&format!(
+                    "KEYWORD:{bare}"
+                )));
+                egcl_rt::rooted!(pair = form_list(&[keyword, *fresh]));
+                form_list(&[*pair])
+            } else {
+                *fresh
+            };
+            new_params.push(replacement);
+            renamed.extend([element, *fresh]);
+            continue;
+        }
+        if !element.is_cons() || matches!(mode, Mode::Req | Mode::Rest) {
+            return None; // destructuring
+        }
+        egcl_rt::rooted!(items = list_to_vec(element));
+        if items.is_empty() || items.len() > 3 || !list_tail(element).is_nil() {
+            return None;
+        }
+        // The init form runs before this spec binds, after earlier ones.
+        if let Some(&init) = items.get(1)
+            && any_renamed
+            && !quote_free(init)
+        {
+            return None;
+        }
+        if mode == Mode::Aux && items.len() > 2 {
+            return None;
+        }
+        // The variable is `var`, or `(keyword var)` for &key.
+        let (variable, keyed) = if items[0].is_symbol() {
+            (items[0], None)
+        } else if mode == Mode::Key && items[0].is_cons() {
+            let pair = list_to_vec(items[0]);
+            if pair.len() != 2 || !pair[1].is_symbol() || !list_tail(items[0]).is_nil() {
+                return None;
+            }
+            (pair[1], Some(pair[0]))
+        } else {
+            return None;
+        };
+        let rename_variable = special(variable);
+        let rename_supplied = items.get(2).is_some_and(|&p| special(p));
+        if !rename_variable && !rename_supplied {
+            new_params.push(element);
+            continue;
+        }
+        egcl_rt::rooted!(spec = items.to_vec());
+        if rename_variable {
+            egcl_rt::rooted!(
+                fresh =
+                    egcl_rt::symbols::make_uninterned(&format!("%EGCL-SPECIAL-PARAMETER-{index}"))
+            );
+            renamed.extend([variable, *fresh]);
+            spec[0] = match keyed {
+                Some(keyword) => form_list(&[keyword, *fresh]),
+                None if mode == Mode::Key => {
+                    let bare = super::symbol_bare_name(&sym_name(variable));
+                    let keyword = EgclVal::from_symbol_index(egcl_rt::symbols::intern(&format!(
+                        "KEYWORD:{bare}"
+                    )));
+                    form_list(&[keyword, *fresh])
+                }
+                None => *fresh,
+            };
+        }
+        if rename_supplied {
+            let supplied = spec[2];
+            egcl_rt::rooted!(
+                fresh =
+                    egcl_rt::symbols::make_uninterned(&format!("%EGCL-SPECIAL-SUPPLIED-P-{index}"))
+            );
+            renamed.extend([supplied, *fresh]);
+            spec[2] = *fresh;
+        }
+        let rebuilt = form_list(&spec);
+        new_params.push(rebuilt);
+    }
+    // Split off the docstring and leading declarations.
+    egcl_rt::rooted!(forms = list_to_vec(body));
+    let mut start = 0;
+    let mut seen_doc = false;
+    while start < forms.len() {
+        let form = forms[start];
+        if form.is_string() && !seen_doc && start + 1 < forms.len() {
+            seen_doc = true;
+        } else if !(form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "DECLARE")
+        {
+            break;
+        }
+        start += 1;
+    }
+    let let_op = resolve_sym("LET")?;
+    let declare = resolve_sym("DECLARE")?;
+    let special_op = resolve_sym("SPECIAL")?;
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    egcl_rt::rooted!(special_spec = vec![special_op]);
+    for pair in 0..renamed.len() / 2 {
+        let binding = form_list(&[renamed[pair * 2], renamed[pair * 2 + 1]]);
+        bindings.push(binding);
+        special_spec.push(renamed[pair * 2]);
+    }
+    egcl_rt::rooted!(special_decl = form_list(&special_spec));
+    egcl_rt::rooted!(special_decl = form_list(&[declare, *special_decl]));
+    egcl_rt::rooted!(let_form = vec![let_op, form_list(&bindings), *special_decl]);
+    let_form.extend(forms[start..].iter().copied());
+    egcl_rt::rooted!(wrapped = form_list(&let_form));
+    egcl_rt::rooted!(new_body = forms[..start].to_vec());
+    new_body.push(*wrapped);
+    egcl_rt::rooted!(body_list = form_list(&new_body));
+    let params_list = form_list(&new_params);
+    Some((params_list, *body_list))
+}
+
+/// Evaluate `&key` defaults in the body (bliss-3k0xm). A default form the
+/// cached variadic binder cannot hold -- anything but an immediate constant --
+/// sent every call that omitted that key through the general binder, which
+/// re-parses the lambda list and tree-walks the default: cl-ppcre's
+/// `(scan scanner string)` paid that for `(end (length target-string))`.
+///
+/// `(lambda (s &key (end (length s) end-p)) (declare (fixnum end)) . body)`
+/// becomes
+///
+/// ```lisp
+/// (lambda (s &key (end 'egcl::%unsupplied-argument end-p))
+///   (let* ((end (if (eq end 'egcl::%unsupplied-argument) (length s) end)))
+///     (declare (fixnum end))
+///     . body))
+/// ```
+///
+/// LET* evaluates the defaults in lambda-list order, each after the
+/// parameters to its left are bound, as the binder did. Unlike the binder,
+/// the parameters to its RIGHT are bound too, so a default that mentions any
+/// later parameter's name, or a lambda list with `&aux`, is left alone.
+/// Leading declarations move into the LET*, where they apply to the
+/// defaulted bindings; a docstring is dropped. A body that declares anything
+/// SPECIAL is left alone, as for [`optional_entry_prologue`].
+fn key_default_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal, EgclVal)> {
+    egcl_rt::rooted!(params = list_to_vec(params_form));
+    if !list_tail(params_form).is_nil() {
+        return None;
+    }
+    let keyword = |p: EgclVal| p.is_symbol() && super::sym_name_rc(p).starts_with('&');
+    let key_at = params
+        .iter()
+        .position(|p| p.is_symbol() && super::sym_name_rc(*p).as_ref() == "&KEY")?;
+    if params
+        .iter()
+        .any(|p| p.is_symbol() && super::sym_name_rc(*p).as_ref() == "&AUX")
+    {
+        return None;
+    }
+    let immediate = |form: EgclVal| {
+        form.is_fixnum()
+            || form.is_character()
+            || form.is_single_float()
+            || form.is_nil()
+            || form == T
+            || (form.is_symbol() && super::sym_name_rc(form).starts_with("KEYWORD:"))
+            || (form.is_cons()
+                && cp(form).0.is_symbol()
+                && super::sym_name_rc(cp(form).0).as_ref() == "QUOTE"
+                && cp(form).1.is_cons()
+                && cp(cp(form).1).1.is_nil()
+                && {
+                    let quoted = cp(cp(form).1).0;
+                    quoted.is_fixnum()
+                        || quoted.is_character()
+                        || quoted.is_single_float()
+                        || quoted.is_symbol()
+                })
+    };
+    // Every variable the lambda list binds, in order, for the scope check.
+    let mut bound: Vec<(usize, String)> = Vec::new();
+    for (index, &p) in params.iter().enumerate() {
+        if keyword(p) {
+            continue;
+        }
+        if p.is_symbol() {
+            bound.push((index, sym_name(p)));
+        } else if p.is_cons() {
+            let items = list_to_vec(p);
+            let variable = match items.first() {
+                Some(v) if v.is_symbol() => *v,
+                Some(v) if v.is_cons() => list_to_vec(*v).get(1).copied()?,
+                _ => return None,
+            };
+            bound.push((index, sym_name(variable)));
+            if let Some(&supplied) = items.get(2) {
+                bound.push((index, sym_name(supplied)));
+            }
+        }
+    }
+    // Key specs whose default needs evaluating.
+    let mut rewritten = Vec::new();
+    for index in key_at + 1..params.len() {
+        let spec = params[index];
+        if keyword(spec) {
+            if super::sym_name_rc(spec).as_ref() == "&ALLOW-OTHER-KEYS" {
+                continue;
+            }
+            return None;
+        }
+        if !spec.is_cons() {
+            continue;
+        }
+        let items = list_to_vec(spec);
+        if items.len() < 2 || items.len() > 3 || !list_tail(spec).is_nil() {
+            continue;
+        }
+        let init = items[1];
+        if immediate(init) {
+            continue;
+        }
+        let mut mentioned = std::collections::HashSet::new();
+        collect_symbol_names_qq(init, &mut mentioned, 0, false);
+        if bound
+            .iter()
+            .any(|(at, name)| *at >= index && mentioned.contains(name))
+        {
+            return None;
+        }
+        // A default that transfers control or establishes a handler is left
+        // to the binder: in the body it could keep the whole function out of
+        // T2, which builds no THROW, for instance. Only speed is at stake.
+        // The binder would evaluate it before the body's defaults, so none
+        // may precede it.
+        if mentioned.iter().any(|name| {
+            matches!(
+                super::symbol_bare_name(name).as_str(),
+                "THROW"
+                    | "CATCH"
+                    | "RETURN-FROM"
+                    | "RETURN"
+                    | "GO"
+                    | "BLOCK"
+                    | "TAGBODY"
+                    | "UNWIND-PROTECT"
+                    | "HANDLER-CASE"
+                    | "HANDLER-BIND"
+                    | "RESTART-CASE"
+                    | "IGNORE-ERRORS"
+                    | "PROGV"
+            )
+        }) {
+            if !rewritten.is_empty() {
+                return None;
+            }
+            continue;
+        }
+        rewritten.push(index);
+    }
+    if rewritten.is_empty() {
+        return None;
+    }
+    // Split off the docstring and leading declarations.
+    egcl_rt::rooted!(forms = list_to_vec(body));
+    egcl_rt::rooted!(declarations = Vec::<EgclVal>::new());
+    let mut start = 0;
+    let mut seen_doc = false;
+    while start < forms.len() {
+        let form = forms[start];
+        if form.is_string() && !seen_doc && start + 1 < forms.len() {
+            seen_doc = true;
+        } else if form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "DECLARE"
+        {
+            if declares_special(form) {
+                return None;
+            }
+            declarations.push(form);
+        } else {
+            break;
+        }
+        start += 1;
+    }
+    let marker = unsupplied_marker();
+    let quote = resolve_sym("QUOTE")?;
+    let eq = resolve_sym("EQ")?;
+    let if_op = resolve_sym("IF")?;
+    egcl_rt::rooted!(quoted_marker = form_list(&[quote, marker]));
+    egcl_rt::rooted!(new_params = params.to_vec());
+    egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
+    for &index in &rewritten {
+        // Re-read from the rooted vectors: the allocations below move objects.
+        egcl_rt::rooted!(items = list_to_vec(new_params[index]));
+        let variable = if items[0].is_symbol() {
+            items[0]
+        } else {
+            list_to_vec(items[0])[1]
+        };
+        egcl_rt::rooted!(init = items[1]);
+        egcl_rt::rooted!(test = form_list(&[eq, variable, *quoted_marker]));
+        egcl_rt::rooted!(value = form_list(&[if_op, *test, *init, variable]));
+        let binding = form_list(&[variable, *value]);
+        bindings.push(binding);
+        items[1] = *quoted_marker;
+        let spec = form_list(&items);
+        new_params[index] = spec;
+    }
+    egcl_rt::rooted!(let_form = vec![resolve_sym("LET*")?, form_list(&bindings)]);
+    let_form.extend(declarations.iter().copied());
+    let_form.extend(forms[start..].iter().copied());
+    egcl_rt::rooted!(wrapped = form_list(&let_form));
+    egcl_rt::rooted!(new_body = arena_cons(*wrapped, NIL));
+    let params_list = form_list(&new_params);
+    Some((params_list, *new_body))
+}
+
+/// Rewrite `params`/`body` so special-named parameters bind through a LET
+/// (see [`rename_special_parameters`]). False when a special-named parameter
+/// remains, which the caller's binder would bind lexically. Both values must
+/// be rooted by the caller.
+fn bind_special_parameters_in_body(params: &mut EgclVal, body: &mut EgclVal) -> bool {
+    if let Some((renamed_params, renamed_body)) = rename_special_parameters(*params, *body) {
+        *params = renamed_params;
+        *body = renamed_body;
+    }
+    parse_lambda_list(*params).is_none_or(|(names, ..)| !names.iter().any(|n| is_special_name(n)))
+}
+
+/// The final CDR of `list`: NIL for a proper list.
+fn list_tail(list: EgclVal) -> EgclVal {
+    let mut cursor = list;
+    while cursor.is_cons() {
+        cursor = cp(cursor).1;
+    }
+    cursor
 }
 
 /// `(arity, min_args)` for a compiled lambda list, given the required count an
@@ -11924,12 +12714,28 @@ fn compile_function_forcing_boxed(
 ) -> Option<BytecodeFunction> {
     egcl_rt::rooted!(params_form = params_form);
     egcl_rt::rooted!(body = body);
+    if !macro_lambda_list
+        && let Some((params, renamed_body)) = rename_special_parameters(*params_form, *body)
+    {
+        *params_form = params;
+        *body = renamed_body;
+    }
+    if !macro_lambda_list
+        && let Some((params, defaulted_body)) = key_default_prologue(*params_form, *body)
+    {
+        *params_form = params;
+        *body = defaulted_body;
+    }
     let _method_attempt = method_context_use::AttemptScope::enter(*body);
     // Required + &optional only: compile the defaults into an entry prologue and
     // bind positionally (optional_entry_prologue). The arguments' count may then
     // fall short of the arity, by the omitted optionals.
     let mut optional_required = None;
     if !macro_lambda_list {
+        if let Ok(Some((params, special_body))) = special_parameter_rewrite(*params_form, *body) {
+            *params_form = params;
+            *body = special_body;
+        }
         if let Some((params, prologue_body)) = aux_entry_prologue(*params_form, *body) {
             *params_form = params;
             *body = prologue_body;
@@ -11967,7 +12773,10 @@ fn compile_function_forcing_boxed(
     // tree-walker bind it. Two live cases: Trivia's `(defmacro match0 (*what*
     // &body clauses &environment *env*) …)`, whose `parse-patterns` reads
     // `*what*`, and Type-I's `(defun all-compound-types (compound &optional
-    // (*compound-infer-level* 0)) …)`.
+    // (*compound-infer-level* 0)) …)`. An ordinary lambda list was already
+    // rewritten by `special_parameter_rewrite` where that is unobservable, so
+    // what reaches here is a macro lambda list, or a later default form that
+    // could read the new binding (bliss-gg3i1.7.15.7).
     if param_names.iter().any(|n| is_special_name(n)) {
         let _ = record_bail(|| "lambda-list:special-parameter-name".to_string());
         return None;
@@ -13346,10 +14155,16 @@ impl BbuConstPool {
         if v.is_character() {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 7);
-            put_u32(&mut bytes, v.as_char() as u32);
+            put_u32(&mut bytes, v.char_code());
             return Some(self.intern_encoded(bytes));
         }
         if v.is_string() {
+            // A string constant is stored as UTF-8, which cannot carry a
+            // surrogate character; such a literal is not externalizable here,
+            // rather than silently becoming U+FFFD (bliss-5fn6m).
+            if egcl_stdlib::sequences::string_has_surrogate(v) {
+                return None;
+            }
             return Some(self.string(&val_as_str(v)));
         }
         // A string with a fill pointer or adjustable storage, such as the ones
@@ -13357,6 +14172,9 @@ impl BbuConstPool {
         // its active elements (CLHS 3.2.4.2.2), so it loads as a simple string.
         // Without this, one such literal made the whole file source-only.
         if let Some(contents) = egcl_stdlib::cvec_char_contents(v) {
+            if egcl_stdlib::sequences::string_has_surrogate(v) {
+                return None;
+            }
             return Some(self.string(&contents));
         }
         if v.is_symbol() {
@@ -16506,9 +17324,9 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                     .collect();
                 egcl_rt::bignum::BigInt::from_mag(if *negative { -1 } else { 1 }, limbs).to_val()
             }
-            BbuConstant::Character(code) => char::from_u32(*code)
-                .map(EgclVal::from_char)
-                .ok_or_else(|| bbu_error(format!("invalid character scalar {code}")))?,
+            // Any code below CHAR-CODE-LIMIT, surrogates included (bliss-5fn6m).
+            BbuConstant::Character(code) => egcl_stdlib::characters::code_char(i64::from(*code))
+                .ok_or_else(|| bbu_error(format!("invalid character code {code}")))?,
             BbuConstant::String(value) => arena_str(value),
             BbuConstant::Package { name_ref, .. } => arena_str(bbu_string(constants, *name_ref)?),
             BbuConstant::Symbol {
@@ -18029,6 +18847,7 @@ fn compile_defun(
     if let Some(frame) = closure_captured_env(*function) {
         if super::handoff_census::enabled() {
             super::handoff_census::note("compile:defun-against-runtime-frame".into());
+            super::handoff_census::note(format!("compile:defun-against-runtime-frame {name}"));
         }
         compile_env.frame = Arc::clone(&frame);
         captures = frame_capture_names(frame);
@@ -18133,6 +18952,12 @@ fn compile_defun(
                     .as_deref()
                     .unwrap_or("bytecode lowering bailed; no reason recorded"),
             );
+            if super::tw_census::enabled() {
+                super::tw_census::note_declined(
+                    sym,
+                    reason.as_deref().unwrap_or("no reason recorded"),
+                );
+            }
             LAZY_DECLINED.with(|s| s.borrow_mut().insert(sym));
             false
         }
@@ -27218,6 +28043,12 @@ fn nn_direct_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("EGCL_NN_DIRECT").as_deref() != Ok("0"))
 }
 
+/// Whether T2 may still replace `sym`'s baseline: enabled and not declined.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn t2_may_replace(sym: u32) -> bool {
+    t2_enabled() && !T2_DECLINED.with(|declined| declined.borrow().contains(&sym))
+}
+
 /// T2 is part of normal tiering.  `EGCL_DISABLE_T2=1` is the explicit debug
 /// off-switch; `EGCL_T2=0` is accepted for compatibility with the old gate.
 fn t2_enabled() -> bool {
@@ -27805,6 +28636,8 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                 let sym = match instruction {
                     Instr::CallNamed { sym, .. } => Some(*sym),
                     Instr::AllocCons => Some(egcl_rt::symbols::intern("CONS")),
+                    // SetValues is built as its VALUES call.
+                    Instr::SetValues(_) => Some(egcl_rt::symbols::intern("VALUES")),
                     Instr::MakeStruct { .. } => {
                         Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT"))
                     }
