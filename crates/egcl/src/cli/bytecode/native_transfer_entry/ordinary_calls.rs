@@ -55,6 +55,18 @@ static COLD_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
 static NAMED_ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
 #[cfg(test)]
+static NAMED_ENTRY_SYMBOLS: egcl_rt::execution_local::ExecutionLocal<RefCell<Option<Vec<u32>>>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(None)) };
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn start_named_entry_symbols_for_test() {
+    NAMED_ENTRY_SYMBOLS.with(|symbols| *symbols.borrow_mut() = Some(Vec::new()));
+}
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_named_entry_symbols_for_test() -> Vec<u32> {
+    NAMED_ENTRY_SYMBOLS.with(|symbols| symbols.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(test)]
 type SelfColdObserver = Cell<Option<fn()>>;
 #[cfg(test)]
 pub(in crate::cli::bytecode) static SELF_COLD_OBSERVER: egcl_rt::execution_local::ExecutionLocal<
@@ -323,6 +335,11 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
     #[cfg(test)]
     if !ordinary_primitives::is_private(unsafe { super::super::call_table::cell_symbol(cell) }) {
         NAMED_ENTRIES.with(|count| count.set(count.get() + 1));
+        NAMED_ENTRY_SYMBOLS.with(|symbols| {
+            if let Some(symbols) = &mut *symbols.borrow_mut() {
+                symbols.push(unsafe { super::super::call_table::cell_symbol(cell) });
+            }
+        });
     }
     unsafe {
         with_entry_roots(request, || {

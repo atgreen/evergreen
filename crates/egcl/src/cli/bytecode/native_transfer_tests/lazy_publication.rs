@@ -44,12 +44,16 @@ fn inner_owner(fixture: &Fixture) -> usize {
 /// Two simultaneous physical T2 owners: the root `outer` and `inner`, which
 /// calls the STRING builtin through the named runtime adapter.
 fn fixture(env: &mut Env) -> Fixture {
-    crate::cli::read_eval_all_env(DEFINITIONS, env).unwrap();
+    fixture_with_inner_value(env, "(+ n 1)")
+}
+
+fn fixture_with_inner_value(env: &mut Env, value: &str) -> Fixture {
+    crate::cli::read_eval_all_env(&DEFINITIONS.replace("(+ n 1)", value), env).unwrap();
     native_transfer_entry::with_ordinary_non_tail_emission_for_test(|| {
         let (_, inner) = install_ordinary(
             "LAZY-PUB-INNER",
             "(n s)",
-            "((let ((held (cons 716241 nil))) (string s) (cons (+ n 1) held)))",
+            &format!("((let ((held (cons 716241 nil))) (string s) (cons {value} held)))"),
             env,
         );
         let (outer_symbol, outer) = install_ordinary(
@@ -77,15 +81,15 @@ fn symbol_value(name: &str, env: &mut Env) -> EgclVal {
     crate::cli::read_eval_all_env(&format!("'{name}"), env).unwrap()
 }
 
-/// Check the shape `((716242) n+1 716241)` and return the two marker conses.
-fn markers(result: EgclVal, n: i64) -> (EgclVal, EgclVal) {
+/// Check the shape `((716242) expected_sum 716241)` and return its marker conses.
+fn markers(result: EgclVal, expected_sum: i64) -> (EgclVal, EgclVal) {
     let (mine, rest) = crate::cli::cp(result);
     assert_eq!(
         crate::cli::cp(mine),
         (EgclVal::from_fixnum(OUTER_MARKER), NIL)
     );
     let (sum, held) = crate::cli::cp(rest);
-    assert_eq!(sum, EgclVal::from_fixnum(n + 1));
+    assert_eq!(sum, EgclVal::from_fixnum(expected_sum));
     assert_eq!(
         crate::cli::cp(held),
         (EgclVal::from_fixnum(INNER_MARKER), NIL)
@@ -156,7 +160,9 @@ fn lazy_publication_gc_inside_builtin_relocates_native_caller_values() {
         .unwrap_or_else(|error| error.into_inner());
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    let fixture = fixture(&mut env);
+    // Keep arithmetic out of this publication probe: its generic runtime
+    // adapter is independent of STRING and would add another named entry.
+    let fixture = fixture_with_inner_value(&mut env, "n");
     egcl_rt::rooted!(name = symbol_value("lazy-pub-symbol", &mut env));
     // Warm the linkage so the measured call is generated code end to end.
     for _ in 0..2 {
@@ -178,6 +184,7 @@ fn lazy_publication_gc_inside_builtin_relocates_native_caller_values() {
     let _hook = Hook::install(collect_inside_builtin);
     MOVES.with(|slot| slot.set(&mut moves));
     native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    native_transfer_entry::ordinary_calls::start_named_entry_symbols_for_test();
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
     let stack = egcl_rt::current_stack();
     let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
@@ -198,10 +205,32 @@ fn lazy_publication_gc_inside_builtin_relocates_native_caller_values() {
         moves.lazy,
         "the builtin's publication must leave owner resolution to the walk"
     );
+    let named_entries = native_transfer_entry::ordinary_calls::take_named_entries_for_test();
+    let named: Vec<_> = native_transfer_entry::ordinary_calls::take_named_entry_symbols_for_test()
+        .into_iter()
+        .map(|symbol| egcl_rt::symbols::registry_key(symbol).unwrap())
+        .collect();
     assert_eq!(
-        native_transfer_entry::ordinary_calls::take_named_entries_for_test(),
+        named_entries,
+        named.len(),
+        "the trace accounts for every named runtime entry"
+    );
+    assert_eq!(
+        named
+            .iter()
+            .filter(|name| name.as_str() == "STRING")
+            .count(),
         1,
-        "STRING is entered once, through the named runtime adapter"
+        "STRING is entered exactly once through the named runtime adapter: {named:?}"
+    );
+    // CONS's allocating fallback also uses this adapter. The total named count
+    // is not STRING's count; forbid every other target, including an adapter
+    // call of the inner Lisp function that must instead run generated code.
+    assert!(
+        named
+            .iter()
+            .all(|name| matches!(name.as_str(), "STRING" | "CONS")),
+        "unexpected runtime target: {named:?}"
     );
     assert_eq!(
         native_transfer_entry::ordinary_calls::take_cold_calls_for_test(),
@@ -249,7 +278,7 @@ fn lazy_publication_error_inside_builtin_unwinds_with_native_backtrace() {
         )
         .unwrap()
     );
-    markers(*warm, 1);
+    markers(*warm, 2);
     let stack = egcl_rt::current_stack();
     let before = (stack.fp(), stack.sp(), NATIVE_DEPTH.with(Cell::get));
     let segment = egcl_rt::native_transfer::current_segment();
@@ -264,8 +293,8 @@ fn lazy_publication_error_inside_builtin_unwinds_with_native_backtrace() {
         .unwrap_err()
     );
     assert!(
-        matches!(&*error, EgclError::Signalled(details)
-            if crate::cli::condition_matches_handler(&env, details.condition, "TYPE-ERROR")),
+        matches!(error.without_backtrace(), EgclError::TypeError { datum, expected }
+            if *datum == EgclVal::from_fixnum(5) && expected == "(OR STRING SYMBOL CHARACTER)"),
         "{:?}",
         &*error
     );
@@ -291,18 +320,16 @@ fn lazy_publication_error_inside_builtin_unwinds_with_native_backtrace() {
     assert_eq!(names.len(), 2, "{trace:?}");
     assert!(names[0].0.ends_with("LAZY-PUB-INNER"), "{names:?}");
     assert!(names[1].0.ends_with("LAZY-PUB-OUTER"), "{names:?}");
-    assert!(
-        names
-            .iter()
-            .all(|(_, origin)| matches!(origin, FrameOrigin::Native)),
-        "{names:?}"
-    );
+    // The physical root enriches its managed segment anchor; only the inner
+    // physical-only frame adds a native-origin row (as in ordinary_register_roots).
+    assert_eq!(names[0].1, FrameOrigin::Native, "{names:?}");
+    assert_eq!(names[1].1, FrameOrigin::Managed, "{names:?}");
 
     // A Lisp handler around the installed definitions catches the same error
     // through the generated frames, and the next call runs normally.
     let caught = crate::cli::read_eval_all_env(
         "(list (handler-case (lazy-pub-outer 1 5) (type-error () :caught))
-               (cadr (lazy-pub-outer 2 'lazy-pub-symbol)))",
+               (car (cdr (lazy-pub-outer 2 'lazy-pub-symbol))))",
         &mut env,
     )
     .unwrap();
@@ -335,7 +362,7 @@ fn lazy_publication_guard_deopt_after_builtin_keeps_relocated_values() {
             )
             .unwrap()
         );
-        markers(*warm, 1);
+        markers(*warm, 2);
     }
     let inner = mapped(&fixture.inner);
     assert!(inner.has_deopt, "(+ n 1) must use a native fixnum guard");
@@ -411,15 +438,19 @@ fn lazy_publication_sprof_samples_anchored_callers_of_a_builtin() {
         )
         .unwrap()
     );
-    markers(*warm, 1);
-    struct Recording(Hook);
+    markers(*warm, 2);
+    struct Recording {
+        _hook: Hook,
+    }
     impl Drop for Recording {
         fn drop(&mut self) {
             crate::cli::sprof::stop();
         }
     }
     crate::cli::sprof::begin_for_test();
-    let _recording = Recording(Hook::install(sample_inside_builtin));
+    let _recording = Recording {
+        _hook: Hook::install(sample_inside_builtin),
+    };
     SAMPLE_OWNER.with(|owner| owner.set(inner_owner(&fixture)));
     SAMPLES.with(|count| count.set(0));
     for n in 0..4 {
@@ -432,7 +463,7 @@ fn lazy_publication_sprof_samples_anchored_callers_of_a_builtin() {
             )
             .unwrap()
         );
-        markers(*result, n);
+        markers(*result, n + 1);
     }
     assert_eq!(SAMPLES.with(Cell::get), 4, "one sample per builtin call");
     let folded = crate::cli::sprof::fold();
@@ -498,7 +529,7 @@ fn unresolved_publication_fiber() -> EgclVal {
             )
             .unwrap()
         );
-        markers(*warm, 7);
+        markers(*warm, 8);
     }
     let inner = mapped(&fixture.inner);
     let (start, len) = inner
@@ -516,7 +547,7 @@ fn unresolved_publication_fiber() -> EgclVal {
         .unwrap()
     );
     drop(hook);
-    markers(*result, 7);
+    markers(*result, 8);
     assert!(!root_publication::any_publication_for_test());
     EgclVal::from_fixnum(1)
 }
