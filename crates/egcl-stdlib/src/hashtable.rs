@@ -589,6 +589,16 @@ fn keys_equal(a: EgclVal, b: EgclVal, test: HashTest) -> bool {
 }
 
 const STRUCTURAL_HASH_DEPTH_LIMIT: usize = 4;
+/// How deeply EQUAL hashing (and SXHASH) descends into nested lists. Only
+/// conses recurse under EQUAL, and [`LIST_HASH_BUDGET`] bounds the total work,
+/// so this can be deeper than the EQUALP limit, which also recurses through
+/// vectors and structures.
+const EQUAL_HASH_DEPTH_LIMIT: usize = 8;
+/// Most list elements one structural hash visits, over every level together.
+/// The walk is a deterministic function of the list's shape, so EQUAL objects
+/// spend the budget identically and still hash alike; it also bounds the cost
+/// of a long or circular list.
+const LIST_HASH_BUDGET: usize = 256;
 const MOST_POSITIVE_FIXNUM_MASK: u64 = 0x0FFF_FFFF_FFFF_FFFF;
 
 fn hash_bytes(bytes: &[u8], case_fold: bool) -> u64 {
@@ -628,6 +638,20 @@ unsafe fn simple_string_hash(ptr: *const u8) -> u64 {
 fn combine_hashes(a: u64, b: u64) -> u64 {
     a.rotate_left(13) ^ b.rotate_right(7) ^ 0x9e37_79b9_7f4a_7c15
 }
+
+/// Fold `x` into the running hash `h` of a sequence. Unlike the XOR-linear
+/// [`combine_hashes`], the multiply makes the result depend on each element's
+/// position and lets every bit of `x` reach the low bits a table indexes by
+/// (bliss-gg3i1.7.18).
+fn mix_hashes(h: u64, x: u64) -> u64 {
+    let v = (h ^ x.rotate_left(23))
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    v ^ (v >> 31)
+}
+
+/// Seed of a list's structural hash, distinct from any leaf's.
+const LIST_HASH_SEED: u64 = 0x6c69_7374_6861_7368;
 
 /// Value-based hash for a heap numeric (bignum / ratio / complex / double-float)
 /// so two distinct-but-numerically-equal objects hash equal — otherwise a hash
@@ -854,6 +878,8 @@ struct KeyHasher {
     /// moving GC changes addresses.
     stable: bool,
     address_sensitive: bool,
+    /// List elements this hash may still visit ([`LIST_HASH_BUDGET`]).
+    list_budget: usize,
 }
 
 impl KeyHasher {
@@ -861,6 +887,40 @@ impl KeyHasher {
         KeyHasher {
             stable,
             address_sensitive: false,
+            list_budget: LIST_HASH_BUDGET,
+        }
+    }
+
+    /// Hash a list by walking its spine: every element (to the budget) is
+    /// mixed in at `depth - 1`, followed by the list's length and any dotted
+    /// tail. The spine does not consume depth: hashing a cons as a car/cdr
+    /// pair, with depth spent on each CDR, saw only the first few elements and
+    /// made `(AND (INTEGER 0 1))` and `(AND (INTEGER 0 2))` -- and every other
+    /// type specifier sharing a short prefix -- hash alike (bliss-gg3i1.7.18).
+    fn list(
+        &mut self,
+        mut object: EgclVal,
+        depth: usize,
+        element: fn(&mut Self, EgclVal, usize) -> u64,
+    ) -> u64 {
+        let mut h = LIST_HASH_SEED;
+        let mut length = 0u64;
+        while object.tag() == TAG_CONS {
+            if self.list_budget == 0 {
+                return mix_hashes(h, length);
+            }
+            self.list_budget -= 1;
+            // Safety: a TAG_CONS value points at a ConsCell.
+            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
+            h = mix_hashes(h, element(self, cell.car, depth - 1));
+            length += 1;
+            object = cell.cdr;
+        }
+        h = mix_hashes(h, length);
+        if object.is_nil() {
+            h
+        } else {
+            mix_hashes(h, element(self, object, depth - 1))
         }
     }
 
@@ -894,12 +954,7 @@ impl KeyHasher {
             return h;
         }
         if object.tag() == TAG_CONS {
-            // Safety: a TAG_CONS value points at a ConsCell.
-            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
-            return combine_hashes(
-                self.equal(cell.car, depth - 1),
-                self.equal(cell.cdr, depth - 1),
-            );
+            return self.list(object, depth, Self::equal);
         }
         // A symbol hashes by its NAME so two symbols with the same name (in any
         // package, interned or uninterned) hash alike (ANSI; sxhash.13/.15/.23).
@@ -959,12 +1014,7 @@ impl KeyHasher {
             return equalp_char_hash(object.as_char());
         }
         if object.tag() == TAG_CONS {
-            // Safety: a TAG_CONS value points at a ConsCell.
-            let cell = unsafe { &*(object.as_ptr() as *const ConsCell) };
-            return combine_hashes(
-                self.equalp(cell.car, depth - 1),
-                self.equalp(cell.cdr, depth - 1),
-            );
+            return self.list(object, depth, Self::equalp);
         }
         if object.is_heap_object() {
             // Pathnames are EQUALP exactly when they are EQUAL (components match),
@@ -1039,7 +1089,7 @@ fn hash_key(object: EgclVal, test: HashTest) -> (u64, bool) {
     let hash = match test {
         HashTest::Eq => hasher.identity(object),
         HashTest::Eql => hasher.eql(object),
-        HashTest::Equal => hasher.equal(object, STRUCTURAL_HASH_DEPTH_LIMIT),
+        HashTest::Equal => hasher.equal(object, EQUAL_HASH_DEPTH_LIMIT),
         HashTest::Equalp => hasher.equalp(object, STRUCTURAL_HASH_DEPTH_LIMIT),
     };
     (hash, hasher.address_sensitive)
@@ -1906,8 +1956,8 @@ pub fn hash_table_rehash_threshold(table: EgclVal) -> Result<f64, EgclError> {
 /// Returns a non-negative fixnum.
 pub fn sxhash(object: EgclVal) -> EgclVal {
     EgclVal::from_fixnum(
-        (KeyHasher::new(true).equal(object, STRUCTURAL_HASH_DEPTH_LIMIT)
-            & MOST_POSITIVE_FIXNUM_MASK) as i64,
+        (KeyHasher::new(true).equal(object, EQUAL_HASH_DEPTH_LIMIT) & MOST_POSITIVE_FIXNUM_MASK)
+            as i64,
     )
 }
 
@@ -2146,6 +2196,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn fixnum_list(items: &[i64]) -> EgclVal {
+        let mut list = NIL;
+        for &item in items.iter().rev() {
+            list = cons(EgclVal::from_fixnum(item), list);
+        }
+        list
+    }
+
+    /// Lists that differ only past the first few elements, or only inside a
+    /// nested list, must still hash apart: SBCL's type caches key EQUAL tables
+    /// on specifiers like `(AND (INTEGER 0 N))`, and when they all collided a
+    /// cached lookup walked one long chain (bliss-gg3i1.7.18).
+    #[test]
+    fn list_hash_sees_late_and_nested_elements() {
+        let shapes: [fn(i64) -> EgclVal; 3] = [
+            // (AND (INTEGER 0 N))
+            |n| {
+                let inner = fixnum_list(&[2, 0, n]);
+                cons(EgclVal::from_fixnum(1), cons(inner, NIL))
+            },
+            // (OR (MEMBER A B) (INTEGER N M))
+            |n| {
+                let range = fixnum_list(&[2, n, n + 7]);
+                let member = fixnum_list(&[3, 4, 5]);
+                cons(EgclVal::from_fixnum(6), cons(member, cons(range, NIL)))
+            },
+            // a flat list whose last element differs
+            |n| fixnum_list(&[1, 2, 3, 4, 5, 6, 7, n]),
+        ];
+        for shape in shapes {
+            let mut seen = std::collections::HashSet::new();
+            for n in 0..2000 {
+                let key = shape(n);
+                let hash = hash_for_test(key, HashTest::Equal);
+                assert_eq!(
+                    sxhash(key).as_fixnum() as u64,
+                    hash & MOST_POSITIVE_FIXNUM_MASK
+                );
+                assert_eq!(
+                    hash,
+                    hash_for_test(shape(n), HashTest::Equal),
+                    "EQUAL copies"
+                );
+                assert_eq!(
+                    hash_for_test(key, HashTest::Equalp),
+                    hash_for_test(shape(n), HashTest::Equalp),
+                    "EQUALP copies"
+                );
+                seen.insert(hash);
+            }
+            assert_eq!(seen.len(), 2000, "every distinct list hashes apart");
+        }
+        // A list longer than the budget and a circular one still hash.
+        let long: Vec<i64> = (0..1000).collect();
+        let long = fixnum_list(&long);
+        assert_eq!(
+            hash_for_test(long, HashTest::Equal),
+            hash_for_test(long, HashTest::Equal)
+        );
+        let ring = cons(EgclVal::from_fixnum(1), NIL);
+        // Safety: a fresh cons; make its cdr point back at itself.
+        unsafe { (*(ring.as_ptr() as *mut ConsCell)).cdr = ring };
+        let _ = hash_for_test(ring, HashTest::Equal);
+        let _ = hash_for_test(ring, HashTest::Equalp);
     }
 
     /// The address flag comes from the hash that consulted the address: a

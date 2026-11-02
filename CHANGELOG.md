@@ -458,6 +458,14 @@
 
 ### Changed
 
+- EQUAL and EQUALP hash tables and SXHASH hash every element of a list, to a
+  bounded nesting depth and total length, instead of only its first few, so
+  keys such as `(AND (INTEGER 0 1))` and `(AND (INTEGER 0 2))` no longer
+  collide. A 10,000-key table of type-specifier lists went from 2,503 distinct
+  hashes to 10,000 and from 73 us to 4.4 us per lookup. SXHASH called from
+  compiled code no longer goes through the evaluator
+  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN)).
+
 - DEFSTRUCT accessors are ordinary functions, as in SBCL: calling one on an
   object of the wrong type signals TYPE-ERROR, DEFMETHOD no longer extends it,
   and an included structure's writer checks the slot type the included

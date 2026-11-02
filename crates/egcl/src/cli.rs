@@ -44478,6 +44478,7 @@ const DIRECT_FAST: &[&str] = &[
     "ELT",
     "LENGTH",
     "EQ",
+    "SXHASH",
     "TYPEP",
     "SYMBOLP",
     "NUMBERP",
@@ -45942,6 +45943,13 @@ fn apply_builtin_fast(
         "EQ" if args.len() == 2 => {
             env.clear_mv();
             Some(Ok(if args[0] == args[1] { T } else { NIL }))
+        }
+        // A compiled SXHASH used to synthesize its form and tree-walk it, at
+        // 13-20us a call whatever the argument (bliss-gg3i1.7.18). It is a
+        // leaf: hashing never allocates or re-enters Lisp.
+        "SXHASH" if args.len() == 1 => {
+            env.clear_mv();
+            Some(Ok(egcl_stdlib::sxhash(args[0])))
         }
         // CLOS readers on already-evaluated arguments. ASDF is CLOS data
         // structures end to end and its plan traversal is almost entirely slot
