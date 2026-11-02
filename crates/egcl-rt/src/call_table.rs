@@ -103,7 +103,8 @@ pub struct OrdinaryCallHeat {
 }
 
 /// Stable executable slots and an opaque pointer to their owning execution's
-/// state. Generated code embeds a slot address computed from its fixed ordinal.
+/// state. Legacy callers embed stable slots; indexed ordinary callers resolve
+/// this cell through their current execution context and process-wide ordinal.
 #[repr(C)]
 pub struct CallCell {
     // Permanent native-contract entries. The checked view below is temporary
@@ -122,6 +123,108 @@ pub struct CallCell {
     /// descriptor also occupies, if any (bliss-gg3i1.7.15.10.1). Changed only
     /// under the table lock, together with `ordinary_entry`.
     entry_claim: Mutex<Option<EntryClaim>>,
+}
+
+/// Immutable bounds and backing pointer loaded together by generated selectors.
+#[repr(C)]
+pub struct ExecutionCallView {
+    pub slots: *const std::sync::atomic::AtomicPtr<CallCell>,
+    pub len: usize,
+}
+// SAFETY: backing slots are atomic and retained by the enclosing linkage.
+unsafe impl Send for ExecutionCallView {}
+unsafe impl Sync for ExecutionCallView {}
+
+struct CallLinkageStorage {
+    cells: Vec<Option<Arc<CallCell>>>,
+    // Views and backing arrays survive every possible reader, including a
+    // selector suspended while another runtime entry grows this execution.
+    #[allow(clippy::vec_box)] // generated selectors retain these exact view addresses
+    views: Vec<Box<ExecutionCallView>>,
+    backing: Vec<Box<[std::sync::atomic::AtomicPtr<CallCell>]>>,
+}
+
+/// Execution-owned ordinal linkage. Cells and all published views live until
+/// this context retires, after its last native frame has left. This does not
+/// own callable state or code; the execution's existing State scanner does.
+#[repr(C)]
+pub struct ExecutionCallLinkage {
+    view: std::sync::atomic::AtomicPtr<ExecutionCallView>,
+    storage: crate::lock_order::OrderedMutex<CallLinkageStorage>,
+}
+
+// High suborder namespace: call linkage uses field 1, execution heat field 2.
+// Directory locks are not nested, but distinct identities keep checks precise.
+static NEXT_CALL_LINKAGE_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+
+impl Default for ExecutionCallLinkage {
+    fn default() -> Self {
+        let instance = NEXT_CALL_LINKAGE_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        assert!(instance < (1 << 61), "call linkage lock identity exhausted");
+        let order = (1 << 63) | (instance << 2) | 1;
+        Self {
+            view: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            storage: crate::lock_order::OrderedMutex::new(
+                crate::lock_order::LockLevel::ExecutionObject,
+                order,
+                "execution call linkage",
+                CallLinkageStorage {
+                    cells: Vec::new(),
+                    views: Vec::new(),
+                    backing: Vec::new(),
+                },
+            ),
+        }
+    }
+}
+
+impl ExecutionCallLinkage {
+    pub const VIEW_OFFSET: usize = std::mem::offset_of!(Self, view);
+
+    pub fn install(&self, cell: Arc<CallCell>) {
+        let ordinal = cell.ordinal();
+        let mut storage = self.storage.lock().unwrap_or_else(|e| e.into_inner());
+        if ordinal >= storage.cells.len() {
+            let len = (ordinal + 1).next_power_of_two().max(16);
+            storage.cells.resize_with(len, || None);
+            let backing: Box<[_]> = storage
+                .cells
+                .iter()
+                .map(|cell| {
+                    std::sync::atomic::AtomicPtr::new(
+                        cell.as_ref()
+                            .map_or(std::ptr::null_mut(), |cell| Arc::as_ptr(cell).cast_mut()),
+                    )
+                })
+                .collect();
+            let mut view = Box::new(ExecutionCallView {
+                slots: backing.as_ptr(),
+                len,
+            });
+            let pointer = std::ptr::from_mut(&mut *view);
+            storage.backing.push(backing);
+            storage.views.push(view);
+            self.view.store(pointer, Ordering::Release);
+        }
+        if let Some(previous) = &storage.cells[ordinal] {
+            assert!(
+                Arc::ptr_eq(previous, &cell),
+                "an execution ordinal cannot change cell identity"
+            );
+            return;
+        }
+        let pointer = Arc::as_ptr(&cell).cast_mut();
+        storage.cells[ordinal] = Some(cell);
+        // An older in-flight view may still miss this slot, which safely goes
+        // cold; no published slot is cleared or changes its cell identity.
+        storage.backing.last().unwrap()[ordinal].store(pointer, Ordering::Release);
+    }
+}
+
+impl CallCell {
+    pub const ORDINARY_ENTRY_OFFSET: usize = std::mem::offset_of!(Self, ordinary_entry);
+    pub const ORDINARY_HEAT_OFFSET: usize = std::mem::offset_of!(Self, ordinary_heat);
+    pub const REVISION_OFFSET: usize = std::mem::offset_of!(Self, revision);
 }
 
 /// A function object's entry word, claimed for one execution's published

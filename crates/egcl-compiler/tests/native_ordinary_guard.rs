@@ -114,6 +114,7 @@ fn emit(f: &Function, target: u32) -> Result<FramedCode, EmitError> {
             binding: None,
         },
         OrdinaryCallTarget {
+            linkage_ordinal: None,
             symbol: target,
             descriptor_slot: 1,
             revision_address: 1,
@@ -170,6 +171,7 @@ fn ordinary_general_entry_accepts_recursive_guarded_continuation() {
         &[(
             call,
             OrdinaryCallTarget {
+                linkage_ordinal: None,
                 symbol: 1,
                 descriptor_slot: 1,
                 revision_address: 1,
@@ -195,4 +197,63 @@ fn ordinary_general_entry_accepts_recursive_guarded_continuation() {
         "ordinary recursion must use the same entry as cross-function calls: {:?}",
         result.err()
     );
+}
+
+#[test]
+fn indexed_call_emission_excludes_all_execution_cell_addresses() {
+    let f = guarded(true, 1, 2);
+    let addresses = [
+        0x1234_5678_1111_2222u64,
+        0x1234_5678_3333_4444,
+        0x1234_5678_5555_6666,
+    ];
+    let emit = |indexed: bool| {
+        emit_framed_ordinary_guarded_call(
+            &f,
+            OrdinaryLispEntryOptions {
+                require_callable_home: false,
+                arity: 1,
+                arity_error_veneer: 1,
+                binding: None,
+            },
+            OrdinaryCallTarget {
+                linkage_ordinal: indexed.then_some(7),
+                symbol: 2,
+                descriptor_slot: addresses[0],
+                revision_address: addresses[1],
+                heat_slot: addresses[2],
+                function_cell: 0,
+            },
+            OrdinaryCallFlags {
+                gc_requested: 1,
+                sigusr1_pending: 1,
+                posted_signal: 1,
+                native_errors: 1,
+                signal_epoch: 1,
+            },
+            1,
+            OrdinaryGuardOptions {
+                veneer: 1,
+                multiple_values: 1,
+            },
+        )
+        .unwrap()
+    };
+    let original = emit(false);
+    let indexed = emit(true);
+    for pointer in addresses {
+        assert!(
+            original
+                .code
+                .windows(8)
+                .any(|window| window == pointer.to_le_bytes())
+        );
+        assert!(
+            !indexed
+                .code
+                .windows(8)
+                .any(|window| window == pointer.to_le_bytes()),
+            "indexed hot admission and cold RuntimeCall request must derive slot addresses from R13"
+        );
+    }
 }

@@ -80,6 +80,8 @@ pub struct LispExecutionContext {
     /// owner. A function object's entry word is callable only by the
     /// execution whose key it records.
     code_owner: u64,
+    /// Lifetime owner of ordinal call cells and immutable generated views.
+    call_linkage: Box<crate::call_table::ExecutionCallLinkage>,
 }
 
 static NEXT_CODE_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -102,6 +104,7 @@ pub mod offsets {
     pub const POLL_SLOT: usize = 40;
     /// `code_owner`
     pub const CODE_OWNER: usize = 48;
+    pub const CALL_LINKAGE: usize = 56;
 }
 
 impl LispExecutionContext {
@@ -114,7 +117,12 @@ impl LispExecutionContext {
             active_native_control: AtomicU64::new(0),
             poll_slot: crate::execution_poll::register(carrier_id),
             code_owner: NEXT_CODE_OWNER.fetch_add(1, Ordering::Relaxed),
+            call_linkage: Box::default(),
         }
+    }
+
+    pub fn call_linkage(&self) -> &crate::call_table::ExecutionCallLinkage {
+        &self.call_linkage
     }
 
     /// This execution's unique code-owner key; see the field.
@@ -324,6 +332,10 @@ mod tests {
             offsets::CODE_OWNER
         );
         let other = LispExecutionContext::new(ExecutionKind::NativeThread, 7, 3);
+        assert_eq!(
+            &ctx.call_linkage as *const _ as usize - base,
+            offsets::CALL_LINKAGE
+        );
         assert_ne!(ctx.code_owner(), 0);
         assert_ne!(ctx.code_owner(), other.code_owner());
     }
@@ -356,14 +368,14 @@ mod tests {
         assert_eq!(first.active_native_control(), 0);
         assert_eq!(second.active_native_control(), 0);
         assert_eq!(offsets::ACTIVE_NATIVE_CONTROL, 32);
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 56);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 64);
     }
 
     /// Every field is one machine word, so generated code can load any of them
     /// with a single `mov` at a fixed displacement.
     #[test]
     fn every_field_is_one_machine_word() {
-        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 56);
+        assert_eq!(std::mem::size_of::<LispExecutionContext>(), 64);
         assert_eq!(std::mem::align_of::<LispExecutionContext>(), 8);
     }
 

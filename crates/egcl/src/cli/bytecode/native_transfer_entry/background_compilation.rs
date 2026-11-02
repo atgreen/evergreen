@@ -23,11 +23,25 @@ fn ordinary_call_target(
     } else {
         0
     };
+    let indexed = super::super::call_table::indexed_linkage_enabled();
     egcl_compiler::t2::emit::OrdinaryCallTarget {
         symbol,
-        descriptor_slot: cell.ordinary_entry_address() as u64,
-        heat_slot: cell.ordinary_heat_address() as u64,
-        revision_address: cell.revision_address() as u64,
+        linkage_ordinal: indexed.then_some(cell.ordinal()),
+        descriptor_slot: if indexed {
+            0
+        } else {
+            cell.ordinary_entry_address() as u64
+        },
+        heat_slot: if indexed {
+            0
+        } else {
+            cell.ordinary_heat_address() as u64
+        },
+        revision_address: if indexed {
+            0
+        } else {
+            cell.revision_address() as u64
+        },
         function_cell,
     }
 }

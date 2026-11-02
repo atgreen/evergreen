@@ -183,6 +183,12 @@ fn bridge_entries() -> Option<[usize; 6]> {
     Some(callbacks)
 }
 
+/// Opt-in sharing prerequisite; legacy emission remains the default.
+pub(super) fn indexed_linkage_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EGCL_R13_CALL_LINKAGE").is_ok_and(|v| v == "1"))
+}
+
 pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
     #[cfg(test)]
     RESOLVES.with(|count| count.set(count.get() + 1));
@@ -227,7 +233,17 @@ pub(super) fn resolve(symbol: u32) -> Option<Arc<CallCell>> {
         });
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         adapter::ensure(state);
-        Arc::clone(&state.cell)
+        let cell = Arc::clone(&state.cell);
+        if indexed_linkage_enabled()
+            && let Some(context) = egcl_rt::thread::current_execution_context_for_native()
+        {
+            // The current execution owns both State and the context. Retain
+            // the cell before publishing an ordinal to generated callers.
+            unsafe { &*context }
+                .call_linkage()
+                .install(Arc::clone(&cell));
+        }
+        cell
     }))
 }
 

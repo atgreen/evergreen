@@ -58,6 +58,7 @@ fn global_value_read_compiles_through_the_ordinary_abi() {
     let targets = [(
         call,
         OrdinaryCallTarget {
+            linkage_ordinal: None,
             symbol: 77,
             descriptor_slot: 1,
             revision_address: 1,
@@ -179,6 +180,7 @@ fn semantic_store_keeps_its_continuation_and_discards_the_primary() {
         (
             inst,
             OrdinaryCallTarget {
+                linkage_ordinal: None,
                 symbol,
                 descriptor_slot: 1,
                 revision_address: 1,

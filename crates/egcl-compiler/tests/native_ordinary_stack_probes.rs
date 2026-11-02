@@ -91,6 +91,7 @@ fn large_ordinary_frames_and_outgoing_areas_touch_each_stack_page() {
         &[(
             site,
             OrdinaryCallTarget {
+                linkage_ordinal: None,
                 symbol: 77,
                 descriptor_slot: 1,
                 revision_address: 1,

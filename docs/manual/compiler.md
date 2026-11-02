@@ -291,6 +291,7 @@ not a portable Common Lisp interface, and many are read once.
 | `EGCL_T2_THRESHOLD` | Compatibility override for the T2 invocation threshold |
 | `EGCL_OSR_THRESHOLD` | Override named-loop OSR threshold; default 100,000 back edges |
 | `EGCL_BAIL_TRACE=1` | Collect bytecode-lowering decline reasons |
+| `EGCL_R13_CALL_LINKAGE=1` | Resolve ordinary x86-64 Linux call metadata through the current execution context; disabled by default |
 
 Eager FASL compilation covers each installed named bytecode definition and the
 closure templates reachable through its nested-function graph. Templates share
@@ -316,6 +317,10 @@ Installed definitions keep their public function names without renaming shared
 closure prototypes or changing their private code identities.
 
 A threshold does not expand the target backend's supported instruction set.
+The experimental [execution call linkage](https://github.com/atgreen/evergreen/blob/main/docs/design/execution-call-linkage.md)
+control preserves entry-owner and redefinition checks. It is a prerequisite
+for sharing compiled artifacts; adapters and other installation state remain
+owned by each execution.
 See [Platform support](user/reference/platforms.md) and
 [Profiling and efficiency](profiling.md).
 

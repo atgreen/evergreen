@@ -412,6 +412,7 @@ fn execute_with_self_stack_bound(
             (
                 inst,
                 OrdinaryCallTarget {
+                    linkage_ordinal: None,
                     symbol: 77,
                     descriptor_slot: slot.as_ptr() as u64,
                     revision_address: revision.as_ptr() as u64,

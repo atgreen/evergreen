@@ -9,6 +9,8 @@ use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 pub struct OrdinaryCallTarget {
+    /// Resolve a current execution cell through R13; absolute slots are unused.
+    pub linkage_ordinal: Option<usize>,
     pub symbol: u32,
     /// Address of a slot populated only by checked ordinary publication.
     /// Descriptors are immutable and retained with their code through every
@@ -26,6 +28,15 @@ pub struct OrdinaryCallTarget {
     /// [`FUNCALL_FIRST_ARGUMENT`] selects the lean FUNCALL instead
     /// (bliss-gg3i1.7.15.10.3): the callee is the call's first argument.
     pub function_cell: u64,
+}
+
+impl OrdinaryCallTarget {
+    fn valid_linkage(&self) -> bool {
+        match self.linkage_ordinal {
+            Some(ordinal) => ordinal <= i32::MAX as usize / std::mem::size_of::<usize>(),
+            None => self.descriptor_slot != 0 && self.revision_address != 0,
+        }
+    }
 }
 
 /// `OrdinaryCallTarget::function_cell` of a call to the builtin FUNCALL: the
@@ -416,9 +427,7 @@ fn validate_entry(
             flags.signal_epoch,
         ]
         .contains(&0)
-        || targets
-            .iter()
-            .any(|target| target.descriptor_slot == 0 || target.revision_address == 0)
+        || targets.iter().any(|target| !target.valid_linkage())
         || crate::t2::verify::verify(f).is_err()
         || (0..f.num_values()).any(|v| f.value(Value(v as u32)).repr != ValueRepresentation::Tagged)
     {
@@ -815,8 +824,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         .next()
                         .ok_or(declined("call site without a call cell"))?;
                     if matches.next().is_some()
-                        || target.descriptor_slot == 0
-                        || target.revision_address == 0
+                        || !target.valid_linkage()
                         || data.args.len() > u16::MAX as usize
                         || data.results.len() > 1
                         || !data.flags.call
@@ -1106,6 +1114,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
     }
     // A call-free guarded function still needs native homes and guard control.
     let unused = OrdinaryCallTarget {
+        linkage_ordinal: None,
         symbol: 0,
         descriptor_slot: 0,
         revision_address: 0,
@@ -1367,8 +1376,18 @@ impl OrdinaryCallEmission<'_> {
             mov_imm64(a, SCRATCH, 0);
             self_stack_fixups.push(at + 2);
         } else {
-            mov_imm64(a, 11, self.target.descriptor_slot as i64);
-            load_mem64_disp(a, 11, 11, 0);
+            if let Some(ordinal) = self.target.linkage_ordinal {
+                emit_execution_cell(a, ordinal, cold);
+                load_mem64_disp(
+                    a,
+                    11,
+                    10,
+                    egcl_rt::call_table::CallCell::ORDINARY_ENTRY_OFFSET as i32,
+                );
+            } else {
+                mov_imm64(a, 11, self.target.descriptor_slot as i64);
+                load_mem64_disp(a, 11, 11, 0);
+            }
             alu_r_imm(a, 7, 11, 0);
             a.jcc(Cc::E, cold);
             for (offset, expected) in [
@@ -1395,8 +1414,19 @@ impl OrdinaryCallEmission<'_> {
                     a.jcc(Cc::Ne, cold);
                 }
             }
-            mov_imm64(a, SCRATCH, self.target.revision_address as i64);
-            load_mem64_disp(a, RAX, SCRATCH, 0);
+            if self.target.linkage_ordinal.is_some() {
+                // R10 still holds the first selected cell: descriptor guards
+                // use RAX/RDX and no call, poll or allocation intervenes.
+                load_mem64_disp(
+                    a,
+                    RAX,
+                    10,
+                    egcl_rt::call_table::CallCell::REVISION_OFFSET as i32,
+                );
+            } else {
+                mov_imm64(a, SCRATCH, self.target.revision_address as i64);
+                load_mem64_disp(a, RAX, SCRATCH, 0);
+            }
             cmp_mem64_disp8(
                 a,
                 RAX,
@@ -1426,10 +1456,23 @@ impl OrdinaryCallEmission<'_> {
         unsigned_branch(a, false, cold);
         cmp_mem64_disp8(a, RAX, 7, 88);
         unsigned_branch(a, true, cold);
-        if !self.direct_self && self.target.heat_slot != 0 {
+        if !self.direct_self
+            && (self.target.heat_slot != 0 || self.target.linkage_ordinal.is_some())
+        {
             let no_heat = a.label();
-            mov_imm64(a, 10, self.target.heat_slot as i64);
-            load_mem64_disp(a, 10, 10, 0);
+            if self.target.linkage_ordinal.is_some() {
+                // Stack admission also preserves R10; replace the cell with
+                // its heat metadata only after the revision check completes.
+                load_mem64_disp(
+                    a,
+                    10,
+                    10,
+                    egcl_rt::call_table::CallCell::ORDINARY_HEAT_OFFSET as i32,
+                );
+            } else {
+                mov_imm64(a, 10, self.target.heat_slot as i64);
+                load_mem64_disp(a, 10, 10, 0);
+            }
             alu_r_imm(a, 7, 10, 0);
             a.jcc(Cc::E, no_heat);
             load_mem64_disp(
@@ -1543,12 +1586,47 @@ impl OrdinaryCallEmission<'_> {
             (0, self.target.symbol as u64),
             (8, data.args.len() as u64),
             (24, egcl_rt::value::NIL.0),
-            (40, self.target.descriptor_slot),
-            (48, self.target.revision_address),
+            (
+                40,
+                if self.target.linkage_ordinal.is_some() {
+                    0
+                } else {
+                    self.target.descriptor_slot
+                },
+            ),
+            (
+                48,
+                if self.target.linkage_ordinal.is_some() {
+                    0
+                } else {
+                    self.target.revision_address
+                },
+            ),
             (56, u64::from(self.direct_self)),
         ] {
             mov_imm64(a, RAX, bits as i64);
             store_to_rsp(a, RAX, offset);
+        }
+        if let Some(ordinal) = self.target.linkage_ordinal {
+            let missing = a.label();
+            emit_execution_cell(a, ordinal, missing);
+            mov_rr(a, RAX, 10);
+            alu_r_imm(
+                a,
+                0,
+                RAX,
+                egcl_rt::call_table::CallCell::ORDINARY_ENTRY_OFFSET as i32,
+            );
+            store_to_rsp(a, RAX, 40);
+            mov_rr(a, RAX, 10);
+            alu_r_imm(
+                a,
+                0,
+                RAX,
+                egcl_rt::call_table::CallCell::REVISION_OFFSET as i32,
+            );
+            store_to_rsp(a, RAX, 48);
+            a.bind(missing);
         }
         mov_rr(a, RAX, 4);
         alu_r_imm(a, 0, RAX, (base * 8 + 64) as i32);
@@ -1570,6 +1648,44 @@ impl OrdinaryCallEmission<'_> {
             .chain(std::iter::once(slow))
             .collect())
     }
+}
+
+/// Load this R13 execution's cell into R10, or branch to an existing cold
+/// continuation. One view load pairs immutable bounds with retained backing.
+/// Clobbers RAX/R10 only; never calls, polls, or allocates.
+fn emit_execution_cell(a: &mut Asm, ordinal: usize, missing: egcl_rt::asm::Label) {
+    use egcl_rt::call_table::{ExecutionCallLinkage, ExecutionCallView};
+    load_mem64_disp(
+        a,
+        10,
+        13,
+        egcl_rt::exec_context::offsets::CALL_LINKAGE as i32,
+    );
+    load_mem64_disp(a, 10, 10, ExecutionCallLinkage::VIEW_OFFSET as i32);
+    alu_r_imm(a, 7, 10, 0);
+    a.jcc(Cc::E, missing);
+    mov_imm64(a, RAX, ordinal as i64);
+    cmp_mem64_disp8(
+        a,
+        RAX,
+        10,
+        std::mem::offset_of!(ExecutionCallView, len) as u8,
+    );
+    a.jcc(Cc::Ae, missing);
+    load_mem64_disp(
+        a,
+        10,
+        10,
+        std::mem::offset_of!(ExecutionCallView, slots) as i32,
+    );
+    load_mem64_disp(
+        a,
+        10,
+        10,
+        i32::try_from(ordinal.checked_mul(8).unwrap()).unwrap(),
+    );
+    alu_r_imm(a, 7, 10, 0);
+    a.jcc(Cc::E, missing);
 }
 
 /// The lean named call (bliss-gg3i1.7.15.10.1). Arguments are already in the
@@ -2017,3 +2133,69 @@ mod join_return_tests {
         assert!(duplicate_join_returns(&f).is_none());
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+mod execution_linkage_tests {
+    use super::*;
+    use egcl_rt::call_table::CallCell;
+    use egcl_rt::exec_context::{ExecutionKind, LispExecutionContext};
+    use std::sync::Arc;
+
+    #[test]
+    fn one_native_selector_uses_current_context_across_empty_growth_and_carrier_reassignment() {
+        let mut a = Asm::new();
+        let missing = a.label();
+        a.extend_from_slice(&[0x41, 0x55]); // preserve r13
+        a.extend_from_slice(&[0x49, 0x89, 0xfd]); // r13 = context argument
+        emit_execution_cell(&mut a, 7, missing);
+        mov_rr(&mut a, RAX, 10);
+        a.extend_from_slice(&[0x41, 0x5d, 0xc3]);
+        a.bind(missing);
+        mov_imm64(&mut a, RAX, 0);
+        a.extend_from_slice(&[0x41, 0x5d, 0xc3]);
+        let bytes = a.finish().unwrap();
+        let code = egcl_rt::jit::JitBuffer::new(&bytes).unwrap();
+        // SAFETY: generated code takes a live context pointer, preserves R13,
+        // and only reads retained linkage metadata; it never calls or allocates.
+        let select: extern "C" fn(&LispExecutionContext) -> usize =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+        let first = LispExecutionContext::new(ExecutionKind::Fiber, 1, 1);
+        let second = LispExecutionContext::new(ExecutionKind::Fiber, 2, 1);
+        assert_eq!(select(&first), 0, "empty view");
+        first
+            .call_linkage()
+            .install(Arc::new(CallCell::new(0, 1, 1)));
+        assert_eq!(select(&first), 0, "null slot within capacity");
+        let one = Arc::new(CallCell::new(7, 1, 1));
+        let two = Arc::new(CallCell::new(7, 1, 1));
+        first.call_linkage().install(Arc::clone(&one));
+        second.call_linkage().install(Arc::clone(&two));
+        assert_eq!(select(&first), Arc::as_ptr(&one) as usize);
+        assert_eq!(select(&second), Arc::as_ptr(&two) as usize);
+        first
+            .call_linkage()
+            .install(Arc::new(CallCell::new(1024, 1, 1)));
+        first.set_carrier_id(9);
+        assert_eq!(select(&first), Arc::as_ptr(&one) as usize);
+        assert_eq!(select(&second), Arc::as_ptr(&two) as usize);
+        for cell in [&one, &two] {
+            for pointer in [
+                Arc::as_ptr(cell) as usize,
+                cell.ordinary_entry_address() as usize,
+                cell.revision_address() as usize,
+                cell.ordinary_heat_address() as usize,
+            ] {
+                assert!(
+                    !bytes
+                        .windows(8)
+                        .any(|window| window == pointer.to_le_bytes()),
+                    "selector must contain no execution cell address"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "ordinary_call_migration_test.rs"]
+mod execution_linkage_migration_test;

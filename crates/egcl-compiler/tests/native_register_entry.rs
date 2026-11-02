@@ -433,6 +433,7 @@ fn ordinary_call_crosses_code_owners_with_exact_native_maps() {
         signal_epoch: words[2].as_ptr() as u64,
     };
     let target = OrdinaryCallTarget {
+        linkage_ordinal: None,
         symbol: 77,
         descriptor_slot: &slot as *const _ as u64,
         revision_address: &revision as *const _ as u64,
@@ -826,6 +827,7 @@ fn ordinary_two_calls_normalize_zero_before_distinct_second_target_and_forward_t
         .map(|d| AtomicUsize::new(d as *const _ as usize));
     let revisions = [AtomicU64::new(7), AtomicU64::new(7)];
     let targets = std::array::from_fn(|i| OrdinaryCallTarget {
+        linkage_ordinal: None,
         symbol: [77, 88][i],
         descriptor_slot: slots[i].as_ptr() as u64,
         revision_address: revisions[i].as_ptr() as u64,
@@ -922,6 +924,7 @@ fn ordinary_two_calls_reject_missing_reset_targets_and_other_shapes() {
         signal_epoch: 1,
     };
     let targets = [77, 88].map(|symbol| OrdinaryCallTarget {
+        linkage_ordinal: None,
         symbol,
         descriptor_slot: 1,
         revision_address: 1,
