@@ -11106,11 +11106,11 @@ pub(super) fn optional_range(body: &BytecodeFunction) -> bool {
 /// ```
 ///
 /// The rename moves each dynamic binding after the evaluation of every later
-/// default form. That is only unobservable when those forms cannot read a
-/// renamed special, so a later default that is not a constant, a QUOTE or
-/// FUNCTION form, or a variable other than an already-renamed special declines
-/// the rewrite. Returns `Ok(None)` when no parameter is special, and `Err` when
-/// one is but the rewrite would be unsound (the caller keeps its bail).
+/// default form. A later variable or FUNCTION lookup can signal to a live
+/// condition handler, or hide a symbol-macro read of the renamed special.
+/// Admit only self-evaluating literals and QUOTE after any renamed binding;
+/// all other later defaults keep the original binder. Returns `Ok(None)` when
+/// no parameter is special, and `Err` when the rewrite would be unsound.
 fn special_parameter_rewrite(
     params_form: EgclVal,
     body: EgclVal,
@@ -11125,12 +11125,12 @@ fn special_parameter_rewrite(
     }
     // An init form evaluated after a renamed special was (originally) bound
     // must not be able to observe that binding. Read-only.
-    fn init_safe(form: EgclVal, renamed_names: &[String]) -> bool {
-        if renamed_names.is_empty() {
+    fn init_safe(form: EgclVal, after_special: bool) -> bool {
+        if !after_special {
             return true;
         }
         if form.is_symbol() {
-            return form.is_nil() || form == T || !renamed_names.contains(&var_name(form));
+            return form.is_nil() || form == T || super::is_keyword_arg(form);
         }
         if !form.is_cons() {
             return true;
@@ -11139,17 +11139,7 @@ fn special_parameter_rewrite(
         if !op.is_symbol() || !rest.is_cons() || !cp(rest).1.is_nil() {
             return false;
         }
-        match &*super::sym_name_rc(op) {
-            "QUOTE" => true,
-            "FUNCTION" => {
-                let target = cp(rest).0;
-                target.is_symbol()
-                    || (target.is_cons()
-                        && cp(target).0.is_symbol()
-                        && super::sym_name_rc(cp(target).0).as_ref() == "SETF")
-            }
-            _ => false,
-        }
+        super::sym_name_rc(op).as_ref() == "QUOTE"
     }
     if !lambda_list_names_special(params_form) {
         return Ok(None);
@@ -11160,21 +11150,18 @@ fn special_parameter_rewrite(
     // Flattened (special, fresh) pairs, in binding order. Symbols are
     // immediates, but keep the vector rooted like its siblings.
     egcl_rt::rooted!(renamed = Vec::<EgclVal>::new());
-    let mut renamed_names: Vec<String> = Vec::new();
     let mut counter = 0usize;
     // Rename `var` if it is special; returns the symbol to use in its place.
-    let mut rename =
-        |var: EgclVal, renamed: &mut Vec<EgclVal>, renamed_names: &mut Vec<String>| -> EgclVal {
-            if !special_lambda_variable(var) {
-                return var;
-            }
-            let fresh =
-                egcl_rt::symbols::make_uninterned(&format!("%EGCL-SPECIAL-PARAMETER-{counter}"));
-            counter += 1;
-            renamed.extend([var, fresh]);
-            renamed_names.push(var_name(var));
-            fresh
-        };
+    let mut rename = |var: EgclVal, renamed: &mut Vec<EgclVal>| -> EgclVal {
+        if !special_lambda_variable(var) {
+            return var;
+        }
+        let fresh =
+            egcl_rt::symbols::make_uninterned(&format!("%EGCL-SPECIAL-PARAMETER-{counter}"));
+        counter += 1;
+        renamed.extend([var, fresh]);
+        fresh
+    };
     let mut mode = Mode::Req;
     for index in 0..params.len() {
         let item = params[index];
@@ -11200,7 +11187,7 @@ fn special_parameter_rewrite(
                 if !item.is_symbol() || item.is_nil() {
                     return Err(());
                 }
-                let fresh = rename(item, &mut renamed, &mut renamed_names);
+                let fresh = rename(item, &mut renamed);
                 new_params.push(fresh);
             }
             Mode::Opt | Mode::Aux | Mode::Key => {
@@ -11226,15 +11213,15 @@ fn special_parameter_rewrite(
                 if !var.is_symbol() || var.is_nil() {
                     return Err(());
                 }
-                if spec.len() > 1 && !init_safe(spec[1], &renamed_names) {
+                if spec.len() > 1 && !init_safe(spec[1], !renamed.is_empty()) {
                     return Err(());
                 }
-                let fresh = rename(var, &mut renamed, &mut renamed_names);
+                let fresh = rename(var, &mut renamed);
                 let supplied = if spec.len() == 3 {
                     if !spec[2].is_symbol() || spec[2].is_nil() {
                         return Err(());
                     }
-                    Some(rename(spec[2], &mut renamed, &mut renamed_names))
+                    Some(rename(spec[2], &mut renamed))
                 } else {
                     None
                 };

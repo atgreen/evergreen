@@ -221,3 +221,31 @@ fn special_parameters_survive_gc_stress() {
         assert_eq!(result_line(tier, &out), expected, "tier {tier:?}:\n{out}");
     }
 }
+
+/// A later lookup may signal before the body, or expand to a read of an
+/// earlier special. Both defaults must retain the original dynamic binder.
+#[test]
+fn later_symbol_defaults_keep_live_dynamic_bindings() {
+    let program = r#"(progn
+      (defvar *sp-observe* :outer)
+      (define-symbol-macro sp-hidden *sp-observe*)
+      (defun sp-symbol-macro (*sp-observe* &optional (value sp-hidden)) value)
+      (defun sp-unbound (*sp-observe* &optional (value sp-missing)) value)
+      (dotimes (i 30) (sp-symbol-macro :warm :supplied) (sp-unbound :warm :supplied))
+      (format t "RESULT ~S~%"
+        (list (sp-symbol-macro :inner)
+              (block observed
+                (handler-bind ((unbound-variable (lambda (condition)
+                                 (declare (ignore condition))
+                                 (return-from observed *sp-observe*))))
+                  (sp-unbound :inner)))
+              *sp-observe*)))"#;
+    for tier in TIERS {
+        let (out, _) = run(tier, program, &[("EGCL_T2_THRESHOLD", "50")]);
+        assert_eq!(
+            result_line(tier, &out),
+            "RESULT (:INNER :INNER :OUTER)",
+            "{out}"
+        );
+    }
+}

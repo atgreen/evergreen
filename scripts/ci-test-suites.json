@@ -23,6 +23,8 @@
     "egcl:test:closure_owner_churn_cli": [""],
     "egcl:test:closure_entry_cli": [""],
     "egcl:test:lambda_list_entries_cli": [""],
+    "egcl:test:special_parameter_entry_cli": [""],
+    "egcl:test:treewalker_exit_cli": [""],
     "egcl-compiler:test:native_current_callable": [""],
     "egcl:test:static_foreign_manifest": [""],
     "egcl-rt:test:ffi_static_libraries": [""],
