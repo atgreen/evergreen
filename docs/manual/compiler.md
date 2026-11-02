@@ -285,7 +285,7 @@ not a portable Common Lisp interface, and many are read once.
 | --- | --- |
 | `EGCL_BACKEND=tree-walker` | Compare against the tree-walking execution path |
 | `EGCL_LAZY_COMPILE=0` | Request eager bytecode compilation rather than lazy compilation |
-| `EGCL_FASL_EAGER_T1=1` | Compile named FASL-loaded functions and their nested closure templates to T1 before continuing the load; off by default |
+| `EGCL_FASL_EAGER_T1=1` | Compile named FASL-loaded functions and portable nested closure templates to T1 during load; off by default |
 | `EGCL_DISABLE_LET_DEFUN_COMPILATION=1` | Compare top-level lexical `DEFUN` creators against their original execution path |
 | `EGCL_T1_THRESHOLD` | Override the T1 invocation threshold |
 | `EGCL_T2_THRESHOLD` | Compatibility override for the T2 invocation threshold |
@@ -294,10 +294,15 @@ not a portable Common Lisp interface, and many are read once.
 | `EGCL_R13_CALL_LINKAGE=1` | Resolve ordinary x86-64 Linux call metadata through the current execution context; disabled by default |
 | `EGCL_EXECUTION_T1_HEAT=1` | Keep T1 sampling countdowns in the current execution on x86-64 Linux; disabled by default |
 
-Eager FASL compilation covers each installed named bytecode definition and the
-closure templates reachable through its nested-function graph. Templates share
-one compiled body across later instances; preparing them runs no Lisp body or
+Eager FASL compilation covers each installed named bytecode definition and
+reusable closure templates in portable loaded function, macro, compiler-macro,
+setf-expander, restart-clause and load-thunk subgraphs. Templates share one
+compiled body across later instances; preparing them runs no Lisp body or
 lambda-list default and does not create an instance or captured environment.
+Expander and restart-clause roots retain their existing binding and execution
+paths; one-shot load thunks retain their existing execution path and order.
+Only their reusable nested closure templates receive this eager preparation.
+Source-fallback actions are excluded.
 This trades extra load time and executable memory for native code on the first
 call. It uses the normal T1 compiler and publication checks; a declined function
 remains executable as bytecode. It does not manufacture
