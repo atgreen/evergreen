@@ -38,13 +38,10 @@ fn rest_probe(caller: u32, caller_code: &NativeCode, env: &mut Env) -> usize {
     let mut moved = 0;
     for i in 0..4 {
         egcl_rt::HeapCollector::new().minor_gc().unwrap();
-        egcl_rt::rooted!(
-            args = vec![
-                crate::cli::arena_cons(EgclVal::from_fixnum(i), NIL),
-                crate::cli::arena_cons(EgclVal::from_fixnum(i + 10), NIL),
-                crate::cli::arena_cons(EgclVal::from_fixnum(i + 20), NIL),
-            ]
-        );
+        egcl_rt::rooted!(args = Vec::with_capacity(3));
+        args.push(crate::cli::arena_cons(EgclVal::from_fixnum(i), NIL));
+        args.push(crate::cli::arena_cons(EgclVal::from_fixnum(i + 10), NIL));
+        args.push(crate::cli::arena_cons(EgclVal::from_fixnum(i + 20), NIL));
         let before = args[0].to_raw();
         // A runtime T0 allocation republishes the generated-code window the
         // collection retired, as the next allocation of a running program would.
