@@ -4,6 +4,10 @@
 
 ### Added
 
+- With eager FASL compilation enabled, prepare reusable closure templates
+  throughout portable loaded function graphs
+  ([#986](https://github.com/atgreen/evergreen/pull/986)).
+
 - Compile escaped closures that reference captured local functions through
   direct calls or `FUNCTION`, preserving definition-site namespace identity
   ([#985](https://github.com/atgreen/evergreen/pull/985)).
