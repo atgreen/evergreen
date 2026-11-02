@@ -1117,6 +1117,7 @@ mod retained_guard_chain_tests {
                 (
                     inst,
                     emit::OrdinaryCallTarget {
+                        linkage_ordinal: None,
                         symbol,
                         descriptor_slot: 1,
                         heat_slot: 1,

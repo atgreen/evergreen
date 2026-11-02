@@ -178,6 +178,7 @@ fn exercise(clear_between: bool) {
             (
                 site,
                 OrdinaryCallTarget {
+                    linkage_ordinal: None,
                     symbol: 71 + i as u32,
                     descriptor_slot: slots[i].as_ptr() as u64,
                     revision_address: revisions[i].as_ptr() as u64,

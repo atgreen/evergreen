@@ -196,6 +196,7 @@ fn ordinary_tail_reuses_frame_and_preserves_moves_depth_and_result_descriptor() 
         signal_epoch: words[2].as_ptr() as u64,
     };
     let target = OrdinaryCallTarget {
+        linkage_ordinal: None,
         symbol: 77,
         descriptor_slot: &slot as *const _ as u64,
         revision_address: &revision as *const _ as u64,
