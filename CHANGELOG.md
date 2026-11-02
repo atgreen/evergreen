@@ -464,7 +464,7 @@
   packed vectors with one memmove: filling a 10,000-bit vector went from
   30 ms to 12 us. SYMBOL-PACKAGE, STRING and SYMBOL-NAME of a symbol,
   FIND-SYMBOL and GET do less work per call; SYMBOL-PACKAGE's own work fell
-  about ninefold ([#NNN](https://github.com/atgreen/evergreen/pull/NNN)).
+  about ninefold ([#976](https://github.com/atgreen/evergreen/pull/976)).
 
 - EQUAL and EQUALP hash tables and SXHASH hash every element of a list, to a
   bounded nesting depth and total length, instead of only its first few, so
