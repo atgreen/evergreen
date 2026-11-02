@@ -414,6 +414,17 @@ pub(super) fn emit_native(
                 helper(&mut a, c2i_alloc_cons as *const () as u64, exit);
                 push(&mut a);
             }
+            Instr::MakeClosure { func, capture_env } => {
+                // Retain the exact nested body through the executing NativeCode,
+                // independently of later rebinding of its public function name.
+                // No Lisp value leaves its GC-scanned activation slot here;
+                // the shared adapter roots the created closure before returning.
+                let nested = bf.nested_functions.get(func as usize)?;
+                a.imm64(A0, std::ptr::from_ref(nested) as u64);
+                a.imm64(A1, u64::from(capture_env));
+                helper(&mut a, c2i_make_bytecode_closure as *const () as u64, exit);
+                push(&mut a);
+            }
             Instr::EvalHost(k) | Instr::MakeClosureEnv(k) => {
                 a.imm64(A0, bf.constants.get(k as usize)? as *const EgclVal as u64);
                 a.load(A0, A0, 0);
@@ -496,6 +507,7 @@ pub(super) fn emit_native(
 #[cfg(test)]
 mod tests {
     use super::super::*;
+    use egcl_rt::Collector;
 
     fn install(name: &str, source: &str, env: &Env) -> (u32, Rc<NativeCode>) {
         let symbol = egcl_rt::symbols::intern(name);
@@ -631,6 +643,116 @@ mod tests {
             );
         }
         registry_remove(symbol);
+    }
+
+    #[test]
+    fn riscv64_native_makeclosure_retains_exact_body_and_captured_locations() {
+        let _lock = crate::cli::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        for capture in [false, true] {
+            let name = if capture {
+                "RISCV64-CAPTURED-CREATOR"
+            } else {
+                "RISCV64-PLAIN-CREATOR"
+            };
+            let symbol = egcl_rt::symbols::intern(name);
+            egcl_rt::rooted!(params = reader::read_from_string("(held)").unwrap().0);
+            egcl_rt::rooted!(
+                forms = reader::read_from_string(if capture {
+                    "((lambda (next) (if next (setq held next) held)))"
+                } else {
+                    "((lambda (next) 37))"
+                })
+                .unwrap()
+                .0
+            );
+            let body =
+                Arc::new(compile_function(name, *params, *forms, &env, false, false).unwrap());
+            assert!(body.code.iter().any(|op| matches!(op,
+                Instr::MakeClosure { capture_env, .. } if *capture_env == capture)));
+            registry_put(symbol, Arc::clone(&body));
+            let native =
+                try_promote_to_t1(symbol).expect("MakeClosure creator must install RV64 T1");
+            assert!(
+                !native.is_t2 && !native.has_deopt,
+                "fixture must execute T1 without interpreter recovery"
+            );
+            assert!(Arc::ptr_eq(native.body.as_ref().unwrap(), &body));
+            // imm64 emits a small address directly or loads a larger one
+            // from its literal pool. Observe the helper target in either form.
+            let bytes = unsafe { std::slice::from_raw_parts(native.entry, native.code_len) };
+            let address = c2i_make_bytecode_closure as *const () as u64;
+            let needle = if i32::try_from(address as i64).is_ok() {
+                let mut call = egcl_rt::asm_riscv64::Asm::new();
+                call.imm64(egcl_rt::asm_riscv64::reg::T0, address);
+                call.call_reg(egcl_rt::asm_riscv64::reg::T0);
+                call.finish().unwrap()
+            } else {
+                address.to_le_bytes().to_vec()
+            };
+            assert!(bytes.windows(needle.len()).any(|window| window == needle));
+            egcl_rt::rooted!(first_value = crate::cli::arena_cons(EgclVal::from_fixnum(17), NIL));
+            egcl_rt::rooted!(second_value = crate::cli::arena_cons(EgclVal::from_fixnum(29), NIL));
+            egcl_rt::rooted!(
+                first = run_native(&native, symbol, &[*first_value], &mut env).unwrap()
+            );
+            egcl_rt::rooted!(
+                second = run_native(&native, symbol, &[*second_value], &mut env).unwrap()
+            );
+            egcl_rt::HeapCollector::new().minor_gc().unwrap();
+            egcl_rt::rooted!(
+                expected = if capture {
+                    *first_value
+                } else {
+                    EgclVal::from_fixnum(37)
+                }
+            );
+            egcl_rt::rooted!(actual = apply_function(*first, &[NIL], &mut env).unwrap());
+            assert_eq!(*actual, *expected);
+            if capture {
+                assert_eq!(
+                    apply_function(*first, &[EgclVal::from_fixnum(41)], &mut env).unwrap(),
+                    EgclVal::from_fixnum(41)
+                );
+                assert_eq!(
+                    apply_function(*first, &[NIL], &mut env).unwrap(),
+                    EgclVal::from_fixnum(41)
+                );
+                assert_eq!(
+                    apply_function(*second, &[NIL], &mut env).unwrap(),
+                    *second_value
+                );
+                assert_ne!(
+                    *first, *second,
+                    "each activation creates a distinct closure"
+                );
+            }
+            // Replace the registry's current body. The old native installation
+            // must still build its original nested function, not the replacement.
+            egcl_rt::rooted!(
+                replacement = reader::read_from_string("((lambda (next) :replacement))")
+                    .unwrap()
+                    .0
+            );
+            let newer = compile_function(name, *params, *replacement, &env, false, false).unwrap();
+            registry_put(symbol, Arc::new(newer));
+            egcl_rt::rooted!(
+                retained = run_native(&native, symbol, &[*first_value], &mut env).unwrap()
+            );
+            egcl_rt::rooted!(
+                expected = if capture {
+                    *first_value
+                } else {
+                    EgclVal::from_fixnum(37)
+                }
+            );
+            egcl_rt::rooted!(actual = apply_function(*retained, &[NIL], &mut env).unwrap());
+            assert_eq!(*actual, *expected);
+            registry_remove(symbol);
+        }
     }
 
     #[test]
