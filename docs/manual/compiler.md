@@ -317,7 +317,7 @@ Installed definitions keep their public function names without renaming shared
 closure prototypes or changing their private code identities.
 
 A threshold does not expand the target backend's supported instruction set.
-The experimental [execution call linkage](../design/execution-call-linkage.md)
+The experimental [execution call linkage](https://github.com/atgreen/evergreen/blob/main/docs/design/execution-call-linkage.md)
 control preserves entry-owner and redefinition checks. It is a prerequisite
 for sharing compiled artifacts; adapters and other installation state remain
 owned by each execution.
