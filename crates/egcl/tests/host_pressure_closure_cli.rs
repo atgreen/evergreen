@@ -5,24 +5,39 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// Closures the loop creates: enough that dead ones left unreclaimed until the
+/// heap is exhausted would push the process far past `PEAK_RSS_LIMIT`.
+const CLOSURES: u64 = 2_000_000;
+/// Every 100,000th closure escapes into a list and must stay callable.
+const KEEP_EVERY: u64 = 100_000;
+/// Measured peak RSS is about 60 MB (captured frames) and 75-90 MB (heap
+/// environments) when dead closures are reclaimed; leaving them all to the
+/// final collection measured over 300 MB at this count.
+const PEAK_RSS_LIMIT: usize = 256 * 1024 * 1024;
+
 fn closure_pressure_keeps_escaped_values(binding: &str) {
     let helper = if binding == "labels" {
         "(if (zerop n) x (f (1- n)))"
     } else {
         "(progn n x)"
     };
+    // Each closure answers its own X: the loop sums 0..CLOSURES, and the
+    // escaped ones sum the multiples of KEEP_EVERY below CLOSURES.
+    let sum = CLOSURES * (CLOSURES - 1) / 2;
+    let kept = CLOSURES / KEEP_EVERY;
+    let kept_sum = KEEP_EVERY * kept * (kept - 1) / 2;
     let program = format!(
         r#"
 (format *error-output* "HOST-PRESSURE-WORKLOAD-BEGIN~%")
 (let ((sum 0) (kept '()))
-  (dotimes (i 600000)
+  (dotimes (i {CLOSURES})
     (let ((x i))
       ({binding} ((f (n) {helper}))
         (incf sum (f 1))
-        (when (zerop (mod i 100000)) (push #'f kept)))))
-  (assert (= sum 179999700000))
-  (assert (= (length kept) 6))
-  (assert (= (reduce #'+ (mapcar (lambda (f) (funcall f 1)) kept)) 1500000))
+        (when (zerop (mod i {KEEP_EVERY})) (push #'f kept)))))
+  (assert (= sum {sum}))
+  (assert (= (length kept) {kept}))
+  (assert (= (reduce #'+ (mapcar (lambda (f) (funcall f 1)) kept)) {kept_sum}))
   (format t "REGISTRY ~D~%" (first (egcl::%bc-registry-sizes)))
   (format t "HOST-PRESSURE-LIVENESS-OK~%"))
 (format *error-output* "HOST-PRESSURE-WORKLOAD-END~%")
@@ -69,9 +84,9 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
             })
         {
             peak_rss = peak_rss.max(kib * 1024);
-            // Bound the complete process as well as the retained registry;
-            // this is a regression safety bound, not the policy's heap limit.
-            if peak_rss > 768 * 1024 * 1024 {
+            // Dead closures must be reclaimed while the loop runs, not left
+            // for the heap to fill: bound the whole process.
+            if peak_rss > PEAK_RSS_LIMIT {
                 exceeded_limit = true;
                 child.kill().unwrap();
                 break child.wait().unwrap();
@@ -89,14 +104,23 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
         "{binding}: peak RSS {peak_rss} bytes; status {status}\n{stdout}\n{stderr}"
     );
     assert!(stdout.contains("HOST-PRESSURE-LIVENESS-OK"), "{stdout}");
+    // Closures with a captured frame own host-side state, tracked as host
+    // bytes; heap-environment closures (Backpack) own none, and their pinned
+    // function objects are counted instead. Either must request the major
+    // collections that free dead closures during the workload.
     let requests_during_workload = stderr
         .split_once("HOST-PRESSURE-WORKLOAD-BEGIN")
         .and_then(|(_, tail)| tail.split_once("HOST-PRESSURE-WORKLOAD-END"))
-        .map(|(workload, _)| workload.matches("request-major reason=host-bytes").count())
+        .map(|(workload, _)| {
+            workload.matches("request-major reason=host-bytes").count()
+                + workload
+                    .matches("request-major reason=pinned-closures")
+                    .count()
+        })
         .unwrap_or(0);
     assert!(
         requests_during_workload > 0,
-        "tracked host-byte pressure never requested a major collection during the workload\n{stderr}"
+        "closure pressure never requested a major collection during the workload\n{stderr}"
     );
     assert!(
         !stderr.contains("request-major reason=legacy-count"),
@@ -111,11 +135,11 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
         .parse()
         .unwrap();
     eprintln!(
-        "{binding}: host-byte requests {requests_during_workload}, registry {registry}, peak RSS {peak_rss}"
+        "{binding}: major requests {requests_during_workload}, registry {registry}, peak RSS {peak_rss}"
     );
     assert!(
         registry < 300000,
-        "{binding}: retained {registry} entries after 600000 closures; peak RSS {peak_rss}\n{stdout}"
+        "{binding}: retained {registry} entries after {CLOSURES} closures; peak RSS {peak_rss}\n{stdout}"
     );
 }
 

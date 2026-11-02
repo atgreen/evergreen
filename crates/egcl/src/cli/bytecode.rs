@@ -17342,11 +17342,40 @@ fn make_template_closure(
     closure_templates::make_instance(nested, captured_env, control, control_free)
 }
 
+/// Heap-environment closure instances (Backpack) own no host-side state, so
+/// the host-byte ledger that schedules a major collection for closures with a
+/// captured frame never sees them. Each is still a pinned function object
+/// that only a major collection frees: request one after every
+/// `MIN_PRIVATE_HOST_GROWTH` bytes of such instances created since the
+/// pinned-function epoch last advanced, so dead closures do not accumulate
+/// until the heap is exhausted.
+fn note_heap_closure_instance() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    let epoch = egcl_rt::gc::pinned_function_epoch();
+    if EPOCH.swap(epoch, Ordering::Relaxed) != epoch {
+        BYTES.store(0, Ordering::Relaxed);
+    }
+    let size = std::mem::size_of::<egcl_rt::object::FunctionData>();
+    let bytes = BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    if bytes >= MIN_PRIVATE_HOST_GROWTH {
+        BYTES.store(0, Ordering::Relaxed);
+        egcl_rt::gc::request_major_gc();
+        if std::env::var_os("EGCL_GC_CENSUS").is_some() {
+            eprintln!(
+                "[GC-CENSUS] request-major reason=pinned-closures bytes={bytes} source=heap-env-closures"
+            );
+        }
+    }
+}
+
 /// A fresh instance of `nested` for a heap-environment closure (Backpack):
 /// it owns no lexical frame, only the control scope a free exit needs, and
 /// never shares the template prototype, since its caller attaches the
 /// captured environment to it.
 fn make_heap_closure_instance(nested: &Arc<BytecodeFunction>, env: &Env) -> EgclVal {
+    note_heap_closure_instance();
     let control_free = closure_templates::control_free(nested);
     let scope_empty = env.block_stack.is_empty() && env.tag_stack.is_empty();
     let control =
