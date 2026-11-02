@@ -6408,9 +6408,35 @@ impl<'e> Lowerer<'e> {
             resolve_sym(&format!("%LG-{tag}{id}_{}", *nsym)).ok_or(Bail)
         };
 
+        // `for A ... and B ...` steps A and B in parallel (CLHS 6.1.2.1). The
+        // drivers below bind with LET* and step in order, which gives the same
+        // result exactly when no clause of the group reads a variable another
+        // clause of the group sets, so an AND-joined clause is lowered as the
+        // next FOR once that has been checked; anything else is the
+        // tree-walker's. Babel's single-byte encoders and decoders step
+        // `for i fixnum from start below end and di fixnum from d-start`, and
+        // one such loop sent babel's whole encoding table to the tree-walker.
+        let mut for_group: Vec<(usize, usize)> = Vec::new();
+        let mut group_pre_start = 0;
+        let mut joined_by_and = false;
         let mut i = 0;
         while i < forms.len() {
             let key = kw(forms[i]);
+            if key.as_deref() == Some("AND") {
+                if for_group.is_empty() || joined_by_and {
+                    return Err(Bail);
+                }
+                forms[i] = s("FOR")?;
+                joined_by_and = true;
+                continue;
+            }
+            let is_for = matches!(key.as_deref(), Some("FOR") | Some("AS"));
+            if !is_for || !joined_by_and {
+                for_group.clear();
+                joined_by_and = false;
+            }
+            let clause_start = i;
+            let pre_at_clause = pre.len();
             match key.as_deref() {
                 Some("WITH") => {
                     // with VAR [TYPE] [= EXPR] {and VAR [TYPE] [= EXPR]}*
@@ -6835,6 +6861,70 @@ impl<'e> Lowerer<'e> {
                     body.extend(acc_forms.iter().copied());
                 }
                 _ => return Err(Bail),
+            }
+            if is_for {
+                let span = (clause_start, i);
+                if for_group.is_empty() {
+                    group_pre_start = pre_at_clause;
+                }
+                if joined_by_and {
+                    // Only arithmetic drivers, whose parallel stepping is
+                    // reproduced below; `in`/`on`/`=` drivers order their
+                    // stepping and end tests differently.
+                    let numeric = |&(start, _): &(usize, usize)| {
+                        matches!(
+                            forms.get(start + 2).copied().and_then(kw).as_deref(),
+                            Some("FROM" | "UPFROM" | "DOWNFROM")
+                        )
+                    };
+                    // A name-only dependency check cannot see a driver
+                    // expression's calls or symbol-macro expansion observing
+                    // another variable's new binding. Keep those on the
+                    // interpreter's parallel binder rather than serializing
+                    // their initialization through our LET*.
+                    let simple_driver = |&(start, end): &(usize, usize)| {
+                        let variable = forms[start + 1];
+                        if !variable.is_symbol() || variable.is_nil() || variable == T {
+                            return false;
+                        }
+                        let name = var_name(variable);
+                        // Even a signaling atom could expose a prematurely
+                        // bound special to a live condition handler.
+                        !is_special_name(&name)
+                            && !self.declared_special.contains_key(&name)
+                            && forms[start + 2..end].iter().all(|form| {
+                                !form.is_cons()
+                                    && (!form.is_symbol()
+                                        || form.is_nil()
+                                        || *form == T
+                                        || !self.env.has_symbol_macro(form.as_symbol_index()))
+                            })
+                    };
+                    if !numeric(&span)
+                        || !for_group.iter().all(numeric)
+                        || !simple_driver(&span)
+                        || !for_group.iter().all(simple_driver)
+                        || !loop_and_clauses_independent(&forms, &for_group, span)
+                    {
+                        return Err(record_bail(|| "loop:and-clause".to_string()));
+                    }
+                    // Every variable of the group takes its stepped value
+                    // before any of the group's end tests runs, so the
+                    // iteration that ends the loop still steps them all for
+                    // FINALLY: (loop for i below 3 and j from 10 finally
+                    // (return j)) is 13, as in SBCL. Move the publishing
+                    // SETQs ahead of the tests, keeping each kind in order.
+                    let is_setq = |f: &EgclVal| {
+                        f.is_cons()
+                            && cp(*f).0.is_symbol()
+                            && sym_bare_name_rc(cp(*f).0).as_ref() == "SETQ"
+                    };
+                    let segment: Vec<EgclVal> = pre.drain(group_pre_start..).collect();
+                    pre.extend(segment.iter().copied().filter(is_setq));
+                    pre.extend(segment.iter().copied().filter(|f| !is_setq(f)));
+                }
+                for_group.push(span);
+                joined_by_and = false;
             }
         }
 
@@ -10625,6 +10715,32 @@ fn compile_restart_clause(
         variadic,
         binder_cache: Default::default(),
         closure_template: Default::default(),
+    })
+}
+
+/// Whether the LOOP `for` clause at `span` (a `forms` index range starting at
+/// its FOR keyword, the variable at `start + 1`) may be stepped after the
+/// clauses at `group` rather than in parallel with them: neither reads a
+/// variable the other sets.
+fn loop_and_clauses_independent(
+    forms: &[EgclVal],
+    group: &[(usize, usize)],
+    span: (usize, usize),
+) -> bool {
+    let names = |from: usize, to: usize| {
+        let mut out = std::collections::HashSet::new();
+        for &form in forms.get(from..to).unwrap_or(&[]) {
+            collect_variable_names(form, &mut out);
+        }
+        out
+    };
+    let (start, end) = span;
+    let vars = names(start + 1, start + 2);
+    let reads = names(start + 2, end);
+    group.iter().all(|&(g_start, g_end)| {
+        let g_vars = names(g_start + 1, g_start + 2);
+        let g_reads = names(g_start + 2, g_end);
+        g_vars.is_disjoint(&reads) && vars.is_disjoint(&g_reads) && vars.is_disjoint(&g_vars)
     })
 }
 

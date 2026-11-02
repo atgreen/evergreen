@@ -4680,6 +4680,15 @@ fn emit_string_char_or_nil(
     a.jcc(Cc::Ne, fail);
     mov_rr(a, SCRATCH, xr);
     alu_r_imm(a, 4 /* AND */, SCRATCH, -8);
+    // A large object (size field 0xFFFF) has a 16-byte header, which moves the
+    // length to +16 and the characters to +24. Leave it to the call: read with
+    // the small layout, the length test compared the index with the size word
+    // and the characters were read 8 bytes early, so a string of 2^17 or more
+    // CHARACTERs answered its own length as its first character (bliss-5fn6m).
+    // cmp word [SCRATCH], 0xFFFF; the byte encodings below name rdx, as the
+    // type-id compares do (SCRATCH is rdx).
+    a.extend_from_slice(&[0x66, 0x81, 0x3A, 0xFF, 0xFF]);
+    a.jcc(Cc::E, fail);
     // dst = the untagged index, a fixnum in [0, char_len).
     let index = data.args[1];
     if let Some(&tagged) = const_tagged.get(&index) {
