@@ -93,6 +93,46 @@ pub(crate) fn sketch(body: EgclVal) -> String {
     s
 }
 
+thread_local! {
+    /// Names of the tree-walked functions running on this thread, innermost
+    /// last, so a closure's creation can be attributed to its creator.
+    static SCOPES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A tree-walked function activation, recorded only while the census is on.
+pub(crate) struct Scope(bool);
+
+impl Scope {
+    pub(crate) fn enter(name: impl FnOnce() -> String) -> Scope {
+        if !enabled() {
+            return Scope(false);
+        }
+        let name = name();
+        SCOPES.with(|s| s.borrow_mut().push(name));
+        Scope(true)
+    }
+
+    /// The innermost tree-walked function, or `<top-level>`.
+    pub(crate) fn current() -> String {
+        SCOPES.with(|s| {
+            s.borrow()
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "<top-level>".to_string())
+        })
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        if self.0 {
+            SCOPES.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+    }
+}
+
 pub(crate) fn note(key: String) {
     if let Ok(mut g) = COUNTS.lock() {
         *g.get_or_insert_with(HashMap::new).entry(key).or_insert(0) += 1;

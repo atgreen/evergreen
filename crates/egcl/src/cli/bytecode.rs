@@ -3754,7 +3754,10 @@ impl<'e> Lowerer<'e> {
         // Root `form` across the allocating lower_expr_inner recursion (moving GC; bliss-wlf).
         egcl_rt::rooted_ref!(_form_root = &mut form);
         let result = self.lower_expr_inner(form);
-        if result.is_err() && bail_trace_on() && last_bail_reason().is_none() {
+        if result.is_err()
+            && (bail_trace_on() || bail_reason_wanted())
+            && last_bail_reason().is_none()
+        {
             let label = if form.is_cons() {
                 let op = cp(form).0;
                 if op.is_symbol() {
@@ -18177,6 +18180,7 @@ fn compile_defun(
     if let Some(frame) = closure_captured_env(*function) {
         if super::handoff_census::enabled() {
             super::handoff_census::note("compile:defun-against-runtime-frame".into());
+            super::handoff_census::note(format!("compile:defun-against-runtime-frame {name}"));
         }
         compile_env.frame = Arc::clone(&frame);
         captures = frame_capture_names(frame);
