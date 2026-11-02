@@ -156,16 +156,19 @@ fn fragment(id: HeatId) -> egcl_rt::jit::JitBuffer {
     let cache = HeatCacheHomes {
         pointer: 0,
         fallback: 1,
+        register: Some(14),
     };
     let heat = BaselineHeat {
         counter: BaselineHeatCounter::ExecutionOwned(id),
         batch: 4,
     };
-    // Entry RSP%16=8. Two pushes +24-byte frame leave RSP%16=0 at CALL.
+    // Entry RSP%16=8. Three pushes +16-byte frame leave RSP%16=0 at CALL.
     push_reg(&mut a, 3);
     push_reg(&mut a, 12);
-    alu_r_imm(&mut a, 5, 4, 24);
+    push_reg(&mut a, 14);
+    alu_r_imm(&mut a, 5, 4, 16);
     emit_heat_binding(&mut a, id, 7, cache); // ONCE, before suspension
+    initialize_heat_register(&mut a, cache);
     mov_imm64(&mut a, 3, 0); // RBX: edge credits
     mov_imm64(&mut a, 12, 0); // R12: batch request count
     emit_visit(&mut a, heat, cache);
@@ -191,7 +194,8 @@ fn fragment(id: HeatId) -> egcl_rt::jit::JitBuffer {
     a.bind(failed);
     mov_imm64(&mut a, RAX, -1);
     a.bind(exit);
-    alu_r_imm(&mut a, 0, 4, 24);
+    alu_r_imm(&mut a, 0, 4, 16);
+    pop_reg(&mut a, 14);
     pop_reg(&mut a, 12);
     pop_reg(&mut a, 3);
     a.push(0xc3);

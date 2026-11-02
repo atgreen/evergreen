@@ -11,19 +11,27 @@ Each physical native artifact receives a never-reused heat identity. Managed
 publication installs its countdown in the execution context before exposing
 code. The native prologue resolves that identity once and caches a stable raw
 pointer in an unscanned frame slot, beside a raw fallback countdown initialized
-to one. Missing bindings select that fallback, so hot backedges always perform
-only the pointer load, subtract and conditional branch. Cold reload/request
+to one. Missing bindings select that fallback. When the final register homes
+leave R12, R14 or RBX unused for the entire activation, the prologue also caches
+that pointer in the first available register. Hot backedges then subtract
+directly through it and branch; otherwise they load the pointer from its frame
+home first. R13 and R15 remain reserved. Cold reload/request
 paths compare the pointer with the fallback address to select one versus batch.
-Mapped entries resolve through NativePollControl.execution; ordinary entries
-use R13. OSR entries initialize
-the same cache. Countdown cells survive redefinition, nested calls, directory
+Mapped entries reuse their existing noncollecting initializer, which validates
+the execution owner and physical artifact identity before returning the pointer
+in RDX. Ordinary entries use R13. OSR entries initialize the same cache. Countdown cells survive redefinition, nested calls, directory
 growth and suspended activations until execution retirement; reentry never
 resets a partially consumed batch. Companion artifacts use distinct identities.
 
 A missing context, view or cell preserves the published cold poll, reporting
 one observed edge rather than an unearned batch. Each entry initializes both
 raw words before any poll. Frame sizing, precise map bounds and ordinary stack
-admission include the additional 16 bytes; neither word is a tagged root.
+admission include both additional raw words, plus any new callee-save word and
+alignment padding. Neither raw word nor the active cache register is a tagged
+root. The saved incoming register word can hold a caller's live Lisp value: its
+normal unwind location stays available to the caller's precise map. It must not
+be globally marked raw. Exceptional cleanup restores that save slot while
+leaving the active pointer register intact.
 Native fiber suspension switches RSP without moving the stack (runtime
 context.rs), preserving the fallback address until that frame retires. Normal
 sampled polls retain the existing batch request and reload policy. No lookup allocates Lisp objects,

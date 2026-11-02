@@ -337,6 +337,10 @@ mod execution {
         saves: usize,
         completions: usize,
         landings: usize,
+        resume_bcp: u32,
+        completion_bcp: u32,
+        heat_credits: usize,
+        control: *mut egcl_compiler::t2::emit::NativePollControl,
         landing: SysvNativeLanding,
         landing_stub: *const u8,
         dispatch: Dispatch,
@@ -399,7 +403,14 @@ mod execution {
     }
 
     unsafe extern "C" fn save(cleanup: u32, resume: u32, value: EgclVal) -> EgclVal {
-        assert_eq!((cleanup, resume, value), (8, 12, EgclVal::from_fixnum(99)));
+        assert_eq!(
+            (cleanup, resume, value),
+            (
+                8,
+                unsafe { (*STATE.with(Cell::get)).resume_bcp },
+                EgclVal::from_fixnum(99)
+            )
+        );
         unsafe {
             (*STATE.with(Cell::get)).saves += 1;
         }
@@ -410,7 +421,7 @@ mod execution {
         let request = unsafe { &*request.cast::<TransferCleanupRequest>() };
         assert_eq!(
             (request.cleanup_bcp, request.resume_bcp, request.reserved),
-            (8, 12, 0)
+            (8, u64::from(state.resume_bcp), 0)
         );
         assert_eq!(request.activation, state.activation);
         state.completions += 1;
@@ -465,7 +476,7 @@ mod execution {
         } else {
             assert_eq!(
                 site.map().origin_bcp,
-                11,
+                state.completion_bcp,
                 "leave only after native cleanup completion"
             );
             state.dispatch = Dispatch {
@@ -480,28 +491,162 @@ mod execution {
         core::arch::naked_asm!("endbr64", "mov rax, [rdi]", "mov rdi, [rdi + 8]", "jmp rax");
     }
 
+    unsafe extern "C" fn unexpected_landing(_push: u32, _resume: u32, _value: EgclVal) -> EgclVal {
+        panic!("cleanup-only fixture must not deliver a catch or handler clause")
+    }
+
+    unsafe extern "C" fn initialize_heat_control() -> *mut egcl_compiler::t2::emit::NativePollControl
+    {
+        unsafe { (*STATE.with(Cell::get)).control }
+    }
+    unsafe extern "C" fn poll_after_landing(request: *mut u64) -> u64 {
+        let bits = request as usize;
+        assert_ne!(bits & 1, 0);
+        unsafe {
+            (*STATE.with(Cell::get)).heat_credits += if bits & 4 != 0 { 4 } else { 1 };
+        }
+        // Allocate and collect only after the cleanup landing has resumed the
+        // original native frame with its restored raw counter register.
+        let body = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
+        unsafe {
+            body.cast::<f64>().write(789.5);
+        }
+        egcl_rt::rooted!(value = unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
+        let before = value.to_raw();
+        HeapCollector::new().minor_gc().unwrap();
+        assert_ne!(
+            value.to_raw(),
+            before,
+            "post-landing allocating path actually collects/moves"
+        );
+        NIL.0
+    }
+
     #[test]
     #[ignore = "requires a platform-supported native segment transition"]
     fn generated_cleanup_uses_exceptional_phi_and_completes_without_bytecode() {
+        run_generated_cleanup(false);
+    }
+
+    #[test]
+    #[ignore = "requires a platform-supported native segment transition"]
+    fn execution_heat_register_survives_same_frame_exceptional_cleanup_and_allocating_resume() {
+        run_generated_cleanup(true);
+    }
+
+    fn run_generated_cleanup(with_heat: bool) {
+        use egcl_compiler::t2::emit::{
+            BaselineHeat, BaselineHeatCounter, NativePollControl, NativePollFastPath,
+            NativeRootPublication, emit_framed_native_handlers_with_entries_and_poll_fast_path,
+        };
+        use egcl_rt::exec_context::{ExecutionKind, LispExecutionContext};
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         assert!(native_transfer::is_supported());
-        let body = cleanup_body();
+        let mut body = cleanup_body();
+        if with_heat {
+            body.constants.push(NIL);
+            body.code[7] = Instr::EnterCleanupNormal {
+                cleanup_bcp: 8,
+                resume_bcp: 16,
+            };
+            body.code.splice(
+                11..12,
+                [
+                    Instr::Br(12),
+                    Instr::Const(1),
+                    Instr::BrIfFalse(15),
+                    Instr::Br(12),
+                    Instr::CleanupReturn,
+                ],
+            );
+        }
+        let execution = LispExecutionContext::new(ExecutionKind::Fiber, 1, 1);
+        assert!(execution.begin_poll());
+        let id = egcl_rt::execution_heat::HeatId::new().unwrap();
+        execution.heat().install(id, 1);
+        let mut control = NativePollControl {
+            execution: &execution,
+            seen_carrier: 1,
+            seen_signal_epoch: 0,
+            deadline_armed: 0,
+            reserved: [0; 7],
+            test_observer: std::ptr::null(),
+            test_skips: std::ptr::null_mut(),
+        };
+        let gc = AtomicBool::new(false);
+        let sig = AtomicBool::new(false);
+        let posted = AtomicUsize::new(0);
+        let errors = AtomicUsize::new(0);
+        let epoch = AtomicU64::new(0);
         let ir = build::build_from_bytecode_for_native_cleanups(&body).unwrap();
         let landing_stub = JitBuffer::new(&emit_native_landing_stub()).unwrap();
         let capture = JitBuffer::new(&emit_capture_stub(prepare, dispatch as *const u8)).unwrap();
         let call_veneer = JitBuffer::new(&emit_helper_veneer(call, capture.as_ptr())).unwrap();
         let complete_veneer =
             JitBuffer::new(&emit_helper_veneer(complete, capture.as_ptr())).unwrap();
-        let (emitted, table) = emit_framed_native_cleanups(
-            &ir,
-            call_veneer.as_ptr() as u64,
-            2,
-            save as *const () as u64,
-            complete_veneer.as_ptr() as u64,
-            single_values as *const () as u64,
-        )
+        let (emitted, table) = if with_heat {
+            emit_framed_native_handlers_with_entries_and_poll_fast_path(
+                &ir,
+                call_veneer.as_ptr() as u64,
+                2,
+                save as *const () as u64,
+                complete_veneer.as_ptr() as u64,
+                single_values as *const () as u64,
+                unexpected_landing as *const () as u64,
+                unexpected_landing as *const () as u64,
+                poll_after_landing as *const () as u64,
+                None,
+                None,
+                &[],
+                NativeRootPublication::ActivationShadows,
+                Some(NativePollFastPath {
+                    initialize: initialize_heat_control as *const () as u64,
+                    initialize_with_execution_heat: false,
+                    gc_requested: &gc as *const _ as u64,
+                    sigusr1_pending: &sig as *const _ as u64,
+                    posted_signal: &posted as *const _ as u64,
+                    native_errors: &errors as *const _ as u64,
+                    signal_epoch: &epoch as *const _ as u64,
+                    observe_forces_cold: false,
+                    instrument_skips: false,
+                    baseline_heat: Some(BaselineHeat {
+                        counter: BaselineHeatCounter::ExecutionOwned(id),
+                        batch: 4,
+                    }),
+                }),
+            )
+        } else {
+            emit_framed_native_cleanups(
+                &ir,
+                call_veneer.as_ptr() as u64,
+                2,
+                save as *const () as u64,
+                complete_veneer.as_ptr() as u64,
+                single_values as *const () as u64,
+            )
+        }
         .unwrap();
+        if with_heat {
+            use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic, Register};
+            assert!(
+                Decoder::new(64, &emitted.code, DecoderOptions::NONE)
+                    .into_iter()
+                    .any(|instruction| instruction.mnemonic() == Mnemonic::Sub
+                        && instruction.memory_size() == MemorySize::UInt32
+                        && matches!(
+                            instruction.memory_base(),
+                            Register::R12 | Register::R14 | Register::RBX
+                        )),
+                "protected loop must execute the raw preserved-register heat arm"
+            );
+        }
         let code = JitBuffer::new(&emitted.code).unwrap();
         for throwing in [false, true] {
+            execution
+                .heat()
+                .counter(id)
+                .unwrap()
+                .store(1, Ordering::Relaxed);
             let mut snapshots: Vec<_> = table
                 .sites()
                 .map(|site| site.reserve_snapshot().unwrap())
@@ -530,6 +675,10 @@ mod execution {
                 saves: 0,
                 completions: 0,
                 landings: 0,
+                resume_bcp: if with_heat { 16 } else { 12 },
+                completion_bcp: if with_heat { 15 } else { 11 },
+                heat_credits: 0,
+                control: &mut control,
                 landing: SysvNativeLanding {
                     stack_pointer: std::ptr::null_mut(),
                     entry: std::ptr::null(),
@@ -564,6 +713,21 @@ mod execution {
             assert_eq!((state.calls, state.drops, state.completions), (2, 2, 1));
             assert_eq!(state.landings, usize::from(throwing));
             assert_eq!(state.saves, usize::from(!throwing));
+            assert_eq!(
+                state.heat_credits,
+                if with_heat { 4 } else { 0 },
+                "native heat executes exactly one loop visit after normal or exceptional cleanup ingress"
+            );
+            if with_heat {
+                assert_eq!(
+                    execution
+                        .heat()
+                        .counter(id)
+                        .unwrap()
+                        .load(Ordering::Relaxed),
+                    4
+                );
+            }
         }
     }
 }

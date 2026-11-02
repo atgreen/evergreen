@@ -320,6 +320,9 @@ fn redundant_bounded_cycle_polls(
     redundant
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+use std::collections::HashMap;
+
 use crate::t2::x64_calls::{
     CallReturn, NativeCallOrigin, NativeCallSites, NativeCallValues, NativeStackBase,
 };
@@ -1596,6 +1599,27 @@ pub struct BaselineHeat {
 struct HeatCacheHomes {
     pointer: u32,
     fallback: u32,
+    register: Option<u8>,
+}
+
+/// The framed emitter uses final homes, not allocator edit liveness. A cache
+/// owns its register for the WHOLE activation, including OSR/exception edges.
+/// R13 belongs to ordinary execution and R15 to allocator scratch; neither is
+/// available even when absent from the value homes.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn select_heat_register(homes: &HashMap<crate::t2::ir::Value, FramedHome>) -> Option<u8> {
+    [12, 14, 3].into_iter().find(|&register| {
+        !homes
+            .values()
+            .any(|home| *home == FramedHome::Reg(register))
+    })
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn initialize_heat_register(a: &mut Asm, cache: HeatCacheHomes) {
+    if let Some(register) = cache.register {
+        load_home(a, register, FramedHome::Stack(cache.pointer), 0);
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -1668,12 +1692,14 @@ fn emit_heat_binding(
 fn load_heat_counter(a: &mut Asm, heat: BaselineHeat, cache: Option<HeatCacheHomes>) {
     match heat.counter {
         BaselineHeatCounter::CodeOwned(address) => mov_imm64(a, RAX, address as i64),
-        BaselineHeatCounter::ExecutionOwned(_) => load_home(
-            a,
-            RAX,
-            FramedHome::Stack(cache.expect("execution heat cache").pointer),
-            0,
-        ),
+        BaselineHeatCounter::ExecutionOwned(_) => {
+            let cache = cache.expect("execution heat cache");
+            if let Some(register) = cache.register {
+                mov_rr(a, RAX, register);
+            } else {
+                load_home(a, RAX, FramedHome::Stack(cache.pointer), 0);
+            }
+        }
     }
 }
 
@@ -1686,8 +1712,24 @@ fn emit_heat_countdown(
     cache: Option<HeatCacheHomes>,
     slow: egcl_rt::asm::Label,
 ) {
-    load_heat_counter(a, heat, cache);
-    a.extend_from_slice(&[0x83, 0x28, 0x01]); // sub dword [rax],1
+    let register = match heat.counter {
+        BaselineHeatCounter::ExecutionOwned(_) => cache.and_then(|cache| cache.register),
+        BaselineHeatCounter::CodeOwned(_) => None,
+    };
+    if let Some(register) = register {
+        // SUB uses the cached raw pointer directly, with the same signed
+        // countdown flags. R12 needs SIB addressing; no displacement or RAX
+        // materialization is necessary for any admitted base register.
+        match register {
+            12 => a.extend_from_slice(&[0x41, 0x83, 0x2c, 0x24, 0x01]),
+            14 => a.extend_from_slice(&[0x41, 0x83, 0x2e, 0x01]),
+            3 => a.extend_from_slice(&[0x83, 0x2b, 0x01]),
+            _ => unreachable!("reserved execution heat register"),
+        }
+    } else {
+        load_heat_counter(a, heat, cache);
+        a.extend_from_slice(&[0x83, 0x28, 0x01]); // sub dword [rax],1
+    }
     a.jcc(Cc::Le, slow);
 }
 
@@ -8040,6 +8082,7 @@ fn emit_framed_inner(
             let cache = HeatCacheHomes {
                 pointer: next_stack,
                 fallback: next_stack + 1,
+                register: select_heat_register(&homes),
             };
             next_stack += 2;
             Some(cache)
@@ -8192,6 +8235,9 @@ fn emit_framed_inner(
             } else {
                 emit_heat_fallback(a, home);
             }
+            // The stack pointer home is authoritative for every success and
+            // missing-binding branch. Cache it only after the branches join.
+            initialize_heat_register(a, home);
         }
     };
     let mut a = Asm::new();
@@ -8337,6 +8383,11 @@ fn emit_framed_inner(
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        if let Some(register) = heat_cache.and_then(|cache| cache.register) {
+            debug_assert!(!s.contains(&register));
+            s.push(register);
+        }
         s.sort_unstable();
         if ordinary_mode {
             s.insert(0, 5);
@@ -12061,6 +12112,20 @@ fn emit_framed_inner(
             );
         }
     }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    if let Some(cache) = heat_cache {
+        static LOG_HEAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *LOG_HEAT.get_or_init(|| std::env::var_os("EGCL_EXECUTION_HEAT_LOG").is_some()) {
+            eprintln!(
+                "[execution-heat] function={} register={:?} saved={:?} pad={} spill_bytes={}",
+                f.name(),
+                cache.register,
+                saved,
+                pad,
+                spill_bytes
+            );
+        }
+    }
     Ok(FramedCode {
         frame_entry: (!ordinary_call_mode).then_some(0),
         ordinary_entry,
@@ -15507,17 +15572,31 @@ mod execution_heat_tests {
         batch: u32,
         visits: usize,
     ) -> (egcl_rt::jit::JitBuffer, Vec<u8>) {
+        fragment_with_register(id, batch, visits, Some(12))
+    }
+
+    fn fragment_with_register(
+        id: HeatId,
+        batch: u32,
+        visits: usize,
+        register: Option<u8>,
+    ) -> (egcl_rt::jit::JitBuffer, Vec<u8>) {
         let mut a = Asm::new();
         let cache = HeatCacheHomes {
             pointer: 0,
             fallback: 1,
+            register,
         };
         let heat = BaselineHeat {
             counter: BaselineHeatCounter::ExecutionOwned(id),
             batch,
         };
+        if let Some(register) = register {
+            push_reg(&mut a, register);
+        }
         alu_r_imm(&mut a, 5, 4, 16);
         emit_heat_binding(&mut a, id, 7, cache);
+        initialize_heat_register(&mut a, cache);
         mov_imm64(&mut a, 8, 0); // caller-saved request sum
         for _ in 0..visits {
             let slow = a.label();
@@ -15533,6 +15612,9 @@ mod execution_heat_tests {
         }
         mov_rr(&mut a, RAX, 8);
         alu_r_imm(&mut a, 0, 4, 16);
+        if let Some(register) = register {
+            pop_reg(&mut a, register);
+        }
         a.push(0xc3);
         let bytes = a.finish().unwrap();
         (egcl_rt::jit::JitBuffer::new(&bytes).unwrap(), bytes)
@@ -15547,6 +15629,7 @@ mod execution_heat_tests {
         let cache = HeatCacheHomes {
             pointer: 0,
             fallback: 1,
+            register: None,
         };
         let mut actual = Asm::new();
         let slow = actual.label();
@@ -15559,6 +15642,66 @@ mod execution_heat_tests {
         expected.jcc(Cc::Le, slow);
         expected.bind(slow);
         assert_eq!(actual.finish().unwrap(), expected.finish().unwrap());
+    }
+
+    #[test]
+    fn execution_heat_register_selection_is_global_and_reserves_execution_and_scratch() {
+        use crate::t2::ir::Value;
+        let mut homes = HashMap::new();
+        assert_eq!(select_heat_register(&homes), Some(12));
+        for (index, (register, expected)) in [(12, Some(14)), (14, Some(3)), (3, None)]
+            .into_iter()
+            .enumerate()
+        {
+            homes.insert(Value(index as u32), FramedHome::Reg(register));
+            assert_eq!(select_heat_register(&homes), expected);
+        }
+        // R13/R15 stay unavailable even though neither appears in the homes.
+        assert_eq!(select_heat_register(&homes), None);
+        let id = HeatId::new().unwrap();
+        let context = LispExecutionContext::new(ExecutionKind::Fiber, 99, 1);
+        context.heat().install(id, 4);
+        let (code, _) = fragment_with_register(id, 4, 1, None);
+        let run: extern "C" fn(*const LispExecutionContext) -> u64 =
+            unsafe { std::mem::transmute(code.as_ptr()) };
+        assert_eq!(
+            [run(&context), run(&context), run(&context), run(&context)],
+            [0, 0, 0, 5]
+        );
+        assert_eq!(run(std::ptr::null()), 1);
+    }
+
+    #[test]
+    fn execution_heat_register_countdown_has_only_direct_subtract_and_signed_branch() {
+        use iced_x86::{Decoder, DecoderOptions, MemorySize, Mnemonic, Register};
+        for (register, base) in [(12, Register::R12), (14, Register::R14), (3, Register::RBX)] {
+            let heat = BaselineHeat {
+                counter: BaselineHeatCounter::ExecutionOwned(HeatId::new().unwrap()),
+                batch: 128,
+            };
+            let mut asm = Asm::new();
+            let slow = asm.label();
+            emit_heat_countdown(
+                &mut asm,
+                heat,
+                Some(HeatCacheHomes {
+                    pointer: 0,
+                    fallback: 1,
+                    register: Some(register),
+                }),
+                slow,
+            );
+            asm.bind(slow);
+            let bytes = asm.finish().unwrap();
+            let instructions: Vec<_> = Decoder::new(64, &bytes, DecoderOptions::NONE)
+                .into_iter()
+                .collect();
+            assert_eq!(instructions.len(), 2);
+            assert_eq!(instructions[0].mnemonic(), Mnemonic::Sub);
+            assert_eq!(instructions[0].memory_base(), base);
+            assert_eq!(instructions[0].memory_size(), MemorySize::UInt32);
+            assert_eq!(instructions[1].mnemonic(), Mnemonic::Jle);
+        }
     }
 
     #[test]
@@ -15591,7 +15734,7 @@ mod execution_heat_tests {
         let id = HeatId::new().unwrap();
         let (code, bytes) = fragment(id, 4);
         // SAFETY: fragment reads only a live context's retained metadata;
-        // all modified registers are caller-saved, and RSP is restored.
+        // the cached preserved register and RSP are saved/restored.
         let visit: extern "C" fn(*const LispExecutionContext) -> u64 =
             unsafe { std::mem::transmute(code.as_ptr()) };
         let a = LispExecutionContext::new(ExecutionKind::Fiber, 1, 1);

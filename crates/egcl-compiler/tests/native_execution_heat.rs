@@ -20,6 +20,9 @@ thread_local! {
     static COLLECT: Cell<bool> = const { Cell::new(false) };
     static HEAT_ID: Cell<Option<HeatId>> = const { Cell::new(None) };
 }
+#[path = "native_execution_heat/saved_caller.rs"]
+mod saved_caller;
+
 static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 extern "C" fn initialize() -> *mut NativePollControl {
     CONTROL.with(Cell::get)
@@ -162,6 +165,7 @@ fn run_case(initialized: bool) {
         function.block_mut(block).insts = instructions;
     }
     let helper = unrelated_helper as *const () as u64;
+    let poll_veneer = saved_caller::poll_veneer();
     let emit = |fast| {
         let (framed, _) = emit_framed_native_handlers_with_entries_and_poll_fast_path(
             &function,
@@ -172,7 +176,7 @@ fn run_case(initialized: bool) {
             helper,
             helper,
             helper,
-            poll as *const () as u64,
+            poll_veneer.as_ptr() as u64,
             None,
             None,
             &[],
@@ -183,6 +187,10 @@ fn run_case(initialized: bool) {
         framed
     };
     let framed = emit(fast);
+    assert!(
+        matches!(saved_caller::selected_register(&framed), Some(12 | 14 | 3)),
+        "this integration must execute the preserved-register arm"
+    );
     let legacy_counter = std::sync::atomic::AtomicU32::new(4);
     let legacy_heat = BaselineHeat {
         counter: BaselineHeatCounter::CodeOwned(legacy_counter.as_ptr() as u64),
@@ -261,10 +269,84 @@ fn run_case(initialized: bool) {
         ordinary.native_spill_slots,
         ordinary_legacy.native_spill_slots + 2
     );
+    assert!(saved_caller::selected_register(&ordinary).is_some());
+    assert_eq!(saved_caller::selected_register(&ordinary_legacy), None);
+    // Decode the actual push/pad/reservation stream independently of the
+    // emitter's metadata. The extra preserved register can consume an old
+    // padding word or require a new one; the two raw homes always add16bytes.
+    fn physical_frame(code: &egcl_compiler::t2::emit::FramedCode) -> (usize, usize) {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+        let start = code.ordinary_entry.unwrap();
+        let mut started = false;
+        let mut bytes = 0;
+        let mut saved = Vec::new();
+        for instruction in Decoder::new(64, &code.code[start..], DecoderOptions::NONE) {
+            if !started {
+                if instruction.mnemonic() != Mnemonic::Push {
+                    continue;
+                }
+                assert_eq!(instruction.op0_register(), Register::RBP);
+                started = true;
+            }
+            match instruction.mnemonic() {
+                Mnemonic::Push => {
+                    saved.push(instruction.op0_register());
+                    bytes += 8;
+                }
+                Mnemonic::Mov
+                    if instruction.op0_register() == Register::RBP
+                        && instruction.op1_register() == Register::RSP => {}
+                Mnemonic::Sub if instruction.op0_register() == Register::RSP => {
+                    bytes += instruction.immediate(1) as usize;
+                }
+                Mnemonic::Test if instruction.memory_base() == Register::RSP => {}
+                _ => break,
+            }
+        }
+        assert!(started);
+        let recipe = code.native_calls.as_ref().unwrap().unwind_recipe().unwrap();
+        assert_eq!(
+            bytes,
+            recipe.frame_bytes() as usize,
+            "physical prologue and exact unwind geometry agree"
+        );
+        for (index, register) in saved.iter().enumerate() {
+            let encoding = match register {
+                Register::RBX => 3,
+                Register::RBP => 5,
+                Register::R12 => 12,
+                Register::R13 => 13,
+                Register::R14 => 14,
+                Register::R15 => 15,
+                _ => panic!("unexpected saved register"),
+            };
+            assert_eq!(
+                recipe.saved_offset(encoding),
+                Some((bytes - (index + 1) * 8) as u32)
+            );
+        }
+        (bytes, saved.len())
+    }
+    let (new_bytes, new_saves) = physical_frame(&ordinary);
+    let (old_bytes, old_saves) = physical_frame(&ordinary_legacy);
     assert_eq!(
-        ordinary.ordinary_stack_required.unwrap(),
-        ordinary_legacy.ordinary_stack_required.unwrap() + 16,
-        "callee stack admission includes the fallback and cached pointer"
+        new_saves,
+        old_saves + 1,
+        "the raw register saves the caller's prior value"
+    );
+    let spill_bytes = |slots: u32| (slots as usize * 8 + 15) & !15;
+    assert_eq!(
+        spill_bytes(ordinary.native_spill_slots),
+        spill_bytes(ordinary_legacy.native_spill_slots) + 16
+    );
+    let new_pad = new_bytes - spill_bytes(ordinary.native_spill_slots) - new_saves * 8;
+    let old_pad = old_bytes - spill_bytes(ordinary_legacy.native_spill_slots) - old_saves * 8;
+    assert!(matches!((old_pad, new_pad), (0, 8) | (8, 0)));
+    assert_eq!(
+        ordinary.ordinary_stack_required.unwrap()
+            - ordinary_legacy.ordinary_stack_required.unwrap(),
+        new_bytes - old_bytes,
+        "stack admission includes the decoded raw homes, register save and padding delta"
     );
     // Locate the actual fallback address selected by the emitted ordinary
     // prologue, then ensure neither raw frame word appears in precise roots.
@@ -293,6 +375,16 @@ fn run_case(initialized: bool) {
             for &fallback in &fallback_offsets {
                 assert!(fallback >= 8 && fallback < (ordinary.native_spill_slots * 8) as i32);
                 for location in map.gc_locations() {
+                    if let egcl_compiler::t2::x64_value_maps::NativeValueLocation::Register(
+                        register,
+                    ) = location
+                    {
+                        assert_ne!(
+                            Some(*register),
+                            saved_caller::selected_register(&ordinary),
+                            "current raw heat register is not a tagged root"
+                        );
+                    }
                     if let egcl_compiler::t2::x64_value_maps::NativeValueLocation::Stack(offset) =
                         location
                     {
@@ -372,6 +464,8 @@ fn run_case(initialized: bool) {
     );
     control.execution = &a;
     CONTROL.with(|slot| slot.set(&mut control));
+
+    saved_caller::check(&framed, &buffer, &mut activation, &a);
 
     // Prove both raw cache words did not contaminate native GC maps.
     let body = egcl_rt::alloc_typed(8, egcl_rt::object::type_id::DOUBLE_FLOAT).unwrap();
