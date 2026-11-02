@@ -2604,6 +2604,10 @@ not a portable Common Lisp interface, and many are read once.</p>
 <td><code>EGCL_BAIL_TRACE=1</code></td>
 <td>Collect bytecode-lowering decline reasons</td>
 </tr>
+<tr>
+<td><code>EGCL_R13_CALL_LINKAGE=1</code></td>
+<td>Resolve ordinary x86-64 Linux call metadata through the current execution context; disabled by default</td>
+</tr>
 </tbody>
 </table>
 <p>Eager FASL compilation covers each installed named bytecode definition and the
@@ -2628,6 +2632,10 @@ quoted data, and exact unshadowed CL <code>LIST</code>/<code>CONS</code> constru
 Installed definitions keep their public function names without renaming shared
 closure prototypes or changing their private code identities.</p>
 <p>A threshold does not expand the target backend's supported instruction set.
+The experimental <a href="https://github.com/atgreen/evergreen/blob/main/docs/design/execution-call-linkage.md">execution call linkage</a>
+control preserves entry-owner and redefinition checks. It is a prerequisite
+for sharing compiled artifacts; adapters and other installation state remain
+owned by each execution.
 See <a href="../user/reference/platforms/">Platform support</a> and
 <a href="../profiling/">Profiling and efficiency</a>.</p>
 <p>Implementation reference: <a href="https://cave.moxielogic.com/atgreen/bliss/src/branch/main/crates/egcl/src/cli/bytecode.rs">CLI compiler integration</a>.</p>
