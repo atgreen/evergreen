@@ -12656,6 +12656,7 @@ fn eval_named_call_ex(
             if is_local { "local" } else { "global" }
         ));
     }
+    let _tw_scope = tw_census::Scope::enter(|| name.to_string());
     // Take the FLET function's captured scope (a shared handle, so this is a
     // refcount bump and not a copy of the map) out from under the env.funs
     // borrow, and if present run the body with env.funs pointing at it,
@@ -14457,7 +14458,8 @@ impl egcl_rt::gc::TraceHostRoots for Closure {
 fn register_tree_closure(mut closure: Closure) -> EgclVal {
     if tw_census::enabled() {
         tw_census::note(format!(
-            "closure-created {}",
+            "closure-created in {} {}",
+            tw_census::Scope::current(),
             tw_census::sketch(closure.body)
         ));
     }
@@ -45522,6 +45524,7 @@ fn apply_function_impl(
                 tw_census::sketch(body)
             ));
         }
+        let _tw_scope = tw_census::Scope::enter(|| sym_name(egcl_rt::function::name(fn_val)));
         // A reified capturing closure runs its interpreted body against the
         // captured environment, not the caller's frame (bliss-jtc.23.3). Its
         // BLOCK/TAGBODY exit scope is fresh: a heap interpreted-function is a
