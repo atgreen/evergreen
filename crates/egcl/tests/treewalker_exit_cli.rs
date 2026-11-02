@@ -155,3 +155,52 @@ fn inline_lambda_with_aux_compiles() {
         );
     }
 }
+
+// ── DESTRUCTURING-BIND in a lambda of compiled code ─────────────────────
+
+/// DESTRUCTURING-BIND lowers only in portable mode. A lambda in an
+/// opportunistically compiled top-level form used to be handed to the
+/// tree-walker for it (SBCL's cold-setup DEFUN macro function); it now
+/// retries its nested body portably.
+const NESTED_DBIND: &str = r#"
+  (defvar *nd-expander* (lambda (form env) (declare (ignore env)) form))
+  (setf (macro-function 'nd-defun)
+        (lambda (whole env)
+          (funcall *nd-expander*
+                   (destructuring-bind (name ll . rest) (cdr whole)
+                     `(defun ,name ,ll ,@rest))
+                   env)))
+  (defvar *nd-fn* nil)
+  (let ((k :k))
+    (setq *nd-fn* (lambda (x) (destructuring-bind (a &optional (b k) &key (c 0)) x (list a b c)))))
+"#;
+
+#[test]
+fn destructuring_bind_in_a_lambda_compiles() {
+    let program = format!(
+        r#"(progn {NESTED_DBIND}
+  (let ((last nil))
+    (dotimes (i 50)
+      (setq last (list (macroexpand-1 '(nd-defun f (x) (1+ x)))
+                       (funcall *nd-fn* '(1)) (funcall *nd-fn* '(1 2 :c 3)))))
+    (format t "RESULT ~S~%" last)))"#
+    );
+    agree_everywhere(&program, "RESULT ((DEFUN F (X) (1+ X)) (1 :K 0) (1 2 3))");
+    let census = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "treewalker-exit-dbind-{}.census",
+        std::process::id()
+    ));
+    let census_path = census.to_string_lossy().into_owned();
+    let (out, _) = run(
+        None,
+        &program,
+        &[("EGCL_HANDOFF_CENSUS", census_path.as_str())],
+    );
+    assert!(result_line(None, &out).starts_with("RESULT "), "{out}");
+    let table = std::fs::read_to_string(&census).expect("handoff census written");
+    let _ = std::fs::remove_file(&census);
+    assert!(
+        !table.contains("lower:"),
+        "a lambda was handed to the tree-walker:\n{table}"
+    );
+}

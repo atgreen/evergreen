@@ -8854,7 +8854,18 @@ impl<'e> Lowerer<'e> {
         // recovered, so its own reason must not displace one recorded earlier.
         let outer_reason = LAST_BAIL_REASON.with(|last| last.borrow_mut().take());
         let (params_form, body) = cp(*lambda_tail);
-        let attempt = self.emit_portable_closure(params_form, body, captured);
+        let mut attempt = self.emit_portable_closure(params_form, body, captured);
+        if attempt.is_err() && !slot_captured {
+            // Some forms lower only in portable mode (DESTRUCTURING-BIND),
+            // and a hot DEFUN that bails retries that way (`compile_defun`).
+            // Give a nested lambda the same retry before handing it to the
+            // tree-walker: SBCL's cold-setup `(lambda (whole env)
+            // (destructuring-bind ...))` macro was the case (bliss-gg3i1.7.15.7).
+            let (params_form, body) = cp(*lambda_tail);
+            let portable = std::mem::replace(&mut self.portable, true);
+            attempt = self.emit_portable_closure(params_form, body, captured);
+            self.portable = portable;
+        }
         let reason = LAST_BAIL_REASON.with(|last| {
             let mut last = last.borrow_mut();
             let reason = last.take();
