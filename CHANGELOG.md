@@ -646,6 +646,13 @@
   count of the calls that still take the general route, by callee and route
   ([#975](https://github.com/atgreen/evergreen/pull/975)).
 
+- On x86-64 Linux, eligible optimized FUNCALL sites enter function objects
+  and closures through their native entry words. Closure instances share a
+  template dispatch stub that follows code replacement and preserves the
+  runtime fallback for other executions and unsupported callees.
+  `EGCL_LEAN_FUNCALL=0` selects the previous route
+  ([#977](https://github.com/atgreen/evergreen/pull/977)).
+
 - More functions that create closures now compile instead of running in the
   interpreter: a closure over a MULTIPLE-VALUE-BIND variable, a HANDLER-CASE
   clause variable, or a local function's parameter no longer forces its whole

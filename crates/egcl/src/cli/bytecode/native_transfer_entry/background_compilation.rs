@@ -11,7 +11,12 @@ fn ordinary_call_target(
     symbol: u32,
     cell: &egcl_rt::call_table::CallCell,
 ) -> egcl_compiler::t2::emit::OrdinaryCallTarget {
-    let function_cell = if super::lean_calls_enabled() && !ordinary_primitives::is_private(symbol) {
+    let function_cell = if super::closure_entry::lean_funcall_enabled()
+        && super::closure_entry::is_funcall(symbol)
+    {
+        // The callee is FUNCALL's first argument (bliss-gg3i1.7.15.10.3).
+        egcl_compiler::t2::emit::FUNCALL_FIRST_ARGUMENT
+    } else if super::lean_calls_enabled() && !ordinary_primitives::is_private(symbol) {
         egcl_rt::symbols::symbol_object_ptr(symbol).map_or(0, |object| {
             (object + std::mem::offset_of!(egcl_rt::object::SymbolData, function)) as u64
         })
@@ -111,6 +116,7 @@ impl EmittedTransfer {
             recompile: Cell::new(false),
             private_probe_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             private_probe_published: Cell::new(false),
+            template_claims: Default::default(),
             state_pool: RefCell::new(Vec::new()),
             callable_cache: Rc::new(CallableIdentityCache::default()),
             leaf_names: std::cell::OnceCell::new(),

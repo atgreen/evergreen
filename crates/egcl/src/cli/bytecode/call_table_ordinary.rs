@@ -771,6 +771,8 @@ fn entry_claim(
         || descriptor.arity == linkage::ORDINARY_ARITY_ANY
         || !egcl_rt::function::is_interpreted_function(function)
         || egcl_rt::function::is_closure_instance(function)
+        // A template's prototype word is its dispatch stub (stage 3).
+        || egcl_rt::function::is_closure_template(function)
         || egcl_rt::function::env(function) != egcl_rt::value::NIL
     {
         return None;

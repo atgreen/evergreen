@@ -1104,22 +1104,22 @@ fn generated_ephemeral_child_keeps_its_capture_through_deoptimizing_hidden_home(
     let descriptor =
         unsafe { &*cell.ordinary_entry_address() }.load(std::sync::atomic::Ordering::Acquire);
     assert_ne!(descriptor, 0);
-    let entry =
-        unsafe { &*(descriptor as *const egcl_rt::call_table::OrdinaryEntryDescriptor) }.entry;
-    // Ordinary no-arg entry: aligned noncollecting factory CALL, followed by
-    // the production FUNCALL probe. Restore RSP before the tail JMP, preserve
-    // every callee-saved register/R13, and never hold B in a host argument.
+    // The closure's entry word is its template's dispatch stub
+    // (bliss-gg3i1.7.15.10.3), which the lean FUNCALL enters.
+    assert_eq!(
+        egcl_rt::function::entry_word(*fresh).unwrap().1,
+        egcl_rt::function::SHARED_ENTRY_OWNER
+    );
+    // Ordinary no-arg entry: aligned noncollecting factory CALL, then the
+    // lean FUNCALL's call of the closure's entry word, as a tail JMP with the
+    // closure in RAX. Restore RSP first, preserve every callee-saved
+    // register/R13, and never hold B in a host argument.
     let mut stub = vec![0x48, 0x83, 0xec, 0x08, 0x48, 0xb8];
     stub.extend_from_slice(&(ephemeral_factory_leaf as *const () as u64).to_le_bytes());
-    stub.extend_from_slice(&[
-        0xff, 0xd0, 0x48, 0x83, 0xc4, 0x08, 0x48, 0x89, 0xc7, 0x48, 0xbe,
-    ]);
+    stub.extend_from_slice(&[0xff, 0xd0, 0x48, 0x83, 0xc4, 0x08, 0x48, 0xbf]);
     stub.extend_from_slice(&egcl_rt::value::T.0.to_le_bytes());
-    stub.extend_from_slice(&[0x48, 0xc7, 0xc1, 2, 0, 0, 0, 0x48, 0xb8]);
-    stub.extend_from_slice(&NIL.0.to_le_bytes());
-    stub.extend_from_slice(&[0x49, 0xbb]);
-    stub.extend_from_slice(&(entry as u64).to_le_bytes());
-    stub.extend_from_slice(&[0x41, 0xff, 0xe3]);
+    stub.extend_from_slice(&[0x48, 0xc7, 0xc1, 1, 0, 0, 0, 0xff, 0x60]);
+    stub.push(egcl_rt::function::ENTRY_TAGGED_OFFSET as u8); // jmp [rax+entry]
     // SAFETY: the only CALL is the nonallocating leaf above. The frame is
     // already retired when the real child's precise guard can collect.
     let _original_code = unsafe { parent.replace_nongc_tail_entry_for_test(&stub) }.unwrap();
@@ -1141,7 +1141,7 @@ fn generated_ephemeral_child_keeps_its_capture_through_deoptimizing_hidden_home(
     assert_eq!(
         native_transfer_entry::funcall_fast::take_fast_calls_for_test().0,
         0,
-        "the child must enter by generated probe, without a Rust callable root"
+        "the child must enter by its entry word, without a Rust callable root"
     );
     assert_eq!(egcl_rt::symbols::symbol_value(slot), Some(NIL));
     egcl_rt::gc::full_gc().unwrap();

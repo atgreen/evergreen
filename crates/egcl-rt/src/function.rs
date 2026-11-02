@@ -212,8 +212,20 @@ pub fn alloc_closure_instance(prototype: EgclVal, state: usize) -> EgclVal {
         (*d).flags = FLAG_CLOSURE_INSTANCE.into();
         (*d).definition_index = (*p).definition_index;
         (*d).closure_state = state.into();
-        (*d).entry = 0.into();
-        (*d).entry_owner = 0.into();
+        // An instance enters its template's dispatch stub, when the template
+        // has one (bliss-gg3i1.7.15.10.3): see `arm_shared_entry`. Stored
+        // before the object is published, so no reader sees a partial pair.
+        // A prototype's word is either unset or that stub, never an
+        // execution's own code: claims skip templates.
+        let stub = (*p).entry.load(Ordering::Acquire);
+        let shared = (*p).flags.load(Ordering::Relaxed) & FLAG_CLOSURE_TEMPLATE != 0
+            && stub != 0
+            && matches!(
+                (*p).entry_owner.load(Ordering::Acquire),
+                0 | SHARED_ENTRY_OWNER
+            );
+        (*d).entry = if shared { stub } else { 0 }.into();
+        (*d).entry_owner = if shared { SHARED_ENTRY_OWNER } else { 0 }.into();
         (*d).closure_env = crate::value::NIL;
         EgclVal::from_heap_ptr(header)
     }
@@ -374,6 +386,49 @@ pub unsafe fn release_entry(f: EgclVal, owner: u64) {
     {
         unsafe { (*d).entry.store(0, Ordering::Release) };
     }
+}
+
+/// The `entry_owner` of an object whose entry word is a process-lifetime
+/// dispatch stub every execution may call (bliss-gg3i1.7.15.10.3): a closure
+/// template's stub, which checks the template's own claim before entering
+/// code. No execution's code-owner key reaches it, and it is never released.
+pub const SHARED_ENTRY_OWNER: u64 = u64::MAX;
+
+/// Point `f`'s entry word at `stub`, a process-lifetime dispatch stub, for
+/// every execution (bliss-gg3i1.7.15.10.3). With `callable` false only the
+/// entry is set (a closure template's prototype that is not itself a valid
+/// receiver for its code keeps an unowned word, so callers miss, while its
+/// later instances copy the stub). Returns whether `f` now carries `stub`.
+///
+/// Protocol: the entry is stored before the owner. A generated caller that
+/// sees [`SHARED_ENTRY_OWNER`] reloads the entry after that load, so it sees
+/// the stub even when this runs concurrently on another thread. A shared word
+/// is never cleared except by `redefine`, which closure objects never take.
+///
+/// # Safety
+/// `f` must be a live interpreted-function object, and `stub` code that lives
+/// for the rest of the process.
+pub unsafe fn arm_shared_entry(f: EgclVal, stub: usize, callable: bool) -> bool {
+    debug_assert_ne!(stub, 0);
+    let d = unsafe { data(f) };
+    let entry = unsafe { &(*d).entry };
+    let owner = unsafe { &(*d).entry_owner };
+    match owner.load(Ordering::Acquire) {
+        0 => {}
+        SHARED_ENTRY_OWNER => return entry.load(Ordering::Acquire) == stub,
+        _ => return false,
+    }
+    if entry
+        .compare_exchange(0, stub, Ordering::AcqRel, Ordering::Acquire)
+        .is_err_and(|current| current != stub)
+    {
+        return false;
+    }
+    if callable {
+        // A lost race to the same stub is the same result.
+        let _ = owner.compare_exchange(0, SHARED_ENTRY_OWNER, Ordering::AcqRel, Ordering::Acquire);
+    }
+    true
 }
 
 /// The current `(entry, entry_owner)` words of `f` (diagnostics and tests).
@@ -615,6 +670,46 @@ mod tests {
         assert_eq!(entry_word(*function), Some((0x2345, 7)));
         unsafe { release_entry(*function, 7) };
         assert_eq!(entry_word(*function), Some((0, 0)));
+    }
+
+    #[test]
+    fn closure_instances_inherit_their_templates_shared_stub() {
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        crate::gc::ensure_heap_initialized();
+        crate::rooted!(prototype = alloc_interpreted(NIL, NIL, NIL, NIL));
+        unsafe { mark_closure_template(*prototype) };
+        crate::rooted!(early = alloc_closure_instance(*prototype, 0));
+        assert_eq!(entry_word(*early), Some((0, 0)), "no stub yet");
+        unsafe {
+            // A prototype that is not a receiver keeps an unowned word.
+            assert!(arm_shared_entry(*prototype, 0x4000, false));
+            assert_eq!(entry_word(*prototype), Some((0x4000, 0)));
+            assert!(!arm_shared_entry(*prototype, 0x5000, false), "one stub");
+        }
+        crate::rooted!(late = alloc_closure_instance(*prototype, 0));
+        assert_eq!(
+            entry_word(*late),
+            Some((0x4000, SHARED_ENTRY_OWNER)),
+            "a later instance copies the stub"
+        );
+        unsafe {
+            assert!(
+                arm_shared_entry(*early, 0x4000, true),
+                "an older one is armed"
+            );
+            assert!(arm_shared_entry(*early, 0x4000, true), "idempotently");
+            assert!(!arm_shared_entry(*early, 0x5000, true));
+            assert!(arm_shared_entry(*prototype, 0x4000, true));
+        }
+        assert_eq!(entry_word(*early), Some((0x4000, SHARED_ENTRY_OWNER)));
+        assert_eq!(entry_word(*prototype), Some((0x4000, SHARED_ENTRY_OWNER)));
+        // A claimed word is never overwritten by a stub.
+        crate::rooted!(claimed = alloc_interpreted(NIL, NIL, NIL, NIL));
+        unsafe {
+            assert!(claim_entry(*claimed, 7, 0x1234));
+            assert!(!arm_shared_entry(*claimed, 0x4000, true));
+            release_entry(*claimed, 7);
+        }
     }
 
     #[test]

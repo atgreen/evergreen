@@ -440,9 +440,41 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn lean_overflow(
     out: *mut OrdinaryHelperOutcome,
     image: *mut SysvTransferCapture,
 ) {
-    let request = request.cast::<OrdinaryArityRequest>();
     #[cfg(test)]
     LEAN_OVERFLOWS.with(|count| count.set(count.get() + 1));
+    unsafe { complete_through_runtime(request.cast(), out, image, false) }
+}
+
+/// A closure template's dispatch stub found no claim of this execution on
+/// the template (bliss-gg3i1.7.15.10.3): its code is not installed, not
+/// current, or owned by another execution. The request's closure word is the
+/// closure the caller passed in RAX. Offer it to the template's entry claim,
+/// so a later call enters the code directly, and complete this one through
+/// the rooted runtime.
+pub(in crate::cli::bytecode) unsafe extern "C" fn closure_miss(
+    request: *mut u8,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+) {
+    #[cfg(test)]
+    CLOSURE_MISSES.with(|count| count.set(count.get() + 1));
+    unsafe { complete_through_runtime(request.cast(), out, image, true) }
+}
+
+#[cfg(test)]
+static CLOSURE_MISSES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| const { Cell::new(0) }) };
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_closure_misses_for_test() -> usize {
+    CLOSURE_MISSES.with(|count| count.replace(0))
+}
+
+unsafe fn complete_through_runtime(
+    request: *mut OrdinaryArityRequest,
+    out: *mut OrdinaryHelperOutcome,
+    image: *mut SysvTransferCapture,
+    teach: bool,
+) {
     unsafe {
         with_entry_roots(request, || {
             root_publication::published(image, || {
@@ -475,6 +507,10 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn lean_overflow(
                     let env = NATIVE_ENV.with(Cell::get);
                     if env.is_null() {
                         return Err(invalid_capture());
+                    }
+                    if teach {
+                        // Non-collecting: the request is reread below.
+                        super::closure_entry::teach((*request).closure, count);
                     }
                     // The request stays rooted; reread the callee after polling.
                     apply_function((*request).closure, args.as_slice(), &mut *env)
