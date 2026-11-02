@@ -87,7 +87,8 @@ fn run(stress: bool) -> String {
     command.args(["--no-init", "--eval", PROGRAM]);
     if stress {
         command
-            .env("EGCL_GC_STRESS", "7")
+            // Every 61st allocation: a stride of 7 took six minutes here.
+            .env("EGCL_GC_STRESS", "61")
             .env("EGCL_GC_STRESS_AFTER_INIT", "1")
             .env("EGCL_GC_POISON", "1");
     }
