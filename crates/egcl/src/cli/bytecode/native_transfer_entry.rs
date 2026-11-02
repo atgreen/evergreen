@@ -50,6 +50,7 @@ pub(super) use lean_root::take_lean_root_entries_for_test;
 mod callable_identity_cache;
 pub(super) mod ordinary_calls;
 pub(super) mod ordinary_closure_context;
+pub(super) mod ordinary_heap_creator;
 pub(super) mod ordinary_primitives;
 use callable_identity_cache::CallableIdentityCache;
 
@@ -1361,7 +1362,15 @@ impl TransferCode {
         // its local tag records from the exact scope map (bliss-tudsy). The
         // non-speculating retry keeps the generic native-cleanups build.
         let local_tags = optimize && t1_ordinary_tagbody_body(&body);
-        let optimize = optimize && (scope_free_native_body(&body, false) || local_tags);
+        let function_lookup = t1_ordinary_function_lookup_body(&body);
+        let heap_access = t1_ordinary_heap_access_body(&body);
+        let heap_creator = ordinary_heap_creator_supported(&body);
+        let optimize = optimize
+            && (scope_free_native_body(&body, false)
+                || local_tags
+                || function_lookup
+                || heap_access
+                || heap_creator);
         // Mandatory result guards also need exact recovery metadata in the
         // baseline tier, including when VALUES produced the checked primary.
         // This does not enable speculation for multiple-value bodies.
@@ -1373,6 +1382,9 @@ impl TransferCode {
         let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false)
             || result_recovery
             || t1_ordinary_tagbody_body(&body)
+            || function_lookup
+            || heap_access
+            || heap_creator
         {
             // A method's callable lives in an uninterned symbol whose name,
             // "(METHOD ...)", does not read back; the installed symbol is its
@@ -1577,13 +1589,13 @@ impl TransferCode {
         drop(old);
         // Recorded with the root, never separately: the bits name the object
         // only while this root keeps it alive.
-        self.callable_cache.last_callable_pinned.set(
-            if egcl_rt::function::is_interpreted_function(*function) {
+        self.callable_cache
+            .last_callable_pinned
+            .set(if egcl_rt::function::is_pinned(*function) {
                 function.0
             } else {
                 0
-            },
-        );
+            });
         root
     }
 
@@ -1596,9 +1608,9 @@ impl TransferCode {
     ) -> Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>> {
         // Clone out of the cell before the GC-gated read, which may park.
         let previous = self.callable_cache.last_callable.borrow().clone()?;
-        // An interpreted function object never moves, and `previous` holds it
-        // alive, so equal bits are equal identity without the gate. That is
-        // every steady-state call of a named function (GitHub #487).
+        // Pinned definitions/prototypes never move, and `previous` holds them
+        // alive, so their equal bits prove identity without the gate. Movable
+        // closure instances must compare the traced root below instead.
         let pinned = self.callable_cache.last_callable_pinned.get();
         if pinned != 0 && pinned == function.0 {
             return Some(previous);
@@ -2373,6 +2385,9 @@ fn named_call_symbol(instruction: &Instr) -> Option<u32> {
         Instr::SetValues(_) => Some(egcl_rt::symbols::intern("VALUES")),
         // A structure constructor is built as its %MAKE-STRUCT call.
         Instr::MakeStruct { .. } => Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT")),
+        Instr::MakeEnv(_) => Some(egcl_rt::symbols::intern(
+            egcl_compiler::t2::build::HEAP_ENV_MAKE_ADAPTER,
+        )),
         // A scoped body's structure opcodes are built as their general calls.
         Instr::StructRef { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-REF")),
         Instr::StructSet { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-SET")),
@@ -2543,6 +2558,86 @@ pub(super) fn t1_ordinary_tagbody_body(body: &BytecodeFunction) -> bool {
         })
 }
 
+/// A scope-free T1 body that reads a global function cell. The transfer builder
+/// preserves the lookup as SymbolFunction, which ordinary primitive lowering
+/// routes through the same private helper T2 uses. Captured environments and
+/// local TAGBODYs retain their separate admission and OSR rules.
+fn t1_ordinary_function_lookup_body(body: &BytecodeFunction) -> bool {
+    ordinary_function_designators_enabled()
+        && !body.has_env
+        && slot_parameters(body, false)
+        && body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::LoadFunction(_)))
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true) || matches!(op, Instr::LoadFunction(_))
+        })
+}
+
+/// Acyclic heap-environment bodies need only the hidden callable and inline
+/// slot accesses already implemented by ordinary emission. Keep creators,
+/// dynamic scopes and backward branches on their existing mapped path.
+fn t1_ordinary_heap_access_body(body: &BytecodeFunction) -> bool {
+    let heap_op = |op: &Instr| {
+        matches!(
+            op,
+            Instr::ClosureEnv | Instr::EnvRef { .. } | Instr::EnvSet { .. }
+        )
+    };
+    fixed_tagged_parameters(body)
+        && body.code.iter().any(heap_op)
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true)
+                || heap_op(op)
+                || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
+        })
+        && !body.code.iter().enumerate().any(|(bcp, op)| {
+            matches!(op, Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target)
+                if (*target as usize) <= bcp)
+        })
+}
+
+fn ordinary_heap_creators_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_HEAP_CREATORS").is_none())
+}
+
+/// Ordinary creators cannot inherit or register lexical exit scopes. Their
+/// nested templates must therefore need only heap lexical values; control-aware
+/// creation remains on the mapped path that installs the captured scope.
+pub(super) fn ordinary_heap_creator_supported(body: &BytecodeFunction) -> bool {
+    ordinary_heap_creators_enabled()
+        && fixed_tagged_parameters(body)
+        && body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::MakeEnvClosure { .. }))
+        && body.code.iter().all(|op| match op {
+            Instr::MakeEnvClosure { func, .. } => body
+                .nested_functions
+                .get(*func as usize)
+                .is_some_and(|nested| super::closure_templates::control_free(nested)),
+            _ => true,
+        })
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true)
+                || matches!(
+                    op,
+                    Instr::MakeEnv(_)
+                        | Instr::MakeEnvClosure { .. }
+                        | Instr::ClosureEnv
+                        | Instr::EnvRef { .. }
+                        | Instr::EnvSet { .. }
+                )
+                || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
+        })
+        && !body.code.iter().enumerate().any(|(bcp, op)| {
+            matches!(op, Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target)
+                if (*target as usize) <= bcp)
+        })
+}
+
 /// A body the ordinary x86-64 Lisp entry may run: scope-free, or scope-free
 /// apart from local TAGBODYs (bliss-6m6ca). Every DOTIMES, DOLIST, DO and
 /// LOOP is one, so admitting them lets a loop call its callees through the
@@ -2709,6 +2804,7 @@ fn ordinary_native_op(op: &Instr) -> bool {
             op,
             Instr::EnvRef { .. } | Instr::EnvSet { .. } | Instr::ClosureEnv | Instr::MakeEnv(_)
         )
+        || (matches!(op, Instr::MakeEnvClosure { .. }) && ordinary_heap_creators_enabled())
         // VALUES publishes its tuple through a noncollecting leaf and the
         // ordinary return descriptor (bliss-gg3i1.7.15.10.4).
         || (matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. })

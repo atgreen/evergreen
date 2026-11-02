@@ -4,6 +4,10 @@
 
 ### Added
 
+- Add opt-in eager T1 compilation for named FASL-loaded functions and their
+  nested closure templates with `EGCL_FASL_EAGER_T1=1`
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
 - Extend character and string storage to preserve surrogate character codes,
   with remaining stream, reader and formatting limitations
   ([#980](https://github.com/atgreen/evergreen/pull/980)).
@@ -29,6 +33,31 @@
   ([#887](https://github.com/atgreen/evergreen/pull/887)).
 
 ### Fixed
+
+- Compile eligible top-level `LET`/`LET*` function creators while preserving
+  shared captures, public function names and definition-time macro ordering
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Enter warmed named closures through their shared native template entries
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Create eligible control-free heap closures through ordinary T1 and T2 entries while
+  preserving captured values and retained definitions
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Reject invalid `STRING` designators with `TYPE-ERROR`, preserving the original
+  invalid datum ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Preserve dynamic binding order when keyword defaults read special parameters
+  indirectly ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Reclaim eligible heap-environment closures during minor GC while preserving
+  shared code identity and captured values
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Compile methods with definition-site lexical captures and admit eligible
+  function-cell lookups through ordinary T1 entries
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
 
 - Read large simple base and character strings correctly from native
   `CHAR`, `SCHAR`, and `ELT` accessors

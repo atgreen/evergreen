@@ -98,6 +98,21 @@ fn every_binding_shape_agrees_at_every_tier() {
     }
 }
 
+#[test]
+fn heap_creators_keep_the_same_results_with_mapped_entries() {
+    let fixture = fixture();
+    for tier in ["t1", "t2"] {
+        assert_expected(
+            &run(
+                &["--load", fixture.to_str().unwrap()],
+                tier,
+                &[("EGCL_DISABLE_ORDINARY_HEAP_CREATORS", "1")],
+            ),
+            &format!("{tier} with mapped creators"),
+        );
+    }
+}
+
 /// Recursive LABELS functions use heap environments by default; with
 /// `EGCL_HEAP_ENV_LABELS=0` they keep the frames, and must agree either way.
 #[test]
@@ -133,6 +148,15 @@ fn every_binding_shape_survives_gc_stress() {
             &format!("{tier} under GC stress"),
         );
     }
+    let t1_stress = [
+        ("EGCL_GC_STRESS", "17"),
+        ("EGCL_GC_STRESS_AFTER_INIT", "1"),
+        ("EGCL_GC_POISON", "1"),
+    ];
+    assert_expected(
+        &run(&["--eval", &program], "t1", &t1_stress),
+        "t1 under GC stress",
+    );
 }
 
 /// `(egcl::%env-access-counts)` is (name-ops name-hops slot-ops slot-hops

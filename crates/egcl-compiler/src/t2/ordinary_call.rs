@@ -1575,14 +1575,14 @@ impl OrdinaryCallEmission<'_> {
 /// The lean named call (bliss-gg3i1.7.15.10.1). Arguments are already in the
 /// outgoing area and every caller-side admission that remains (control, poll,
 /// multiple values) has passed. Load the target's function cell, and call the
-/// entry word when the cell holds an interpreted function whose entry this
-/// execution owns; the callee's lean entry checks the stack. Anything else
+/// entry word when this execution owns it or it is a shared template stub
+/// (which validates the execution itself); the callee checks the stack. Anything else
 /// falls through to the descriptor admission that follows, with RDI still the
 /// control pointer.
 ///
 /// GC: from the cell load to the call there is no call, poll or allocation,
-/// so RAX (the callee) needs no value-map coverage; the object is pinned in
-/// any case and reachable from the symbol. The callee receives it in RAX.
+/// so RAX (the callee) needs no value-map coverage before entry. The symbol
+/// roots the possibly movable instance; the callee publishes RAX itself.
 fn emit_lean_named_call(
     a: &mut Asm,
     emission: &OrdinaryCallEmission<'_>,
@@ -1593,9 +1593,11 @@ fn emit_lean_named_call(
     done: egcl_rt::asm::Label,
 ) -> Option<CallReturn> {
     use egcl_rt::function::{
-        ENTRY_OWNER_TAGGED_OFFSET, ENTRY_TAGGED_OFFSET, TYPE_ID_TAGGED_OFFSET,
+        ENTRY_OWNER_TAGGED_OFFSET, ENTRY_TAGGED_OFFSET, SHARED_ENTRY_OWNER, TYPE_ID_TAGGED_OFFSET,
     };
     let legacy = a.label();
+    let shared = a.label();
+    let enter = a.label();
     a.extend_from_slice(&[0x48, 0xa1]); // movabs rax, [function cell]
     a.extend_from_slice(&emission.target.function_cell.to_le_bytes());
     a.extend_from_slice(&[0x4c, 0x8d, 0x50]); // lea r10, [rax - heap tag]
@@ -1613,7 +1615,8 @@ fn emit_lean_named_call(
     load_mem64_disp(a, 11, RAX, ENTRY_TAGGED_OFFSET);
     load_mem64_disp(a, 10, 13, egcl_rt::exec_context::offsets::CODE_OWNER as i32);
     cmp_mem64_disp8(a, 10, RAX, ENTRY_OWNER_TAGGED_OFFSET as u8);
-    a.jcc(Cc::Ne, legacy);
+    a.jcc(Cc::Ne, shared);
+    a.bind(enter);
     // Arguments move exactly as the descriptor path below moves them; only
     // RAX differs. The callee checks its own stack, including overflow words.
     let lean = if emission.tail {
@@ -1651,6 +1654,27 @@ fn emit_lean_named_call(
         a.jmp(done);
         Some(lean)
     };
+    // Keep the ordinary owning-execution success path as a fallthrough. Only
+    // a mismatched owner takes the additional shared-stub admission.
+    a.bind(shared);
+    // This extension admits only the closure cohort taught by closure_entry.
+    // Other shared entries (including builtins) keep descriptor admission.
+    let flags = std::mem::offset_of!(egcl_rt::object::FunctionData, flags)
+        - egcl_rt::value::TAG_HEAP_OBJECT as usize;
+    debug_assert!(flags <= i8::MAX as usize);
+    a.extend_from_slice(&[
+        0xf6,
+        0x40,
+        flags as u8,
+        (egcl_rt::function::FLAG_CLOSURE_INSTANCE | egcl_rt::function::FLAG_CLOSURE_TEMPLATE) as u8,
+    ]);
+    a.jcc(Cc::E, legacy);
+    debug_assert_eq!(SHARED_ENTRY_OWNER, u64::MAX);
+    a.extend_from_slice(&[0x48, 0x83, 0x78, ENTRY_OWNER_TAGGED_OFFSET as u8, 0xff]);
+    a.jcc(Cc::Ne, legacy);
+    // A shared owner may have been armed after our earlier entry load.
+    load_mem64_disp(a, 11, RAX, ENTRY_TAGGED_OFFSET);
+    a.jmp(enter);
     a.bind(legacy);
     lean
 }

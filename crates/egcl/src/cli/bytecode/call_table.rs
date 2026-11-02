@@ -930,7 +930,14 @@ fn warm(state: &State, args: &[EgclVal]) -> Result<EgclVal, EgclError> {
             Some(call) => run_bridge_call(call, state, args, env),
             None => cold(state, args),
         },
-        Target::Function(_) => apply_function(*function, args, env),
+        Target::Function(_) => {
+            // A global name can hold a closure whose code belongs to a private
+            // template. Teach its exact instance just as FUNCALL does; the
+            // existing target/control guards decide whether it can be armed.
+            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            super::native_transfer_entry::closure_entry::teach(*function, args.len());
+            apply_function(*function, args, env)
+        }
     }
 }
 

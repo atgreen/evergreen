@@ -263,6 +263,29 @@ pub fn verify(f: &Function) -> Result<(), Vec<VerifyError>> {
                     "multiple-value list collection requires one primary and one result",
                 ));
             }
+            if let AuxData::HeapClosure { bcp } = data.aux {
+                let valid_state = data
+                    .frame_state
+                    .filter(|id| (id.0 as usize) < f.frame_states.len())
+                    .is_some_and(|id| {
+                        let scopes = &f.frame_states.get(id).scopes;
+                        scopes.last().is_some_and(|scope| scope.bcp == bcp)
+                    });
+                if data.opcode != Opcode::Call
+                    || data.args.is_empty()
+                    || data.results.len() != 1
+                    || !data.targets.is_empty()
+                    || !data.flags.call
+                    || !data.flags.effectful
+                    || !data.flags.safepoint
+                    || !valid_state
+                {
+                    errors.push(VerifyError::new(
+                        "V11 heap-closure",
+                        "heap closure requires parent/captures and exact recovery PC",
+                    ));
+                }
+            }
             if let AuxData::DirectExit { bcp } = data.aux {
                 let identity_matches = data
                     .frame_state

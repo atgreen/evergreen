@@ -1047,7 +1047,7 @@ pub(super) fn make_closure(
         layer
     };
     egcl_rt::rooted!(captured = captured);
-    let closure = make_heap_closure_instance(nested, env);
+    let closure = make_heap_closure_instance(nested, env)?;
     // SAFETY: a fresh instance no other thread can call yet.
     unsafe { egcl_rt::function::set_closure_env(closure, *captured) };
     Some(closure)

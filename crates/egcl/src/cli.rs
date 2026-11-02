@@ -22870,7 +22870,13 @@ fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
     if is_string_value(v) {
         return Ok(v);
     }
-    let s = if v.is_character() {
+    if !v.is_character() {
+        return Err(EgclError::TypeError {
+            datum: v,
+            expected: "(OR STRING SYMBOL CHARACTER)".into(),
+        });
+    }
+    let s = {
         if egcl_stdlib::characters::is_surrogate_char(v) {
             // No Rust text holds a surrogate; build the string from its code.
             return Ok(egcl_stdlib::make_lisp_string_from_codes(
@@ -22879,8 +22885,6 @@ fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
             ));
         }
         v.as_char().to_string()
-    } else {
-        val_as_str(v)
     };
     Ok(arena_str(&s))
 }
@@ -28116,6 +28120,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL::SET-SYMBOL-PLIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::PUT-SYMBOL-PROPERTY" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::%DBIND-CHECK-KEYS" => return eval_builtin_arguments(&name, cdr, env),
+            "EGCL::%DEFUN-CLOSURE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::PUT-PLIST" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::SET-SLOT-VALUE" => return eval_builtin_arguments(&name, cdr, env),
             "EGCL::GET-ACCESSOR-SLOT" => return eval_builtin_arguments(&name, cdr, env),
@@ -43371,11 +43376,11 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
 
     // Tier the method: compile its body to bytecode so invoke_method dispatches
     // it through the native tier ladder instead of eval_progn (bliss-x5y.20).
-    // Restrict to the tractable, high-value case — a method with no captured
-    // lexical environment (the compiler can't resolve free captured vars) and no
-    // CALL-NEXT-METHOD/NEXT-METHOD-P (which need env.method_context, unknown to
-    // the bytecode compiler). Everything else keeps tree-walking. A redefinition
-    // drops any stale compiled body first.
+    // A method defined within lexical bindings compiles as an escaping closure
+    // over those same locations. The method-context lowering remains shared with
+    // uncaptured methods, including CALL-NEXT-METHOD and escaping continuations.
+    // Unsupported bodies retain their original interpreter fallback. A
+    // redefinition drops any stale compiled body first.
     forget_compiled_method(method_id.0);
     if std::env::var_os("EGCL_NO_METHOD_COMPILE").is_none() {
         // Name the callable after its generic function, so profiles, the
@@ -43388,35 +43393,31 @@ fn eval_defmethod(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             _ => "",
         };
         let label = format!("(METHOD {name}{qualifier_text})");
-        if nested_in_binding {
-            // Tree-walked for good: say so, as every other decline does
-            // (bliss-75b8v).
-            bytecode::log_not_compiled(&label, "method defined inside a lexical binding");
-            if handoff_census::enabled() {
-                handoff_census::note("define:method:nested-in-binding".into());
-            }
+        let compile = if nested_in_binding {
+            bytecode::compile_and_reify_captured_method_lambda
         } else {
-            let compile_ll = method_lambda_list_for_compile(*lambda_list);
-            if let Some((callable, proof, raw_reader)) = bytecode::compile_and_reify_method_lambda(
-                &label,
-                compile_ll,
-                body,
-                env,
-                method_context_spec.expect("generated method context metadata"),
-            ) {
-                METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
-                if let Some(raw_reader) = raw_reader {
-                    METHOD_RAW_READERS
-                        .borrow_mut()
-                        .insert(method_id.0, raw_reader);
-                }
-                if let Some(proof) = proof {
-                    METHOD_CONTEXT_UNUSED
-                        .borrow_mut()
-                        .insert(method_id.0, proof);
-                }
-                invalidate_gf_dispatch_cache();
+            bytecode::compile_and_reify_method_lambda
+        };
+        let compile_ll = method_lambda_list_for_compile(*lambda_list);
+        if let Some((callable, proof, raw_reader)) = compile(
+            &label,
+            compile_ll,
+            body,
+            env,
+            method_context_spec.expect("generated method context metadata"),
+        ) {
+            METHOD_COMPILED.borrow_mut().insert(method_id.0, callable);
+            if let Some(raw_reader) = raw_reader {
+                METHOD_RAW_READERS
+                    .borrow_mut()
+                    .insert(method_id.0, raw_reader);
             }
+            if let Some(proof) = proof {
+                METHOD_CONTEXT_UNUSED
+                    .borrow_mut()
+                    .insert(method_id.0, proof);
+            }
+            invalidate_gf_dispatch_cache();
         }
     }
     generic_binding::publish(&name, name_form.symbol_index(), false);
@@ -45752,6 +45753,7 @@ fn is_builtin_function(name: &str) -> bool {
     if matches!(
         name,
         "EGCL::%MAKE-NIL-VECTOR"
+            | "EGCL::%DEFUN-CLOSURE"
             | "EGCL::%APPLY-RETAINED-GENERIC"
             | "EGCL::%MAKE-RANDOM-STATE"
             | "EGCL::%RANDOM-STATE-P"
@@ -52297,6 +52299,11 @@ mod method_block_tests {
             env.methods.borrow()["FASL-NESTED-METHOD"][0]
                 .captured_frame
                 .is_some()
+        );
+        let nested_id = env.methods.borrow()["FASL-NESTED-METHOD"][0].method_id.0;
+        assert!(
+            METHOD_COMPILED.borrow().contains_key(&nested_id),
+            "a nested FASL method compiles with its definition-site capture"
         );
         assert_eq!(
             read_eval_all_env("(fasl-nested-method 1)", &mut env).unwrap(),

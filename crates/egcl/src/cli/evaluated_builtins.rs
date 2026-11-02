@@ -4372,6 +4372,44 @@ fn resolve(name: &str) -> Option<Handler> {
             Ok(plist)
         }),
 
+        "EGCL::%DEFUN-CLOSURE" => Some(|_operator, args, env| {
+            // A DEFUN of NAME inside a compiled top-level binding form
+            // (bliss-gg3i1.7.15.7): install the compiled closure FUNCTION as
+            // NAME's global definition, as DEFUN does for a tree-walked one,
+            // and return NAME. A noncapturing lambda may be its shared
+            // prototype; give this definition a fresh instance before naming it.
+            egcl_rt::rooted!(name = args.first().copied().unwrap_or(NIL));
+            egcl_rt::rooted!(function = args.get(1).copied().unwrap_or(NIL));
+            let Some(index) = name.symbol_index().filter(|_| !name.is_nil() && *name != T) else {
+                return Err(EgclError::TypeError {
+                    datum: *name,
+                    expected: "SYMBOL".into(),
+                });
+            };
+            if !egcl_rt::function::is_interpreted_function(*function) {
+                return Err(EgclError::TypeError {
+                    datum: *function,
+                    expected: "FUNCTION".into(),
+                });
+            }
+            if egcl_rt::function::is_closure_template(*function) {
+                *function = egcl_rt::function::alloc_closure_instance(*function, 0);
+            }
+            // This generated lambda belongs to exactly this DEFUN site. The
+            // instance is fresh and unexposed; its private prototype/code key
+            // remain unchanged, so saved references keep their own identity.
+            unsafe { egcl_rt::function::set_name(*function, *name) };
+            egcl_rt::symbols::set_symbol_function(index, *function);
+            // A previously registered compiled body for the name would keep
+            // answering calls (bliss-96hjb).
+            if bytecode::is_registered(index) {
+                bytecode::clear_lazy_state(index);
+            }
+            bytecode::bump_direct_call_gen_for(index);
+            home_defined_symbol(env, *name);
+            Ok(*name)
+        }),
+
         "EGCL::%DBIND-CHECK-KEYS" => Some(|_operator, args, _env| {
             // Keyword check for bytecode-lowered DESTRUCTURING-BIND `&key`
             // (bliss-gg3i1.7.17): KEYS must be an even-length plist whose
