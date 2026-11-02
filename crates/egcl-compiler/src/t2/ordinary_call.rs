@@ -172,6 +172,9 @@ pub struct OrdinarySelfCallFacts {
     /// pending-work slot, exactly as an ordinary call admits, and skips the
     /// published runtime poll when nothing is armed (bliss-6m6ca).
     pub top_tier: bool,
+    /// Baseline (not `top_tier`) only: sample loop heat in batches. Its other
+    /// polls then test the R13 execution as `top_tier` polls do (bliss-tudsy).
+    pub baseline_heat: Option<super::BaselineHeat>,
 }
 
 #[derive(Clone, Copy)]

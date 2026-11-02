@@ -27565,6 +27565,12 @@ fn nn_direct_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("EGCL_NN_DIRECT").as_deref() != Ok("0"))
 }
 
+/// Whether T2 may still replace `sym`'s baseline: enabled and not declined.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn t2_may_replace(sym: u32) -> bool {
+    t2_enabled() && !T2_DECLINED.with(|declined| declined.borrow().contains(&sym))
+}
+
 /// T2 is part of normal tiering.  `EGCL_DISABLE_T2=1` is the explicit debug
 /// off-switch; `EGCL_T2=0` is accepted for compatibility with the old gate.
 fn t2_enabled() -> bool {

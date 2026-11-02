@@ -106,14 +106,9 @@ fn impure_osr_loop_resumes_after_effect_on_numeric_guard_failure() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains(
-            if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-                // Mapped T1 computes the ratio generically: no deopt.
-                "OSR-EFFECTS (200 200 T NIL)"
-            } else {
-                "OSR-EFFECTS (200 200 T T)"
-            }
-        ),
+        // Mapped T1 speculates a DOTIMES body too (bliss-tudsy), so the ratio
+        // deopts on every target.
+        String::from_utf8_lossy(&output.stdout).contains("OSR-EFFECTS (200 200 T T)"),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );

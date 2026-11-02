@@ -275,6 +275,8 @@ fn native_private_root_survives_short_and_wide_calls() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+    let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     install_collector(&mut env);
@@ -335,6 +337,8 @@ fn native_returned_primary_moves_after_becoming_a_caller_private_root() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+    let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     install_collector(&mut env);

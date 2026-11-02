@@ -60,6 +60,7 @@ impl TransferCode {
                     .iter()
                     .all(|ty| matches!(ty, DeclaredType::Any))
                 && self.osr_entries.is_empty()
+                && self.ordinary_root_allowed()
                 && lean_root_enabled()
         })
     }

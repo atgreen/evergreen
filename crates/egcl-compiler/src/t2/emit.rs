@@ -1553,6 +1553,37 @@ pub struct NativePollFastPath {
     pub signal_epoch: u64,
     pub observe_forces_cold: bool,
     pub instrument_skips: bool,
+    /// Baseline (T1) code: its loop-header heat and OSR-entry polls reach the
+    /// runtime, which counts heat and enters ready optimized code. Every other
+    /// poll in the loop body takes the idle guard (bliss-tudsy).
+    pub baseline_heat: Option<BaselineHeat>,
+}
+
+/// Baseline loop heat sampling (bliss-tudsy). Generated code counts
+/// loop-header visits down in a code-owned `u32` at `counter`; when it runs out,
+/// or the idle guard finds pending work, it reloads `batch` and calls the
+/// runtime poll with request bit 2, which records `batch` visits.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[derive(Clone, Copy, Debug)]
+pub struct BaselineHeat {
+    pub counter: u64,
+    pub batch: u32,
+}
+
+/// Count one visit; branch to `slow` once the batch is spent.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_countdown(a: &mut Asm, heat: BaselineHeat, slow: egcl_rt::asm::Label) {
+    mov_imm64(a, RAX, heat.counter as i64);
+    a.extend_from_slice(&[0x83, 0x28, 0x01]); // sub dword [rax],1
+    a.jcc(Cc::Le, slow);
+}
+
+/// The slow edge of a counted poll: restart the batch it samples.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_heat_reload(a: &mut Asm, heat: BaselineHeat) {
+    mov_imm64(a, RAX, heat.counter as i64);
+    a.extend_from_slice(&[0xc7, 0x00]); // mov dword [rax],batch
+    a.extend_from_slice(&heat.batch.to_le_bytes());
 }
 
 /// One acquire observation of the running execution's pending work. The slot
@@ -1581,6 +1612,7 @@ fn emit_idle_poll_guard(
     fast: NativePollFastPath,
     home: FramedHome,
     idle: egcl_rt::asm::Label,
+    heat: Option<BaselineHeat>,
 ) {
     use std::mem::offset_of;
     let slow = a.label();
@@ -1609,6 +1641,9 @@ fn emit_idle_poll_guard(
         a.jcc(Cc::Ne, slow);
         a.bind(no_observer);
     }
+    if let Some(heat) = heat {
+        emit_heat_countdown(a, heat, slow);
+    }
     if fast.instrument_skips {
         load_mem64_disp(
             a,
@@ -1622,13 +1657,20 @@ fn emit_idle_poll_guard(
     }
     a.jmp(idle);
     a.bind(slow);
+    if let Some(heat) = heat {
+        emit_heat_reload(a, heat);
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 struct PollFrame {
     fast_path: Option<(NativePollFastPath, FramedHome)>,
-    /// Ordinary final-tier code: skip an idle poll by testing R13's slot.
+    /// Ordinary code: skip an idle poll by testing R13's slot.
     execution_idle: bool,
+    /// Baseline code: heat and OSR-entry polls implement tier transfer.
+    baseline_heat: bool,
+    /// Baseline code's loop heat counter, when its idle polls can skip.
+    heat_counter: Option<BaselineHeat>,
     arguments: Vec<(crate::t2::ir::Value, u32)>,
     native_frame_mode: bool,
     spill_area: NativeValueArea,
@@ -1649,26 +1691,43 @@ fn emit_mapped_poll(
     frame: &PollFrame,
     veneer: u64,
     heat: bool,
+    osr_entry: bool,
 ) -> Result<(CallReturn, std::sync::Arc<NativeFrameValues>), EmitError> {
-    let idle = frame
-        .fast_path
-        .map(|(fast, home)| {
-            let idle = a.label();
-            emit_idle_poll_guard(a, fast, home, idle);
-            idle
-        })
-        .or_else(|| {
-            frame.execution_idle.then(|| {
-                // The ordinary entry holds the current execution in R13 for its
-                // whole extent; ordinary call admission reads this same slot.
+    // Baseline heat and OSR polls implement tier transfer; the remaining
+    // polls only service runtime requests. A baseline heat header skips the
+    // call until its sampled batch runs out; an OSR entry that samples no
+    // heat calls on every visit (bliss-tudsy).
+    let tiering = (heat || osr_entry) && frame.baseline_heat;
+    let counter = frame.heat_counter.filter(|_| tiering && heat);
+    let idle = if tiering && counter.is_none() {
+        None
+    } else {
+        frame
+            .fast_path
+            .map(|(fast, home)| {
                 let idle = a.label();
-                let slow = a.label();
-                emit_execution_poll_guard(a, 13, slow);
-                a.jmp(idle);
-                a.bind(slow);
+                emit_idle_poll_guard(a, fast, home, idle, counter);
                 idle
             })
-        });
+            .or_else(|| {
+                frame.execution_idle.then(|| {
+                    // The ordinary entry holds the current execution in R13 for its
+                    // whole extent; ordinary call admission reads this same slot.
+                    let idle = a.label();
+                    let slow = a.label();
+                    emit_execution_poll_guard(a, 13, slow);
+                    if let Some(heat) = counter {
+                        emit_heat_countdown(a, heat, slow);
+                    }
+                    a.jmp(idle);
+                    a.bind(slow);
+                    if let Some(heat) = counter {
+                        emit_heat_reload(a, heat);
+                    }
+                    idle
+                })
+            })
+    };
     for (index, home) in values.raw_registers().enumerate() {
         load_home(a, RAX, home, 0);
         store_home(
@@ -1724,7 +1783,12 @@ fn emit_mapped_poll(
     } else {
         load_home(a, 7, frame.base, 0);
     }
-    if heat && frame.fast_path.is_none() && !frame.execution_idle {
+    // Only a poll that always calls the runtime samples heat, one visit per
+    // call. A counted poll samples its whole batch (bit 2); pending work that
+    // ends a batch early also counts as one, since heat is an estimate.
+    if heat && counter.is_some() && idle.is_some() {
+        a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x05]); // or rdi,5
+    } else if heat && idle.is_none() {
         a.extend_from_slice(&[0x48, 0x83, 0xcf, 0x01]); // or rdi,1
     }
     mov_imm64(a, RAX, veneer as i64);
@@ -8575,7 +8639,22 @@ fn emit_framed_inner(
         .zip(activation_slots)
         .map(|(base, activation_slots)| PollFrame {
             fast_path: poll_fast_path.zip(poll_control_home),
-            execution_idle: ordinary_call.is_some_and(|call| call.self_facts.top_tier),
+            // Every ordinary ingress holds the execution in R13; a baseline's
+            // non-tiering polls skip an idle runtime as final-tier polls do.
+            execution_idle: ordinary_call.is_some_and(|call| {
+                call.self_facts.top_tier || call.self_facts.baseline_heat.is_some()
+            }),
+            baseline_heat: poll_fast_path.is_some_and(|fast| fast.baseline_heat.is_some())
+                || ordinary_call.is_some_and(|call| {
+                    !call.self_facts.top_tier && call.self_facts.baseline_heat.is_some()
+                }),
+            heat_counter: poll_fast_path
+                .and_then(|fast| fast.baseline_heat)
+                .or_else(|| {
+                    ordinary_call
+                        .filter(|call| !call.self_facts.top_tier)
+                        .and_then(|call| call.self_facts.baseline_heat)
+                }),
             arguments: native_arguments.clone(),
             native_frame_mode,
             spill_area,
@@ -8641,6 +8720,7 @@ fn emit_framed_inner(
                 poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                 poll_veneer,
                 heat_headers.contains(&b),
+                f.osr_entries.iter().any(|osr| osr.block == b),
             )?;
             native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
             let origin = match bounded_polls.get(&b) {
@@ -8754,6 +8834,7 @@ fn emit_framed_inner(
                     &homes,
                     poll_frame.as_ref().ok_or(EmitError::UnsupportedOp(0xFE))?,
                     poll_veneer,
+                    false,
                     false,
                 )?;
                 native_value_maps.insert(call.return_offset, NativeCallValues::Frame(values));
@@ -14711,6 +14792,8 @@ mod poll_map_tests {
                 &PollFrame {
                     fast_path: None,
                     execution_idle: false,
+                    baseline_heat: false,
+                    heat_counter: None,
                     arguments: Vec::new(),
                     native_frame_mode: false,
                     spill_area: NativeValueArea::Activation(0),
@@ -14721,6 +14804,7 @@ mod poll_map_tests {
                     native_slots: 3,
                 },
                 0x12345678,
+                false,
                 false,
             )
             .unwrap();
@@ -14917,6 +15001,8 @@ mod poll_map_tests {
                 &PollFrame {
                     fast_path: None,
                     execution_idle: false,
+                    baseline_heat: false,
+                    heat_counter: None,
                     arguments: Vec::new(),
                     native_frame_mode: false,
                     spill_area: if native_storage {
@@ -14931,6 +15017,7 @@ mod poll_map_tests {
                     native_slots: 5,
                 },
                 veneer.as_ptr() as u64,
+                false,
                 false,
             )
             .unwrap();

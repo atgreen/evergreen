@@ -19,6 +19,7 @@ pub(super) fn binding() -> Option<NativePollFastPath> {
         signal_epoch: egcl_rt::runtime::process_signal_activity_address() as u64,
         observe_forces_cold: cfg!(test),
         instrument_skips: cfg!(test),
+        baseline_heat: None,
     })
 }
 
@@ -53,6 +54,34 @@ unsafe extern "C" fn initialize() -> *mut NativePollControl {
     }
     control
 }
+
+/// Loop-header visits baseline (T1) code counts in generated code per runtime
+/// heat sample (bliss-tudsy). Each sample records the whole batch, so batching
+/// delays a T2 request or OSR entry by at most this many visits; a low
+/// back-edge threshold keeps sampling every visit.
+pub(in crate::cli::bytecode) fn heat_batch() -> u32 {
+    // Unit tests count exact heat; a test may raise this around its own
+    // compilation and run, under the heap test lock.
+    #[cfg(test)]
+    {
+        TEST_HEAT_BATCH.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        static BATCH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *BATCH.get_or_init(|| {
+            std::env::var("EGCL_T1_HEAT_BATCH")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|batch| *batch > 0)
+                .unwrap_or_else(|| (t2_backedge_threshold() / 64).clamp(1, 128))
+        })
+    }
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) static TEST_HEAT_BATCH: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1);
 
 /// Fresh function boundary prevents carrier TLS reads moving across a yielding
 /// poll. Copy only the consumed epoch; copying the producer would acknowledge

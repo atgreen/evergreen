@@ -76,9 +76,12 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
             registry
                 .borrow()
                 .get(&symbol)
+                // A baseline's mapped companion runs runtime entries and OSR
+                // imports under the same installed version (bliss-tudsy).
                 .filter(|native| {
                     matches!(&native._storage, NativeCodeStorage::Mapped(mapped)
-                    if std::ptr::eq(mapped.as_ref(), code))
+                    if std::ptr::eq(mapped.as_ref(), code)
+                        || (!native.is_t2 && std::ptr::eq(mapped.osr_destination(), code)))
                 })
                 .cloned()
                 .map(|native| (symbol, native))
@@ -3088,6 +3091,11 @@ mod tests {
             root_publication::OBSERVE.with(|hook| hook.get().is_none()),
             "observer-forced publication cannot prove baseline poll selection"
         );
+        assert!(
+            replacement._native_calls.iter().any(|site| matches!(site.origin,
+                egcl_compiler::t2::x64_calls::NativeCallOrigin::StraightPoll(_))),
+            "the refreshed baseline retains its straight-line polls"
+        );
         reset_poll_paths_for_test();
         for _ in 0..12 {
             assert_eq!(
@@ -3098,11 +3106,11 @@ mod tests {
             );
         }
         let (idle, published) = take_poll_paths_for_test();
-        assert_eq!(idle, 0, "refreshed optimized baseline polls must publish");
-        assert!(
-            published >= 12,
-            "each refreshed call must execute a real straight-line poll: {published}"
-        );
+        assert_eq!(idle, 0, "baseline polls never take the T2 Rust preflight");
+        // A baseline straight-line poll samples no heat and services only
+        // runtime requests; with none pending it skips the runtime, as the
+        // final tier's polls do (bliss-tudsy).
+        assert_eq!(published, 0, "idle baseline straight-line polls skip publication");
         assert_eq!(
             replacement.deopt_count(),
             0,

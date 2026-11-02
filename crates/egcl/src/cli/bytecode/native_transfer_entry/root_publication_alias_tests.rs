@@ -112,6 +112,8 @@ fn aliased_native_publications_visit_each_physical_home_once() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    // A mapped T1 loop fixture (bliss-gg3i1.7.15.10.7).
+    let _t1_mapped = crate::cli::bytecode::native_transfer_entry::T1TagbodyMappedForTest::new();
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     egcl_rt::rooted!(params = reader::read_from_string("(x y)").unwrap().0);
