@@ -50,6 +50,10 @@
 
 ### Fixed
 
+- Compile bytecode closure creation in RV64 T1 while preserving captured
+  locations and retained definitions
+  ([#987](https://github.com/atgreen/evergreen/pull/987)).
+
 - Compile eligible top-level `LET`/`LET*` function creators while preserving
   shared captures, public function names and definition-time macro ordering
   ([#981](https://github.com/atgreen/evergreen/pull/981)).
