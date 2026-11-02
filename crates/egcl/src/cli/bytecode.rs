@@ -19375,16 +19375,54 @@ pub(super) struct RawSlotReader {
 
 pub(super) fn compile_and_reify_method_lambda(
     label: &str,
+    lambda_list: EgclVal,
+    body: EgclVal,
+    env: &super::Env,
+    spec: MethodContextSpec,
+) -> Option<(EgclVal, Option<MethodNoContextBody>, Option<RawSlotReader>)> {
+    compile_and_reify_method_lambda_in(label, lambda_list, body, env, spec, false)
+}
+
+/// A method defined within lexical bindings shares those locations with its
+/// defining scope, as any escaping compiled closure does.
+pub(super) fn compile_and_reify_captured_method_lambda(
+    label: &str,
+    lambda_list: EgclVal,
+    body: EgclVal,
+    env: &super::Env,
+    spec: MethodContextSpec,
+) -> Option<(EgclVal, Option<MethodNoContextBody>, Option<RawSlotReader>)> {
+    compile_and_reify_method_lambda_in(label, lambda_list, body, env, spec, true)
+}
+
+fn compile_and_reify_method_lambda_in(
+    label: &str,
     mut lambda_list: EgclVal,
     mut body: EgclVal,
     env: &super::Env,
     spec: MethodContextSpec,
+    captured: bool,
 ) -> Option<(EgclVal, Option<MethodNoContextBody>, Option<RawSlotReader>)> {
     // Compilation allocates; a second compile below reads these again.
     egcl_rt::rooted_ref!(_lambda_list_root = &mut lambda_list);
     egcl_rt::rooted_ref!(_body_root = &mut body);
     let scope = method_context_use::Scope::enter(spec);
-    let function = compile_and_reify_lambda_inner(label, lambda_list, body, env)?;
+    let compile = |lambda_list, body| {
+        if captured {
+            compile_tree_closure(
+                label,
+                lambda_list,
+                body,
+                env,
+                Arc::clone(&env.frame),
+                &env.block_stack,
+                &env.tag_stack,
+            )
+        } else {
+            compile_and_reify_lambda_inner(label, lambda_list, body, env)
+        }
+    };
+    let function = compile(lambda_list, body)?;
     if scope.lexically_unused() && scope.raw_reader().is_none() {
         // Nothing reads the generated method-context binding or its helper
         // functions, so the source body without them is the same method minus
@@ -19397,7 +19435,7 @@ pub(super) fn compile_and_reify_method_lambda(
         egcl_rt::rooted!(function = function);
         let plain = super::method_continuations::unwrapped_body(body);
         if plain != body
-            && let Some(direct) = compile_and_reify_lambda_inner(label, lambda_list, plain, env)
+            && let Some(direct) = compile(lambda_list, plain)
         {
             let proof = if unused {
                 bytecode_for_callable(egcl_rt::function::definition_index(direct), direct)
