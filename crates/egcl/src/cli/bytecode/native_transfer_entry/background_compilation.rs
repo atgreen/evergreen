@@ -140,10 +140,40 @@ impl EmittedTransfer {
                     .map(Box::new)
             })
             .transpose()?;
+        // Eligibility describes the entire reachable leaf address graph, not
+        // merely the presence of an ordinary entry. Pointer-bearing mapped and
+        // call/adapter variants keep their payload installation-owned.
+        let audited_leaf = self.is_t2
+            && self.ordinary_entry.is_some()
+            && self._ordinary_arity.is_some()
+            && self._ordinary_keywords.is_none()
+            && self._ordinary_cold.is_none()
+            && !self.has_deopt
+            && self.osr_entries.is_empty()
+            && self.sites.sites().next().is_none()
+            && companion.is_none()
+            && self._call_entries.is_empty()
+            && self._heat_counter.is_none()
+            && self.recursive_symbol.is_none()
+            && self.native_callable_slot.is_none()
+            && artifact::binding_free_leaf_body(&body);
+        let executable = ExecutableOwner::new(
+            ExecutablePayload {
+                code: self.code,
+                code_info,
+                _native_calls: self._native_calls,
+                code_len: self.code_len,
+                bcp_offsets: self.bcp_offsets,
+                _ordinary_arity: self._ordinary_arity,
+                retained_roots: None,
+            },
+            audited_leaf,
+            &roots,
+        );
         Ok(TransferCode {
+            executable,
             body,
             _body_roots: roots,
-            code_info,
             deopt_metadata: metadata,
             deopts: Cell::new(0),
             recompile: Cell::new(false),
@@ -159,9 +189,6 @@ impl EmittedTransfer {
             unavailable_handler: None,
             installed_symbol: self.installed_symbol,
             is_t2: self.is_t2,
-            code: self.code,
-            _native_calls: self._native_calls,
-            code_len: self.code_len,
             frame_entry: self.frame_entry,
             ordinary_entry: self.ordinary_entry,
             ordinary_lean_entry: self.ordinary_lean_entry,
@@ -169,11 +196,9 @@ impl EmittedTransfer {
             ordinary_bound_entry: self.ordinary_bound_entry,
             ordinary_checks_params: self.ordinary_checks_params,
             _ordinary_keywords: self._ordinary_keywords,
-            _ordinary_arity: self._ordinary_arity,
             _ordinary_cold: self._ordinary_cold,
             _primitive_cells: self._primitive_cells,
             has_deopt: self.has_deopt,
-            bcp_offsets: self.bcp_offsets,
             osr_entries: self.osr_entries,
             osr_raw_doubles: self.osr_raw_doubles,
             osr_companion: companion,
