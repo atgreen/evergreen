@@ -65,6 +65,12 @@ pub(in crate::cli::bytecode) struct TemplateClaim {
 }
 
 impl TemplateClaim {
+    pub(in crate::cli::bytecode) fn same_claim(&self, other: &Self) -> bool {
+        std::ptr::eq(self.record, other.record)
+            && self.owner == other.owner
+            && self.entry == other.entry
+    }
+
     /// Release the pair if it still names this claim. Only the owning
     /// execution, or the collector with it stopped, gets here.
     pub(in crate::cli::bytecode) fn release(&self) {
@@ -154,8 +160,9 @@ fn record_for(prototype: EgclVal, callable: bool) -> Option<&'static TemplateRec
 /// through the runtime, to its template's entry claim: when it is a closure
 /// whose template has current T2 code with a lean ordinary entry in this
 /// execution, claim the template's pair for that code and arm `function`'s
-/// word, so its next call enters the code directly. Allocation-free and
-/// non-collecting; a no-op for anything else.
+/// word, so its next call enters the code directly. Non-collecting: first use
+/// may allocate Rust metadata and JIT stubs, but no Lisp heap objects. A no-op
+/// for anything else.
 pub(in crate::cli::bytecode) fn teach(function: EgclVal, nargs: usize) {
     if !lean_funcall_enabled() || !egcl_rt::function::is_interpreted_function(function) {
         return;

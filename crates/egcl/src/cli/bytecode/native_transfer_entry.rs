@@ -1263,7 +1263,18 @@ impl TransferCode {
 
     /// Hold `claim` until this code's private entries retire.
     pub(super) fn note_template_claim(&self, claim: closure_entry::TemplateClaim) {
-        self.template_claims.borrow_mut().push(claim);
+        // Mapped callers can keep using the runtime FUNCALL path after the
+        // template is armed. Hold one lease per exact claim, rather than
+        // accumulating the same lease on every call.
+        let mut claims = self.template_claims.borrow_mut();
+        if !claims.iter().any(|current| current.same_claim(&claim)) {
+            claims.push(claim);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn template_claim_count_for_test(&self) -> usize {
+        self.template_claims.borrow().len()
     }
 
     pub(super) fn retire_private_entries(&self) {

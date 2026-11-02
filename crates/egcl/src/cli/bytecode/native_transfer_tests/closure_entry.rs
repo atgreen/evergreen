@@ -89,6 +89,13 @@ fn lean_funcall_enters_instances_through_their_template_claim() {
         );
         let prototype = egcl_rt::function::closure_prototype(*first).unwrap();
         assert_eq!(word(prototype).0, stub, "the prototype names the stub");
+        // Mapped/runtime callers continue to teach even after a template is
+        // armed. Repeating that path must not grow the retained claim list.
+        for _ in 0..128 {
+            native_transfer_entry::closure_entry::teach(*first, 1);
+            native_transfer_entry::closure_entry::teach(*second, 1);
+        }
+        assert_eq!(mapped(&code).template_claim_count_for_test(), 1);
         misses();
         fast_calls();
         let _ = native_transfer_entry::take_lean_root_entries_for_test();

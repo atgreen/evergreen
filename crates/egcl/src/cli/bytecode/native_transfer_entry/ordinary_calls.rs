@@ -509,7 +509,7 @@ unsafe fn complete_through_runtime(
                         return Err(invalid_capture());
                     }
                     if teach {
-                        // Allocation-free: the request is reread below.
+                        // Non-collecting: the request is reread below.
                         super::closure_entry::teach((*request).closure, count);
                     }
                     // The request stays rooted; reread the callee after polling.
