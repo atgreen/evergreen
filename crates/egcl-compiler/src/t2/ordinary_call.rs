@@ -985,6 +985,11 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::Brif
                 | Opcode::Car
                 | Opcode::Cdr
+                // Heap-environment slots and the callable's environment word
+                // (Backpack): plain loads, and a barriered store.
+                | Opcode::EnvSlotRef
+                | Opcode::EnvSlotSet
+                | Opcode::CallableClosureEnv
                 | Opcode::ConstHeapObj
                 | Opcode::StringByteLength
                 | Opcode::StringAsciiCharAt

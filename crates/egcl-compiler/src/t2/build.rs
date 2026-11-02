@@ -147,6 +147,10 @@ fn heap_env_operands(instr: &Instr) -> Option<(usize, bool)> {
     })
 }
 
+/// The runtime adapter a non-mapped build calls for `MakeEnv`:
+/// `(parent size) -> environment`.
+pub const HEAP_ENV_MAKE_ADAPTER: &str = "EGCL::%LEXENV-MAKE";
+
 fn instr_kind(instr: &Instr) -> String {
     let full = format!("{instr:?}");
     match full.find(['(', ' ', '{']) {
@@ -387,12 +391,37 @@ pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<()
                     | Opcode::SymbolFunction
                     | Opcode::EnvironmentValue
                     | Opcode::SetEnvironmentValue
+                    | Opcode::ClosureEnvironment
             )
         })
         .collect();
     for call in calls {
         let operation = f.inst(call).opcode;
-        if matches!(
+        if operation == Opcode::ClosureEnvironment {
+            // A mapped activation reads it from its frame's callable through
+            // the decode-at-PC request.
+            let state = f
+                .inst(call)
+                .frame_state
+                .ok_or(BuildError::Unsupported("unmapped closure environment"))?;
+            let bcp = f
+                .frame_states
+                .get(state)
+                .scopes
+                .last()
+                .ok_or(BuildError::Unsupported(
+                    "closure environment without logical frame",
+                ))?
+                .bcp;
+            let data = f.inst_mut(call);
+            data.opcode = Opcode::Call;
+            data.aux = AuxData::LexicalEnvironment {
+                bcp,
+                value: false,
+                result: true,
+            };
+            data.flags = runtime_call_flags();
+        } else if matches!(
             operation,
             Opcode::EnvironmentValue | Opcode::SetEnvironmentValue
         ) {
@@ -1575,6 +1604,17 @@ impl<'a> Builder<'a> {
                         ));
                     }
                     push(i + 1, d - 2, &mut depth_at, &mut work);
+                }
+                Instr::MakeEnv(_) if !self.native_cleanups => {
+                    if d < 1 {
+                        return Err(BuildError::Unsupported(
+                            "heap environment operand underflow",
+                        ));
+                    }
+                    push(i + 1, d, &mut depth_at, &mut work);
+                }
+                Instr::ClosureEnv if !self.native_cleanups => {
+                    push(i + 1, d + 1, &mut depth_at, &mut work);
                 }
                 Instr::MakeEnv(_) | Instr::ClosureEnv | Instr::MakeEnvClosure { .. }
                     if self.native_cleanups =>
@@ -2828,6 +2868,65 @@ impl<'a> Builder<'a> {
                         )?;
                         return Ok(());
                     }
+                    stack.push(results[0]);
+                }
+                // Outside the mapped protocol, `ClosureEnv` waits for the entry
+                // ABI (see `Opcode::ClosureEnvironment`), and `MakeEnv` is a
+                // call to its allocating runtime adapter.
+                Instr::ClosureEnv if !self.native_cleanups => {
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let value = self
+                        .emit(
+                            block,
+                            Opcode::ClosureEnvironment,
+                            vec![],
+                            AuxData::None,
+                            runtime_call_flags(),
+                            Some(fs),
+                            IRType::TOP,
+                        )
+                        .expect("closure environment has a result");
+                    stack.push(value);
+                }
+                Instr::MakeEnv(size) if !self.native_cleanups => {
+                    let parent = stack
+                        .pop()
+                        .ok_or(BuildError::Unsupported("stack underflow (MakeEnv)"))?;
+                    let fs = self.build_frame_state(
+                        block,
+                        &{
+                            let mut before = stack.clone();
+                            before.push(parent);
+                            before
+                        },
+                        i as u32,
+                    );
+                    let count = self
+                        .emit(
+                            block,
+                            Opcode::ConstFixnum,
+                            vec![],
+                            AuxData::FixnumImm(i64::from(*size)),
+                            InstFlags::default(),
+                            None,
+                            IRType::of(TypeBits::FIXNUM),
+                        )
+                        .expect("constant has a result");
+                    let target = egcl_rt::symbols::intern(HEAP_ENV_MAKE_ADAPTER);
+                    let (_, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args: vec![parent, count],
+                            results: vec![],
+                            aux: AuxData::CallTarget(target),
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
                     stack.push(results[0]);
                 }
                 // Heap lexical environments (Backpack): a slot is a load chain

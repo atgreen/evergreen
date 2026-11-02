@@ -185,7 +185,10 @@ pub const IMAGE_MAGIC: u64 = u64::from_be_bytes(*b"EGCLIMG\0");
 // Version 19 grows interpreted function objects by a native entry word and its
 // owner key (bliss-gg3i1.7.15.10.1); both are saved as zero and re-derived when
 // the restored process publishes code. Older function bodies are too short.
-const FORMAT_VERSION: u32 = 19;
+// Version 20 grows interpreted function objects by a traced heap-environment
+// word after the entry owner (Backpack heap environments) and adds the LEXENV
+// object type. Older function bodies are too short to read.
+const FORMAT_VERSION: u32 = 20;
 
 /// Image file header (128 bytes). D7.01.
 #[derive(Clone, Copy)]

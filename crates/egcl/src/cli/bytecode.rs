@@ -7558,6 +7558,20 @@ impl<'e> Lowerer<'e> {
                     egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
                     *clause_body = arena_cons(*let_form, NIL);
                     Some(slot)
+                } else if self.captured_names.contains(&var_key) {
+                    // A closure captures the clause variable, and the driver
+                    // stores the condition in a frame slot: bind it from a
+                    // hidden slot with LET, which handles a captured variable
+                    // (bliss-gg3i1.7.17).
+                    egcl_rt::rooted!(hidden = super::gensym_symbol("HANDLER-CASE-CONDITION"));
+                    let slot = self.alloc_slot(&var_name(*hidden));
+                    let let_sym = super::resolve_sym("LET").ok_or(Bail)?;
+                    egcl_rt::rooted!(binding = vec_to_list(&[var, *hidden]));
+                    egcl_rt::rooted!(bindings = vec_to_list(&[*binding]));
+                    egcl_rt::rooted!(let_body = arena_cons(*bindings, body));
+                    egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
+                    *clause_body = arena_cons(*let_form, NIL);
+                    Some(slot)
                 } else {
                     Some(self.alloc_slot(&var_key))
                 }
@@ -8125,8 +8139,39 @@ impl<'e> Lowerer<'e> {
         let saved_next_local = self.next_local;
         self.enter_scope();
         let slot_base = self.next_local;
+        // TakeValuesToLocals fills consecutive frame slots, so a variable a
+        // closure captures cannot be one: its slot gets a hidden name and the
+        // body runs inside `(let ((VAR hidden) ...) . body)`, which binds VAR
+        // as LET does any captured variable. This used to bail the whole
+        // function (`function:closure-captures-slot`; SBCL's QQ-TEMPLATE-1,
+        // bliss-gg3i1.7.17).
+        let captured_decl_special = body_declared_special(body);
+        // Symbols are immediates: nothing here needs a root.
+        let mut captured_vars: Vec<(EgclVal, EgclVal)> = Vec::new();
         for i in 0..vars.len() {
-            self.alloc_slot(&var_name(vars[i]));
+            let name = var_name(vars[i]);
+            if self.captured_names.contains(&name)
+                && !is_special_name(&name)
+                && !captured_decl_special.contains(&name)
+            {
+                let hidden = super::gensym_symbol("MVB-CAPTURED");
+                self.alloc_slot(&var_name(hidden));
+                captured_vars.push((vars[i], hidden));
+            } else {
+                self.alloc_slot(&name);
+            }
+        }
+        if !captured_vars.is_empty() {
+            let let_sym = super::resolve_sym("LET").ok_or(Bail)?;
+            egcl_rt::rooted!(bindings = Vec::with_capacity(captured_vars.len()));
+            for &(var, hidden) in captured_vars.iter() {
+                let binding = vec_to_list(&[var, hidden]);
+                bindings.push(binding);
+            }
+            egcl_rt::rooted!(binding_list = vec_to_list(&bindings));
+            egcl_rt::rooted!(let_body = arena_cons(*binding_list, body));
+            egcl_rt::rooted!(let_form = arena_cons(let_sym, *let_body));
+            body = arena_cons(*let_form, NIL);
         }
         self.emit(Instr::TakeValuesToLocals {
             nvars: vars.len() as u16,
@@ -9408,6 +9453,7 @@ fn compile_local_function(
     lo.portable = portable;
     lo.local_fns = local_fns.clone();
     lo.captured_names = compute_captured_names(fbody);
+    lo.captured_names.extend(forced_boxing());
     let mut param_layout = Vec::with_capacity(param_names.len());
     for pn in &param_names {
         let loc = lo.alloc_local(pn);
@@ -9506,6 +9552,7 @@ fn compile_capturing_local(
     egcl_rt::rooted_ref!(_const_guard = &mut lo);
     lo.portable = portable;
     lo.captured_names = compute_captured_names(fbody);
+    lo.captured_names.extend(forced_boxing());
     lo.has_env = true;
     lo.closure_fns = callable.clone();
     lo.local_fns = local_fns.clone();
@@ -11634,6 +11681,35 @@ static BOX_REQUEST: egcl_rt::execution_local::ExecutionLocal<
     egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashSet::new()))
 };
 
+/// Names the enclosing compile attempt is forcing into heap bindings, for the
+/// local functions it lowers along the way (bliss-gg3i1.7.17).
+static FORCED_BOXING: egcl_rt::execution_local::ExecutionLocal<
+    RefCell<std::collections::HashSet<String>>,
+> = unsafe {
+    egcl_rt::execution_local::ExecutionLocal::new(|| RefCell::new(std::collections::HashSet::new()))
+};
+
+fn forced_boxing() -> Vec<String> {
+    FORCED_BOXING.with(|forced| forced.borrow().iter().cloned().collect())
+}
+
+/// Install a compile attempt's forced names until it returns, restoring the
+/// enclosing attempt's.
+struct ForcedBoxingScope(std::collections::HashSet<String>);
+
+impl ForcedBoxingScope {
+    fn enter(forced: &std::collections::HashSet<String>) -> Self {
+        Self(FORCED_BOXING.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), forced.clone())))
+    }
+}
+
+impl Drop for ForcedBoxingScope {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        FORCED_BOXING.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
 fn request_boxing(names: impl IntoIterator<Item = String>) {
     BOX_REQUEST.with(|r| r.borrow_mut().extend(names));
 }
@@ -11704,6 +11780,9 @@ fn compile_function_in(
         }
         let requested = take_box_request();
         if requested.is_empty() || requested.is_subset(&forced) {
+            if !requested.is_empty() && std::env::var_os("EGCL_BOX_RETRY_TRACE").is_some() {
+                eprintln!("[box-retry] still slot-bound after boxing: {requested:?}");
+            }
             return None;
         }
         forced.extend(requested);
@@ -11878,6 +11957,10 @@ fn compile_function_forcing_boxed(
     for forced in forced_boxed {
         lo.captured_names.insert(forced.clone());
     }
+    // Nested local functions compiled during this attempt box the same names:
+    // a macro-revealed capture of a local function's own parameter or LET
+    // variable is requested here too, and only reaches that body this way.
+    let _forced_scope = ForcedBoxingScope::enter(forced_boxed);
     lo.enclosing_blocks = enclosing_blocks.clone();
     lo.enclosing_tags = enclosing_tags.clone();
     lo.loop_finish_tag = loop_finish_tag.map(str::to_owned);
@@ -12420,6 +12503,9 @@ fn compile_thunk(form: EgclVal, env: &Env, portable: bool) -> Option<BytecodeFun
         }
         let requested = take_box_request();
         if requested.is_empty() || requested.is_subset(&forced) {
+            if !requested.is_empty() && std::env::var_os("EGCL_BOX_RETRY_TRACE").is_some() {
+                eprintln!("[box-retry] still slot-bound after boxing: {requested:?}");
+            }
             return None;
         }
         forced_symbols.extend(
@@ -12444,6 +12530,7 @@ fn compile_thunk_forcing_boxed(
     lo.portable = portable;
     lo.captured_names = compute_captured_names(arena_cons(*form, NIL));
     lo.captured_names.extend(forced.iter().cloned());
+    let _forced_scope = ForcedBoxingScope::enter(forced);
     if lo.lower_expr(*form).is_err() {
         return None;
     }
@@ -17255,6 +17342,47 @@ fn make_template_closure(
     closure_templates::make_instance(nested, captured_env, control, control_free)
 }
 
+/// Heap-environment closure instances (Backpack) own no host-side state, so
+/// the host-byte ledger that schedules a major collection for closures with a
+/// captured frame never sees them. Each is still a pinned function object
+/// that only a major collection frees: request one after every
+/// `MIN_PRIVATE_HOST_GROWTH` bytes of such instances created since the
+/// pinned-function epoch last advanced, so dead closures do not accumulate
+/// until the heap is exhausted.
+fn note_heap_closure_instance() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicUsize = AtomicUsize::new(0);
+    let epoch = egcl_rt::gc::pinned_function_epoch();
+    if EPOCH.swap(epoch, Ordering::Relaxed) != epoch {
+        BYTES.store(0, Ordering::Relaxed);
+    }
+    let size = std::mem::size_of::<egcl_rt::object::FunctionData>();
+    let bytes = BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    if bytes >= MIN_PRIVATE_HOST_GROWTH {
+        BYTES.store(0, Ordering::Relaxed);
+        egcl_rt::gc::request_major_gc();
+        if std::env::var_os("EGCL_GC_CENSUS").is_some() {
+            eprintln!(
+                "[GC-CENSUS] request-major reason=pinned-closures bytes={bytes} source=heap-env-closures"
+            );
+        }
+    }
+}
+
+/// A fresh instance of `nested` for a heap-environment closure (Backpack):
+/// it owns no lexical frame, only the control scope a free exit needs, and
+/// never shares the template prototype, since its caller attaches the
+/// captured environment to it.
+fn make_heap_closure_instance(nested: &Arc<BytecodeFunction>, env: &Env) -> EgclVal {
+    note_heap_closure_instance();
+    let control_free = closure_templates::control_free(nested);
+    let scope_empty = env.block_stack.is_empty() && env.tag_stack.is_empty();
+    let control =
+        (!control_free && !scope_empty).then(|| (env.block_stack.clone(), env.tag_stack.clone()));
+    closure_templates::make_instance(nested, None, control, false)
+}
+
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
 /// compiling every defun at load time costs more than it saves for a big library
 /// load (asdf) whose functions are mostly never hot — the bytecode backend loads
@@ -21590,7 +21718,7 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 }
             }
             Instr::ClosureEnv => {
-                let captured = heap_env::captured_env(acts[top_idx].env_frame.as_ref());
+                let captured = heap_env::frame_closure_env(acts[top_idx].frame);
                 acts[top_idx].push_op(captured);
             }
             Instr::MakeEnvClosure { func, nflat } => {
@@ -30072,15 +30200,6 @@ fn emit_native(
                 );
                 emit_c2i_helper_call(&mut c);
             }
-            Instr::ClosureEnv => {
-                c.extend_from_slice(&[0x48, 0xB8]);
-                c.extend_from_slice(
-                    &(heap_env::c2i_heap_closure_env as extern "C" fn() -> u64 as usize as u64)
-                        .to_le_bytes(),
-                );
-                emit_c2i_helper_call(&mut c);
-                push_rax(&mut c);
-            }
             Instr::MakeEnvClosure { func, nflat } => {
                 let nested =
                     bf.nested_functions.get(*func as usize)? as *const Arc<BytecodeFunction>;
@@ -31286,6 +31405,30 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             .is_some_and(|context| context.captured_entry_profitable());
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_outer_capture = false;
+    // A heap-environment body that creates no closure (Backpack) keeps its
+    // environment operations semantic too: the ordinary entry reads its
+    // closure environment from the hidden callable, and a declined ordinary
+    // emission falls back to the same legalized mapped clone.
+    let heap_env_body = cfg!(all(target_arch = "x86_64", target_os = "linux"))
+        && bf.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::ClosureEnv | Instr::MakeEnv(_) | Instr::EnvRef { .. } | Instr::EnvSet { .. }
+            )
+        })
+        && !bf.code.iter().any(|op| {
+            matches!(
+                op,
+                Instr::MakeEnvClosure { .. }
+                    | Instr::MakeClosure { .. }
+                    | Instr::LoadEnvVar(_)
+                    | Instr::StoreEnvVar(_)
+                    | Instr::DefineEnvVar(_)
+                    | Instr::PushEnvChild
+                    | Instr::PopEnvChild
+            )
+        });
+    let ordinary_outer_capture = ordinary_outer_capture || heap_env_body;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let special_binding_body = native_transfer_entry::special_binding_body(bf);
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
@@ -31294,18 +31437,36 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         // Keep lexical operations semantic for the explicit-callable ordinary
         // adapter. prepare_ordinary_t2 legalizes a separate mapped clone using
         // the retained bytecode scope/BCP protocol if ordinary emission declines.
-        if let Some(snapshot) = &input.snapshot {
+        let transfer = if let Some(snapshot) = &input.snapshot {
             egcl_compiler::t2::build::build_for_transfer_optimization_snapshot_with_inline_options(
                 snapshot,
                 sym,
-                inline_options,
+                inline_options.clone(),
             )
         } else {
             egcl_compiler::t2::build::build_for_transfer_optimization_with_inline_options(
                 bf,
                 sym,
-                inline_options,
+                inline_options.clone(),
             )
+        };
+        match transfer {
+            // A heap-environment body with a construct only the native-scope
+            // build models (a THROW, a closure's named exit, ...) takes that
+            // build, as its name-keyed form always did.
+            Err(error) if heap_env_body => {
+                t2_log!("{name}: transfer build refused ({error:?}); native-scope build");
+                if let Some(snapshot) = &input.snapshot {
+                    egcl_compiler::t2::build::build_for_native_scope_optimization_snapshot_with_inline_options(snapshot, sym, inline_options)
+                } else {
+                    egcl_compiler::t2::build::build_for_native_scope_optimization_with_inline_options(
+                        bf,
+                        sym,
+                        inline_options,
+                    )
+                }
+            }
+            built => built,
         }
     } else if let Some(Ok(ir)) = special_binding_body.then(|| {
         // Special bindings are the body's only dynamic scopes: keep them plain
@@ -31348,10 +31509,9 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
-                    | Instr::MakeEnv(_)
-                    | Instr::EnvRef { .. }
-                    | Instr::EnvSet { .. }
-                    | Instr::ClosureEnv
+                    // A heap-environment closure creator still needs the
+                    // mapped protocol; the other heap-environment
+                    // instructions also lower for the ordinary entry.
                     | Instr::MakeEnvClosure { .. }
             )
         })
@@ -33811,6 +33971,8 @@ mod direct_call_invalidation_tests {
         let _lock = super::super::heap_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        // Checks the name-keyed frame's LexicalEnvironment scope records.
+        let _legacy = super::heap_env::legacy_frames_for_test();
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env_root = &mut env);
         egcl_rt::rooted!(

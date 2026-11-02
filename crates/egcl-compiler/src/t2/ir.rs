@@ -468,6 +468,13 @@ pub enum Opcode {
     /// Heap lexical environment slot write: `args = [value, environment]`,
     /// addressed as for `EnvSlotRef`, stored through the reference barrier.
     EnvSlotSet,
+    /// The heap environment the running closure captured (Backpack
+    /// `ClosureEnv`), before an entry ABI is chosen. Carries the bytecode's
+    /// frame state. The ordinary entry lowers it to `CallableClosureEnv` on
+    /// its hidden callable; a mapped clone to a lexical-environment request.
+    ClosureEnvironment,
+    /// Load the traced `closure_env` word of the callable in `args[0]`.
+    CallableClosureEnv,
 }
 
 impl Opcode {

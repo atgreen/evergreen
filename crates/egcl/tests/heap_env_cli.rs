@@ -98,16 +98,16 @@ fn every_binding_shape_agrees_at_every_tier() {
     }
 }
 
-/// Recursive LABELS functions stay on the name-keyed frames by default (see
-/// `heap_env::labels_enabled`); their heap layout must still be right.
+/// Recursive LABELS functions use heap environments by default; with
+/// `EGCL_HEAP_ENV_LABELS=0` they keep the frames, and must agree either way.
 #[test]
-fn recursive_labels_on_heap_environments_agree_at_every_tier() {
+fn recursive_labels_on_frames_agree_at_every_tier() {
     let fixture = fixture();
     let fixture = fixture.to_str().unwrap();
     for tier in ["t0", "t1", "t2"] {
         assert_expected(
-            &run(&["--load", fixture], tier, &[("EGCL_HEAP_ENV_LABELS", "1")]),
-            &format!("{tier} with heap LABELS"),
+            &run(&["--load", fixture], tier, &[("EGCL_HEAP_ENV_LABELS", "0")]),
+            &format!("{tier} with LABELS on frames"),
         );
     }
 }

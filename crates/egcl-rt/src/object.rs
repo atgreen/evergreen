@@ -568,7 +568,10 @@ pub struct FunctionData {
     /// Code-owner key (`exec_context::offsets::CODE_OWNER`) of the execution
     /// whose code `entry` names, or 0 when no execution owns it.
     pub entry_owner: core::sync::atomic::AtomicU64,
-    // TODO(bliss-gg3i1.7.15 heap environments): `closure_env` follows here.
+    /// The heap lexical environment a heap-environment closure captured
+    /// (Backpack, `crate::lexenv`), or NIL. Traced; stored with the write
+    /// barrier, once, before the closure is published.
+    pub closure_env: EgclVal,
 }
 
 // ── Cons cell ──────────────────────────────────────────────────────
