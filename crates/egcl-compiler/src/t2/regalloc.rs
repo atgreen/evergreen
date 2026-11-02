@@ -390,7 +390,9 @@ impl Adapter {
             }
             for &u in &inst.uses {
                 if inst.op == crate::t2::lower::op::INVOKE
-                    || (calls != CallOperands::Registers && inst.op == crate::t2::lower::op::CALL)
+                    || (inst.op == crate::t2::lower::op::CALL
+                        && (calls == CallOperands::Stack
+                            || (calls == CallOperands::HomeUses && inst.uses.len() > 3)))
                 {
                     // Invoke and the slice-call framed emitters copy call
                     // arguments from their homes to a scanned slice. Requiring
@@ -639,24 +641,27 @@ fn allocate_framed_mode(mf: &mut MachFunc, ordinary: bool) -> Result<(), Allocat
     // reduced pool genuinely runs out of registers — a retry costs one extra
     // background-thread allocation pass, declining to T1 costs the tier.
     // EGCL_T2_FRAME_ENV=full|reduced pins one environment for debugging.
-    // Ordinary code reads every Lisp call's arguments from their homes
-    // (bliss-gg3i1.7.15.10.4), so a call wider than the register bank is
-    // allocatable there.
-    let calls = if ordinary {
-        CallOperands::HomeUses
-    } else {
-        CallOperands::Registers
-    };
-    let run = |mf: &mut MachFunc, reduced| {
+    let run = |mf: &mut MachFunc, reduced, calls| {
         allocate_with_call_operand_policy(mf, environment(reduced), x86_call_clobbers(), calls)
     };
+    let registers = CallOperands::Registers;
     match std::env::var("EGCL_T2_FRAME_ENV").as_deref() {
-        Ok("full") => return run(mf, false),
-        Ok("reduced") => return run(mf, true),
+        Ok("full") => return run(mf, false, registers),
+        Ok("reduced") => return run(mf, true, registers),
         _ => {}
     }
-    match run(mf, true) {
-        Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) => run(mf, false),
+    match run(mf, true, registers) {
+        Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) => {
+            match run(mf, false, registers) {
+                // Ordinary code reads every Lisp call's arguments from their
+                // homes (bliss-gg3i1.7.15.10.4), so a call wider than the
+                // register bank is still allocatable there.
+                Err(AllocationError::Allocator(RegAllocError::TooManyLiveRegs)) if ordinary => {
+                    run(mf, false, CallOperands::HomeUses)
+                }
+                done => done,
+            }
+        }
         done => done,
     }
 }
@@ -854,7 +859,9 @@ enum CallOperands {
     Registers,
     /// Uses and multiple results through activation slots.
     Stack,
-    /// Uses read from their homes; results as usual.
+    /// Uses read from their homes; results as usual. Only calls wider than
+    /// the three argument registers relax their uses: a narrow call keeps
+    /// the register allocation that suits its argument moves best.
     HomeUses,
 }
 

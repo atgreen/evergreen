@@ -485,6 +485,21 @@ impl VariadicPlan {
         count: usize,
         out: &mut [EgclVal],
     ) -> bool {
+        // A small bound lets the common short keyword list bind unrolled.
+        if self.keys.as_ref().is_none_or(|keys| keys.len() <= 3) {
+            self.bind_native_up_to::<3>(args, count, out)
+        } else {
+            self.bind_native_up_to::<NATIVE_KEYS>(args, count, out)
+        }
+    }
+
+    /// `bind_native` for a plan with at most `K` keys.
+    fn bind_native_up_to<const K: usize>(
+        &self,
+        args: impl Fn(usize) -> EgclVal,
+        count: usize,
+        out: &mut [EgclVal],
+    ) -> bool {
         let positional = self.required + self.optionals.len();
         if count < self.required
             || out.len() != self.values
@@ -494,9 +509,10 @@ impl VariadicPlan {
         }
         let tail_start = count.min(positional);
         let mut supplied: u64 = 0;
-        let mut key_values = [0usize; NATIVE_KEYS];
+        // Written for each supplied key before it is read.
+        let mut key_values = [0u8; K];
         if let Some(keys) = &self.keys {
-            if keys.len() > NATIVE_KEYS || (count - tail_start) % 2 != 0 {
+            if keys.len() > K || count > usize::from(u8::MAX) || (count - tail_start) % 2 != 0 {
                 return false;
             }
             for at in (tail_start..count).step_by(2) {
@@ -514,7 +530,7 @@ impl VariadicPlan {
                     Some(index) => {
                         if supplied & (1 << index) == 0 {
                             supplied |= 1 << index;
-                            key_values[index] = at + 1;
+                            key_values[index] = (at + 1) as u8;
                         }
                     }
                     None if self.ignores(key) => {}
@@ -525,20 +541,8 @@ impl VariadicPlan {
         // The `&rest` list is the only allocation, made before anything is
         // written. It cannot collect, so no argument word moves.
         let rest = if self.rest {
-            let length = count - tail_start;
-            if length > NATIVE_REST {
-                return false;
-            }
-            let mut tail = [NIL; NATIVE_REST];
-            for (index, value) in tail[..length].iter_mut().enumerate() {
-                *value = args(tail_start + index);
-            }
-            match egcl_rt::gc::try_native_list(&tail[..length]) {
-                Some(list) => {
-                    #[cfg(test)]
-                    NATIVE_REST_BINDS.with(|binds| binds.set(binds.get() + 1));
-                    list
-                }
+            match native_rest(&args, tail_start, count) {
+                Some(list) => list,
                 None => return false,
             }
         } else {
@@ -575,7 +579,7 @@ impl VariadicPlan {
             };
             let given = supplied & (1 << index) != 0;
             push(if given {
-                args(key_values[index])
+                args(usize::from(key_values[index]))
             } else {
                 initial
             });
@@ -591,6 +595,30 @@ impl VariadicPlan {
         }
         at == self.values
     }
+}
+
+/// The `&rest` list of `args[tail_start..count]` from the generated-code
+/// allocation window, or `None` when it does not fit. Kept out of line so
+/// the common keyword binding stays small.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[inline(never)]
+fn native_rest(
+    args: &impl Fn(usize) -> EgclVal,
+    tail_start: usize,
+    count: usize,
+) -> Option<EgclVal> {
+    let length = count - tail_start;
+    if length > NATIVE_REST {
+        return None;
+    }
+    let mut tail = [NIL; NATIVE_REST];
+    for (index, value) in tail[..length].iter_mut().enumerate() {
+        *value = args(tail_start + index);
+    }
+    let list = egcl_rt::gc::try_native_list(&tail[..length])?;
+    #[cfg(test)]
+    NATIVE_REST_BINDS.with(|binds| binds.set(binds.get() + 1));
+    Some(list)
 }
 
 /// The ordinary `&key` entry's bind helper (`OrdinaryKeywordArguments`).

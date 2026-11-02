@@ -687,12 +687,11 @@
   third, or with `&key` lists of any size (including `&allow-other-keys`);
   calls passing eight or more arguments; functions that return multiple
   values with `VALUES`; and callers that bind multiple values with
-  `MULTIPLE-VALUE-BIND`. A call to such a function from optimized code drops
-  from 0.9–3.8 µs to tens of nanoseconds. `FUNCALL` of a compiled function
-  with up to 15 arguments also stays native.
+  `MULTIPLE-VALUE-BIND`. `FUNCALL` of a compiled function with up to 15
+  arguments also stays native.
   `EGCL_DISABLE_ORDINARY_VALUES=1` keeps multiple-value functions on the old
   path for comparison.
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
+  ([#979](https://github.com/atgreen/evergreen/pull/979))
 - On x86-64 Linux, a compiled call from one optimized function to another
   named, fixed-arity, optimized function is cheaper. The function object now
   carries its own native entry, so the caller loads the name's current
