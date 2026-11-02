@@ -25000,6 +25000,7 @@ extern "C" fn c2i_make_closure(form: u64) -> u64 {
     target_arch = "x86_64",
     target_arch = "s390x",
     target_arch = "aarch64",
+    target_arch = "riscv64",
     all(target_arch = "powerpc64", target_endian = "little")
 ))]
 extern "C" fn c2i_make_bytecode_closure(nested: *const Arc<BytecodeFunction>, capture: u64) -> u64 {
