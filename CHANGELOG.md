@@ -644,7 +644,7 @@
   top-level code. A special parameter is still bound dynamically and
   restored on every exit; when a later default form could observe the new
   binding, the function keeps the interpreter.
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
+  ([#977](https://github.com/atgreen/evergreen/pull/977))
 - On x86-64 Linux, optimized code answers ATOM, LISTP, SYMBOLP, PLUSP,
   MINUSP, BIT, SBIT, GET, three-argument LOGAND/LOGIOR/LOGXOR, and TYPEP of a
   structure type name without the general runtime call: about 11 ns a call
