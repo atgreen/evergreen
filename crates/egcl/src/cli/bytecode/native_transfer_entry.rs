@@ -24,6 +24,8 @@ use std::cell::Cell;
 use std::sync::OnceLock;
 
 mod activation;
+mod artifact;
+use artifact::{ExecutableOwner, ExecutablePayload};
 mod condition_osr;
 pub(super) mod interpreter_osr;
 pub(super) mod local_exits;
@@ -356,11 +358,7 @@ pub(super) struct TransferCode {
     is_t2: bool,
     body: Arc<BytecodeFunction>,
     _body_roots: Arc<ActiveBytecodeRoot>,
-    code: JitBuffer,
-    code_info: &'static CodeInfo,
-    // Retired definitions retain their exact value recipes as long as code lives.
-    _native_calls: Arc<egcl_compiler::t2::x64_calls::NativeCallSites>,
-    code_len: usize,
+    executable: ExecutableOwner,
     frame_entry: Option<usize>,
     pub(super) ordinary_entry: Option<usize>,
     /// `ordinary_entry` preceded by its stack check (bliss-gg3i1.7.15.10.1).
@@ -371,11 +369,9 @@ pub(super) struct TransferCode {
     /// The ordinary entry checks declared parameter types itself.
     pub(super) ordinary_checks_params: bool,
     _ordinary_keywords: Option<JitBuffer>,
-    _ordinary_arity: Option<JitBuffer>,
     _ordinary_cold: Option<JitBuffer>,
     _primitive_cells: Vec<Arc<egcl_rt::call_table::CallCell>>,
     pub(super) has_deopt: bool,
-    bcp_offsets: Vec<u32>,
     osr_entries: HashMap<u32, usize>,
     /// Per OSR header, the locals an entry unboxes into raw double homes
     /// (bliss-vwpaz). Each must hold a double-float when the entry is taken.
@@ -442,6 +438,16 @@ pub(super) struct TransferCode {
     unavailable_catch: Option<u32>,
     #[cfg(test)]
     unavailable_handler: Option<(u32, u32)>,
+}
+
+// Keep immutable field access uniform for audited and installation-owned code.
+// There is deliberately no DerefMut: executable bytes/maps are frozen after install.
+impl std::ops::Deref for TransferCode {
+    type Target = ExecutablePayload;
+
+    fn deref(&self) -> &Self::Target {
+        self.executable.payload()
+    }
 }
 
 fn cache_enabled() -> bool {
@@ -1223,9 +1229,13 @@ impl TransferCode {
         assert_eq!(self.body.arity, 0);
         assert!(self.ordinary_entry.is_some() && self.native_callable_slot.is_none());
         let code = JitBuffer::new(bytes)?;
-        self.code_len = bytes.len();
+        // Synthetic code replacement must not mutate an independently retained
+        // payload. Production payload access remains immutable.
+        let payload = self.executable.unleased_fixture_payload()?;
+        payload.code_len = bytes.len();
+        let previous = std::mem::replace(&mut payload.code, code);
         self.ordinary_entry = Some(0);
-        Some(std::mem::replace(&mut self.code, code))
+        Some(previous)
     }
 
     #[cfg(test)]

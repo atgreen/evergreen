@@ -136,7 +136,7 @@ pub(super) unsafe extern "C" fn slow_call(
             // The cold request occupies 48 bytes below the caller's body SP.
             // Budget the child's exact prologue and CALL return word just as
             // the generated fast check does; a retry must not bypass that guard.
-            let frame_bytes = (*(*context).owner)
+            let frame_bytes = (&*(*context).owner)
                 ._native_calls
                 .unwind_recipe()
                 .expect("native recursive unwind recipe")
