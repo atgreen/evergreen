@@ -430,8 +430,8 @@ pub use ordinary_call::{
 pub(crate) use ordinary_primitives::packed_u8_adapter;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub use ordinary_primitives::{
-    OrdinaryPrimitive, PackedU8AdapterSymbols, lower_ordinary_primitives,
-    lower_ordinary_primitives_with_specials, register_packed_u8_adapter,
+    OrdinaryPrimitive, PackedU8AdapterSymbols, lower_ordinary_heap_closures,
+    lower_ordinary_primitives, lower_ordinary_primitives_with_specials, register_packed_u8_adapter,
 };
 
 #[cfg(all(test, target_arch = "x86_64"))]

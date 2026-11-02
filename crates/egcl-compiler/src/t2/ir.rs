@@ -581,6 +581,12 @@ pub enum AuxData {
     /// Materialize `nested_functions[idx]` of the retained root body as a
     /// fresh non-capturing closure through the native-transfer bridge.
     NestedClosure(u32),
+    /// Heap closure creation from parent and flat captures, identified by the
+    /// exact retained root body's bytecode PC. Ordinary lowering inserts that
+    /// PC as an adapter argument; mapped legalization keeps decode-at-PC.
+    HeapClosure {
+        bcp: u32,
+    },
     /// Captured-variable operation identified by its exact retained bytecode
     /// PC: LoadEnvVar, StoreEnvVar, DefineEnvVar, PushEnvChild, PopEnvChild or
     /// a capturing MakeClosure. The runtime decodes that instruction and applies

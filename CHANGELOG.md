@@ -4,6 +4,10 @@
 
 ### Added
 
+- Add opt-in eager T1 compilation for named FASL-loaded functions and their
+  nested closure templates with `EGCL_FASL_EAGER_T1=1`
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
 - Extend character and string storage to preserve surrogate character codes,
   with remaining stream, reader and formatting limitations
   ([#980](https://github.com/atgreen/evergreen/pull/980)).
@@ -29,6 +33,10 @@
   ([#887](https://github.com/atgreen/evergreen/pull/887)).
 
 ### Fixed
+
+- Create eligible heap closures through ordinary T1 and T2 entries while
+  preserving captured values and retained definitions
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
 
 - Reject invalid `STRING` designators with `TYPE-ERROR`, preserving the original
   invalid datum ([#981](https://github.com/atgreen/evergreen/pull/981)).

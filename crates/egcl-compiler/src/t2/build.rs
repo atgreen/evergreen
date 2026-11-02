@@ -397,6 +397,13 @@ pub fn legalize_transfer_calls(f: &mut Function, scopes: &ScopeMap) -> Result<()
         .collect();
     for call in calls {
         let operation = f.inst(call).opcode;
+        if let AuxData::HeapClosure { bcp } = f.inst(call).aux {
+            f.inst_mut(call).aux = AuxData::LexicalEnvironment {
+                bcp,
+                value: true,
+                result: true,
+            };
+        }
         if operation == Opcode::ClosureEnvironment {
             // A mapped activation reads it from its frame's callable through
             // the decode-at-PC request.
@@ -1615,6 +1622,14 @@ impl<'a> Builder<'a> {
                 }
                 Instr::ClosureEnv if !self.native_cleanups => {
                     push(i + 1, d + 1, &mut depth_at, &mut work);
+                }
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                Instr::MakeEnvClosure { nflat, .. } if !self.native_cleanups => {
+                    let operands = i32::from(*nflat) + 1;
+                    if d < operands {
+                        return Err(BuildError::Unsupported("heap closure operand underflow"));
+                    }
+                    push(i + 1, d - operands + 1, &mut depth_at, &mut work);
                 }
                 Instr::MakeEnv(_) | Instr::ClosureEnv | Instr::MakeEnvClosure { .. }
                     if self.native_cleanups =>
@@ -2887,6 +2902,33 @@ impl<'a> Builder<'a> {
                         )
                         .expect("closure environment has a result");
                     stack.push(value);
+                }
+                #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                Instr::MakeEnvClosure { func, nflat } if !self.native_cleanups => {
+                    if self.bf.nested_functions.get(*func as usize).is_none() {
+                        return Err(BuildError::Unsupported("invalid heap closure template"));
+                    }
+                    let operands = usize::from(*nflat) + 1;
+                    if stack.len() < operands {
+                        return Err(BuildError::Unsupported("heap closure operand underflow"));
+                    }
+                    let fs = self.build_frame_state(block, &stack, i as u32);
+                    let args = stack.split_off(stack.len() - operands);
+                    let (_, results) = self.f.push_inst(
+                        block,
+                        InstData {
+                            opcode: Opcode::Call,
+                            args,
+                            results: vec![],
+                            aux: AuxData::HeapClosure { bcp: i as u32 },
+                            flags: runtime_call_flags(),
+                            targets: vec![],
+                            frame_state: Some(fs),
+                            source_pos: 0,
+                        },
+                        &[(IRType::TOP, ValueRepresentation::Tagged)],
+                    );
+                    stack.push(results[0]);
                 }
                 Instr::MakeEnv(size) if !self.native_cleanups => {
                     let parent = stack
@@ -5015,6 +5057,79 @@ mod tests {
 
     fn has_opcode(f: &Function, b: Block, op: Opcode) -> bool {
         f.block(b).insts.iter().any(|&i| f.inst(i).opcode == op)
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn heap_creator_semantics_preserve_recovery_and_legalize_each_abi() {
+        let root = egcl_rt::symbols::intern("HEAP-CREATOR-ABI-ROOT");
+        let mut body = bf(
+            "HEAP-CREATOR-ABI-ROOT",
+            vec![
+                Instr::LoadLocal(0),
+                Instr::MakeEnvClosure { func: 0, nflat: 0 },
+                Instr::Return,
+            ],
+            vec![],
+            1,
+            1,
+            1,
+        );
+        body.param_layout.push(("PARENT".into(), VarLoc::Slot(0)));
+        body.nested_functions.push(Arc::new(bf(
+            "HEAP-CREATOR-LEAF",
+            vec![Instr::Const(0), Instr::Return],
+            vec![egcl_rt::value::NIL],
+            0,
+            0,
+            1,
+        )));
+        let semantic = build_for_transfer_optimization(&body, root).unwrap();
+        assert!(crate::t2::verify::verify(&semantic).is_ok());
+        let site = semantic
+            .block_order()
+            .iter()
+            .flat_map(|&block| &semantic.block(block).insts)
+            .copied()
+            .find(|&inst| matches!(semantic.inst(inst).aux, AuxData::HeapClosure { bcp: 1 }))
+            .unwrap();
+        let original = semantic.inst(site).clone();
+        assert_eq!(original.args.len(), 1);
+        assert!(original.flags.call && original.flags.effectful && original.flags.safepoint);
+        let mut mapped = semantic.clone();
+        legalize_transfer_calls(&mut mapped, &ScopeMap::analyze_function(&body).unwrap()).unwrap();
+        assert!(crate::t2::verify::verify(&mapped).is_ok());
+        assert_eq!(mapped.inst(site).opcode, Opcode::Invoke);
+        assert!(matches!(
+            mapped.inst(site).aux,
+            AuxData::LexicalEnvironment {
+                bcp: 1,
+                value: true,
+                result: true
+            }
+        ));
+        let mut ordinary = semantic.clone();
+        let target = egcl_rt::symbols::intern("PRIVATE-HEAP-CREATOR-ABI-TEST");
+        assert_eq!(
+            crate::t2::emit::lower_ordinary_heap_closures(&mut ordinary, target, |bcp, count| bcp
+                == 1
+                && count == 1)
+            .unwrap(),
+            1
+        );
+        assert!(crate::t2::verify::verify(&ordinary).is_ok());
+        assert_eq!(ordinary.inst(site).opcode, Opcode::Call);
+        assert!(matches!(ordinary.inst(site).aux, AuxData::CallTarget(symbol) if symbol == target));
+        assert_eq!(ordinary.inst(site).args.len(), 2);
+        assert_eq!(ordinary.inst(site).results, original.results);
+        assert_eq!(ordinary.inst(site).frame_state, original.frame_state);
+        let mut malformed = semantic.clone();
+        malformed.inst_mut(site).flags.safepoint = false;
+        assert!(crate::t2::verify::verify(&malformed).is_err());
+        assert!(
+            crate::t2::emit::lower_ordinary_heap_closures(&mut malformed, target, |_, _| true)
+                .is_err()
+        );
     }
 
     #[test]

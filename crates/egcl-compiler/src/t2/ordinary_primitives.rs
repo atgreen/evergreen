@@ -21,6 +21,7 @@ pub enum OrdinaryPrimitive {
     Divide,
     Equal,
     MakeArray,
+    MakeEnvClosure,
     LoadEnvironment,
     StoreEnvironment,
     /// `(symbol value)`: establish a special binding on the execution's
@@ -42,7 +43,7 @@ impl OrdinaryPrimitive {
         format!("%EGCL-ORDINARY-{self:?}").to_ascii_uppercase()
     }
 
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::LoadGlobal,
         Self::StoreGlobal,
         Self::LoadFunction,
@@ -53,6 +54,7 @@ impl OrdinaryPrimitive {
         Self::Divide,
         Self::Equal,
         Self::MakeArray,
+        Self::MakeEnvClosure,
         Self::LoadEnvironment,
         Self::StoreEnvironment,
         Self::BindSpecial,
@@ -60,6 +62,91 @@ impl OrdinaryPrimitive {
         Self::BindSpecialPreservingValues,
         Self::UnbindSpecialPreservingValues,
     ];
+}
+
+/// Lower a heap creator only when its retained root body validates the exact
+/// bytecode PC and operand count. Inlined creators keep their mapped fallback.
+pub fn lower_ordinary_heap_closures(
+    f: &mut Function,
+    target: u32,
+    valid: impl Fn(u32, usize) -> bool,
+) -> Result<usize, EmitError> {
+    let mut sites = Vec::new();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            let AuxData::HeapClosure { bcp } = data.aux else {
+                continue;
+            };
+            let exact_root = data
+                .frame_state
+                .filter(|id| (id.0 as usize) < f.frame_states.len())
+                .is_some_and(|id| {
+                    let scopes = &f.frame_states.get(id).scopes;
+                    scopes.len() == 1 && scopes[0].bcp == bcp
+                });
+            if data.opcode != Opcode::Call
+                || !exact_root
+                || !valid(bcp, data.args.len())
+                || data.results.len() != 1
+                || !data.targets.is_empty()
+                || !data.flags.call
+                || !data.flags.effectful
+                || !data.flags.safepoint
+                || data
+                    .args
+                    .iter()
+                    .chain(&data.results)
+                    .any(|&v| f.value(v).repr != ValueRepresentation::Tagged)
+            {
+                return Err(EmitError::Declined("heap closure without exact root owner"));
+            }
+            sites.push((block, inst, bcp));
+        }
+    }
+    for &(block, inst, bcp) in &sites {
+        let source_pos = f.inst(inst).source_pos;
+        let value = insert_before(
+            f,
+            block,
+            inst,
+            InstData {
+                opcode: Opcode::ConstFixnum,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::FixnumImm(i64::from(bcp)),
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos,
+            },
+            &[(IRType::of(TypeBits::FIXNUM), ValueRepresentation::Tagged)],
+        )[0];
+        let clear = || InstData {
+            opcode: Opcode::ClearMv,
+            args: vec![],
+            results: vec![],
+            aux: AuxData::None,
+            flags: InstFlags {
+                call: true,
+                safepoint: true,
+                effectful: true,
+                ..Default::default()
+            },
+            targets: vec![],
+            frame_state: None,
+            source_pos,
+        };
+        insert_before(f, block, inst, clear(), &[]);
+        f.inst_mut(inst).args.insert(0, value);
+        f.inst_mut(inst).aux = AuxData::CallTarget(target);
+        let (after, _) = f.push_inst(block, clear(), &[]);
+        let layout = &mut f.block_mut(block).insts;
+        assert_eq!(layout.pop(), Some(after));
+        let position = layout.iter().position(|&site| site == inst).unwrap();
+        layout.insert(position + 1, after);
+    }
+    Ok(sites.len())
 }
 
 /// Immutable immediate identities captured by the owner that registers the

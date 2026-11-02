@@ -203,6 +203,10 @@ pub(in crate::cli::bytecode) fn invoke(
             return Err(invalid_capture());
         }
         use OrdinaryPrimitive::*;
+        if primitive == MakeEnvClosure {
+            unsafe { (*env).clear_mv() };
+            return super::ordinary_heap_creator::make(args, unsafe { &*env });
+        }
         // A value-preserving binding leaves the tuple for what follows; the
         // ordinary return then reports it, as after any call.
         if !matches!(
@@ -305,6 +309,22 @@ impl Bindings {
         ir: &mut egcl_compiler::t2::ir::Function,
         cells: &mut Vec<(u32, Arc<egcl_rt::call_table::CallCell>)>,
     ) -> Result<(), egcl_compiler::t2::emit::EmitError> {
+        let (_, creator, cell) = self
+            .0
+            .iter()
+            .find(|(kind, _, _)| *kind == OrdinaryPrimitive::MakeEnvClosure)
+            .expect("registered heap creator");
+        let count = egcl_compiler::t2::emit::lower_ordinary_heap_closures(
+            ir,
+            *creator,
+            |bcp, operands| {
+                matches!(body.code.get(bcp as usize), Some(Instr::MakeEnvClosure { func, nflat })
+                if operands == usize::from(*nflat) + 1 && body.nested_functions.get(*func as usize).is_some())
+            },
+        )?;
+        if count != 0 && !cells.iter().any(|(symbol, _)| symbol == creator) {
+            cells.push((*creator, Arc::clone(cell)));
+        }
         egcl_compiler::t2::emit::lower_ordinary_primitives_with_specials(
             ir,
             |primitive| {

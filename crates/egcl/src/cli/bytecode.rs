@@ -28703,6 +28703,12 @@ fn snapshot_t2_input(sym: u32, priority: u64) -> Option<T2CompileInput> {
                     Instr::MakeStruct { .. } => {
                         Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT"))
                     }
+                    // The semantic MakeEnv call needs its immutable cell in
+                    // the worker snapshot, just as baseline T1 preparation does.
+                    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+                    Instr::MakeEnv(_) => Some(egcl_rt::symbols::intern(
+                        egcl_compiler::t2::build::HEAP_ENV_MAKE_ADAPTER,
+                    )),
                     _ => None,
                 };
                 if let Some(sym) = sym
@@ -32432,7 +32438,7 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
             .is_some_and(|context| context.captured_entry_profitable());
     #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
     let ordinary_outer_capture = false;
-    // A heap-environment body that creates no closure (Backpack) keeps its
+    // A heap-environment body (including creators) keeps its
     // environment operations semantic too: the ordinary entry reads its
     // closure environment from the hidden callable, and a declined ordinary
     // emission falls back to the same legalized mapped clone.
@@ -32440,14 +32446,17 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
         && bf.code.iter().any(|op| {
             matches!(
                 op,
-                Instr::ClosureEnv | Instr::MakeEnv(_) | Instr::EnvRef { .. } | Instr::EnvSet { .. }
+                Instr::ClosureEnv
+                    | Instr::MakeEnv(_)
+                    | Instr::EnvRef { .. }
+                    | Instr::EnvSet { .. }
+                    | Instr::MakeEnvClosure { .. }
             )
         })
         && !bf.code.iter().any(|op| {
             matches!(
                 op,
-                Instr::MakeEnvClosure { .. }
-                    | Instr::MakeClosure { .. }
+                Instr::MakeClosure { .. }
                     | Instr::LoadEnvVar(_)
                     | Instr::StoreEnvVar(_)
                     | Instr::DefineEnvVar(_)
@@ -32536,9 +32545,8 @@ fn compile_t2_artifact(input: &T2CompileInput) -> Option<T2Artifact> {
                     | Instr::DefineEnvVar(_)
                     | Instr::PushEnvChild
                     | Instr::PopEnvChild
-                    // A heap-environment closure creator still needs the
-                    // mapped protocol; the other heap-environment
-                    // instructions also lower for the ordinary entry.
+                    // Heap creators outside the semantic cohort retain the
+                    // mapped decode-at-PC protocol.
                     | Instr::MakeEnvClosure { .. }
             )
         })

@@ -27,6 +27,7 @@ pub(super) mod ordinary_cleanup_osr;
 pub(super) mod ordinary_condition_osr;
 mod ordinary_guard;
 mod ordinary_guard_roots;
+mod ordinary_heap_creator;
 mod ordinary_lifecycle;
 mod ordinary_local_self;
 mod ordinary_mixed_entries;

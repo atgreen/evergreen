@@ -50,6 +50,7 @@ pub(super) use lean_root::take_lean_root_entries_for_test;
 mod callable_identity_cache;
 pub(super) mod ordinary_calls;
 pub(super) mod ordinary_closure_context;
+pub(super) mod ordinary_heap_creator;
 pub(super) mod ordinary_primitives;
 use callable_identity_cache::CallableIdentityCache;
 
@@ -1363,11 +1364,13 @@ impl TransferCode {
         let local_tags = optimize && t1_ordinary_tagbody_body(&body);
         let function_lookup = t1_ordinary_function_lookup_body(&body);
         let heap_access = t1_ordinary_heap_access_body(&body);
+        let heap_creator = t1_ordinary_heap_creator_body(&body);
         let optimize = optimize
             && (scope_free_native_body(&body, false)
                 || local_tags
                 || function_lookup
-                || heap_access);
+                || heap_access
+                || heap_creator);
         // Mandatory result guards also need exact recovery metadata in the
         // baseline tier, including when VALUES produced the checked primary.
         // This does not enable speculation for multiple-value bodies.
@@ -1381,6 +1384,7 @@ impl TransferCode {
             || t1_ordinary_tagbody_body(&body)
             || function_lookup
             || heap_access
+            || heap_creator
         {
             // A method's callable lives in an uninterned symbol whose name,
             // "(METHOD ...)", does not read back; the installed symbol is its
@@ -2381,6 +2385,9 @@ fn named_call_symbol(instruction: &Instr) -> Option<u32> {
         Instr::SetValues(_) => Some(egcl_rt::symbols::intern("VALUES")),
         // A structure constructor is built as its %MAKE-STRUCT call.
         Instr::MakeStruct { .. } => Some(egcl_rt::symbols::intern("EGCL::%MAKE-STRUCT")),
+        Instr::MakeEnv(_) => Some(egcl_rt::symbols::intern(
+            egcl_compiler::t2::build::HEAP_ENV_MAKE_ADAPTER,
+        )),
         // A scoped body's structure opcodes are built as their general calls.
         Instr::StructRef { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-REF")),
         Instr::StructSet { .. } => Some(egcl_rt::symbols::intern("EGCL::%STRUCT-SET")),
@@ -2591,6 +2598,36 @@ fn t1_ordinary_heap_access_body(body: &BytecodeFunction) -> bool {
         })
 }
 
+fn ordinary_heap_creators_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_ORDINARY_HEAP_CREATORS").is_none())
+}
+
+fn t1_ordinary_heap_creator_body(body: &BytecodeFunction) -> bool {
+    ordinary_heap_creators_enabled()
+        && fixed_tagged_parameters(body)
+        && body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::MakeEnvClosure { .. }))
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true)
+                || matches!(
+                    op,
+                    Instr::MakeEnv(_)
+                        | Instr::MakeEnvClosure { .. }
+                        | Instr::ClosureEnv
+                        | Instr::EnvRef { .. }
+                        | Instr::EnvSet { .. }
+                )
+                || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
+        })
+        && !body.code.iter().enumerate().any(|(bcp, op)| {
+            matches!(op, Instr::Br(target) | Instr::BrIfFalse(target) | Instr::BrIfTrue(target)
+                if (*target as usize) <= bcp)
+        })
+}
+
 /// A body the ordinary x86-64 Lisp entry may run: scope-free, or scope-free
 /// apart from local TAGBODYs (bliss-6m6ca). Every DOTIMES, DOLIST, DO and
 /// LOOP is one, so admitting them lets a loop call its callees through the
@@ -2757,6 +2794,7 @@ fn ordinary_native_op(op: &Instr) -> bool {
             op,
             Instr::EnvRef { .. } | Instr::EnvSet { .. } | Instr::ClosureEnv | Instr::MakeEnv(_)
         )
+        || (matches!(op, Instr::MakeEnvClosure { .. }) && ordinary_heap_creators_enabled())
         // VALUES publishes its tuple through a noncollecting leaf and the
         // ordinary return descriptor (bliss-gg3i1.7.15.10.4).
         || (matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. })
