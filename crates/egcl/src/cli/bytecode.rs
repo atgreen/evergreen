@@ -21067,6 +21067,7 @@ fn load_bbu_definitions(
     } else {
         None
     };
+    let mut eager_unit = eager_fasl::LoadUnit::new(restoring);
     for (action_index, action) in actions.into_iter().enumerate() {
         let function_index = match action.kind {
             3 | 4 | 5 | 7 | 8 | 10 => Some(action.arg0 as usize),
@@ -21177,9 +21178,7 @@ fn load_bbu_definitions(
                 // Keep the function object's tier metadata tied to this loaded
                 // definition; publication has already invalidated old native code.
                 egcl_rt::function::set_tier(fn_obj, 0);
-                if !restoring {
-                    eager_fasl::promote(sym, fn_obj);
-                }
+                eager_unit.promote_named(sym, fn_obj);
                 last = symbol;
             }
             4 => {
@@ -21190,6 +21189,7 @@ fn load_bbu_definitions(
                     Arc::clone(live_function.as_ref().unwrap()),
                     env,
                 );
+                eager_unit.promote_nested(live_function.as_ref().unwrap());
                 last = symbol;
             }
             5 => {
@@ -21209,6 +21209,7 @@ fn load_bbu_definitions(
                     definition_package,
                     env,
                 )?;
+                eager_unit.promote_nested(live_function.as_ref().unwrap());
                 last = symbol;
             }
             8 => {
@@ -21220,9 +21221,11 @@ fn load_bbu_definitions(
                     Arc::clone(live_function.as_ref().unwrap()),
                     env,
                 );
+                eager_unit.promote_nested(live_function.as_ref().unwrap());
                 last = symbol;
             }
             7 => {
+                eager_unit.promote_nested(live_function.as_ref().unwrap());
                 last = run(Arc::clone(live_function.as_ref().unwrap()), &[], NIL, env)?;
             }
             9 => {
@@ -21239,6 +21242,7 @@ fn load_bbu_definitions(
                 };
             }
             11 => {
+                eager_unit.promote_nested(live_function.as_ref().unwrap());
                 let mut initializer_env = env.null_lexical_child();
                 egcl_rt::rooted_ref!(_env_root = &mut initializer_env);
                 last = run(
