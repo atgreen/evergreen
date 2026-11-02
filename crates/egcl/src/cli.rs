@@ -33,6 +33,8 @@ mod evaluated_builtins;
 pub mod events;
 mod generic_binding;
 mod generic_call;
+#[cfg(test)]
+mod global_symbol_macro_shadow_tests;
 pub mod handoff_census;
 mod lexical_identity;
 mod method_continuations;
@@ -12183,12 +12185,24 @@ impl Env {
         // `as_symbol_index()` would abort on them. They can never be symbol
         // macros, so treat them (and any non-symbol) as "no symbol macro".
         let idx = symbol.symbol_index()?;
-        // A SYMBOL-MACROLET binding shadows a global definition of the same name.
-        self.symbol_macros
-            .borrow()
-            .get(&idx)
-            .copied()
-            .or_else(|| GLOBAL_SYMBOL_MACROS.lock().unwrap().get(&idx).copied())
+        // An explicit inner SYMBOL-MACROLET still shadows an enclosing
+        // lexical binding. Copy its expansion before inspecting other scopes.
+        if let Some(expansion) = self.symbol_macros.borrow().get(&idx).copied() {
+            return Some(expansion);
+        }
+        // Global definitions are outside every lexical binding. A source
+        // lambda parameter (also LET, defaults and assignments) must shadow
+        // them, without confusing global value cells or dynamic frame copies
+        // with real lexical locations. Neither lookup below can collect.
+        let expansion = GLOBAL_SYMBOL_MACROS.lock().unwrap().get(&idx).copied()?;
+        if !is_special_var(symbol) && !self.locally_specials.contains(&idx) {
+            // Actual source bindings record exact symbol identities. Printed
+            // names (especially gensyms and other packages) are not evidence.
+            if Self::lookup_symbol_frame(&self.frame, idx).is_some() {
+                return None;
+            }
+        }
+        Some(expansion)
     }
 
     /// Is this symbol index bound as a symbol macro, lexically or globally?
