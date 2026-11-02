@@ -19,7 +19,8 @@
               (initially nil) (finally nil) (block-name nil)
               (first (gensym "LOOP-FIRST")) (accumulators nil)
               (result nil) (boolean-result-p nil)
-              (wrappers nil) (pending nil) (checks nil) (parallel nil) (it nil))
+              (wrappers nil) (pending nil) (checks nil) (parallel nil) (it nil)
+              (numeric-vars nil))
           (labels
               ((take ()
                  (unless remaining (error "Missing operand in LOOP: ~S" clauses))
@@ -265,6 +266,7 @@
                       ;; NIL suppresses the user binding, but arithmetic
                       ;; iteration still needs a private counter.
                       (unless var (setq var (gensym "LOOP-COUNTER")))
+                      (push var numeric-vars)
                       (let ((start 0) (bound nil) (boundary nil) (stride 1)
                             (down nil))
                         (push (intern mode :keyword) remaining)
@@ -297,15 +299,33 @@
                  (take)
                  ;; Buffer user-variable stores until the whole group has
                  ;; computed its next values. Driver-private state stays local.
-                 (setq parallel t pending nil checks nil)
-                 (driver)
-                 (do () ((not (at "AND"))) (take) (driver))
-                 (setq parallel nil)
-                 (do ((stores (nreverse pending) (cdr stores))) ((null stores))
-                   (emit (car stores)))
-                 (do ((tests (nreverse checks) (cdr tests))) ((null tests))
-                   (emit (car tests)))
-                 (setq pending nil checks nil))
+                 (let ((prior-bindings bindings) (driver-count 1))
+                   (setq parallel t pending nil checks nil numeric-vars nil)
+                   (driver)
+                   (do () ((not (at "AND")))
+                     (take) (incf driver-count) (driver))
+                   (when (and (> driver-count 1) (= (length numeric-vars) driver-count))
+                     ;; Every arithmetic initializer in an AND group sees the
+                     ;; bindings outside that group. The final expansion uses
+                     ;; LET*, so put all private option/next temporaries before
+                     ;; the group's user bindings, preserving source order.
+                     ;; Distinct FOR groups and mixed drivers retain their order.
+                     (let ((user-bindings nil) (private-bindings nil))
+                       (do ((tail bindings (cdr tail))) ((eq tail prior-bindings))
+                         (if (member (caar tail) numeric-vars :test #'eq)
+                             (push (car tail) user-bindings)
+                             (push (car tail) private-bindings)))
+                       ;; BIND collects in reverse order; the outer NREVERSE
+                       ;; will place private initializers before user bindings.
+                       (setq bindings (append (nreverse user-bindings)
+                                              (nreverse private-bindings)
+                                              prior-bindings))))
+                   (setq parallel nil)
+                   (do ((stores (nreverse pending) (cdr stores))) ((null stores))
+                     (emit (car stores)))
+                   (do ((tests (nreverse checks) (cdr tests))) ((null tests))
+                     (emit (car tests)))
+                   (setq pending nil checks nil)))
                 ((at "WITH")
                  (take)
                  (let ((group nil))
