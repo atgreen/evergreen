@@ -30,6 +30,20 @@
 
 ### Fixed
 
+- Reject invalid `STRING` designators with `TYPE-ERROR`, preserving the original
+  invalid datum ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Preserve dynamic binding order when keyword defaults read special parameters
+  indirectly ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Reclaim eligible heap-environment closures during minor GC while preserving
+  shared code identity and captured values
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Compile methods with definition-site lexical captures and admit eligible
+  function-cell lookups through ordinary T1 entries
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
 - Read large simple base and character strings correctly from native
   `CHAR`, `SCHAR`, and `ELT` accessors
   ([#978](https://github.com/atgreen/evergreen/pull/978)).
