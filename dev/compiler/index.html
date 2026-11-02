@@ -2581,6 +2581,14 @@ not a portable Common Lisp interface, and many are read once.</p>
 <td>Request eager bytecode compilation rather than lazy compilation</td>
 </tr>
 <tr>
+<td><code>EGCL_FASL_EAGER_T1=1</code></td>
+<td>Compile named FASL-loaded functions and their nested closure templates to T1 before continuing the load; off by default</td>
+</tr>
+<tr>
+<td><code>EGCL_DISABLE_LET_DEFUN_COMPILATION=1</code></td>
+<td>Compare top-level lexical <code>DEFUN</code> creators against their original execution path</td>
+</tr>
+<tr>
 <td><code>EGCL_T1_THRESHOLD</code></td>
 <td>Override the T1 invocation threshold</td>
 </tr>
@@ -2598,6 +2606,27 @@ not a portable Common Lisp interface, and many are read once.</p>
 </tr>
 </tbody>
 </table>
+<p>Eager FASL compilation covers each installed named bytecode definition and the
+closure templates reachable through its nested-function graph. Templates share
+one compiled body across later instances; preparing them runs no Lisp body or
+lambda-list default and does not create an instance or captured environment.
+This trades extra load time and executable memory for native code on the first
+call. It uses the normal T1 compiler and publication checks; a declined function
+remains executable as bytecode. It does not manufacture
+invocation heat or request T2 compilation. Forced <code>interp</code>/<code>t0</code> tiers, disabled
+profiling, and builds without T1 take precedence. Core-image restoration keeps
+its existing policy. Compare load time and steady execution separately before
+enabling this experimental control for a workload.</p>
+<p>Eligible top-level <code>LET</code> and <code>LET*</code> forms that define functions compile as one
+creator, sharing captured locations between their functions. Forms requiring
+definition-time declaration policies, event recording, unsupported closure
+operations, or declared result contracts retain their existing path. The creator
+also retains that path when an initializer or a body form preceding a definition
+can perform opaque effects, so runtime macro changes precede definition-time
+expansion. The compiled cohort accepts literals, ordinary variable references,
+quoted data, and exact unshadowed CL <code>LIST</code>/<code>CONS</code> constructors as initializers.
+Installed definitions keep their public function names without renaming shared
+closure prototypes or changing their private code identities.</p>
 <p>A threshold does not expand the target backend's supported instruction set.
 See <a href="../user/reference/platforms/">Platform support</a> and
 <a href="../profiling/">Profiling and efficiency</a>.</p>
