@@ -24,8 +24,10 @@ growth and suspended activations until execution retirement; reentry never
 resets a partially consumed batch. Companion artifacts use distinct identities.
 
 A missing context, view or cell preserves the published cold poll, reporting
-one observed edge rather than an unearned batch. Each entry initializes both
-raw words before any poll. Frame sizing, precise map bounds and ordinary stack
+one observed edge rather than an unearned batch. Each entry publishes its
+selected pointer before any poll; the fallback word is initialized when a
+missing binding selects it. A valid mapped initializer result skips that unused
+fallback setup and fills the pointer home and cache register directly. Frame sizing, precise map bounds and ordinary stack
 admission include both additional raw words, plus any new callee-save word and
 alignment padding. Neither raw word nor the active cache register is a tagged
 root. The saved incoming register word can hold a caller's live Lisp value: its

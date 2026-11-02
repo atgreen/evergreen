@@ -1643,12 +1643,20 @@ fn emit_heat_fallback(a: &mut Asm, cache: HeatCacheHomes) {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn emit_initialized_heat_binding(a: &mut Asm, cache: HeatCacheHomes) {
-    let missing = a.label();
-    emit_heat_fallback(a, cache);
+    let ready = a.label();
+    // The initializer has already validated a stable execution-owned cell.
+    // Only a missing binding needs a frame-local countdown. A real cell never
+    // reads that raw word: cold code merely compares its fallback address.
     alu_r_imm(a, 7, SCRATCH, 0);
-    a.jcc(Cc::E, missing);
+    a.jcc(Cc::Ne, ready);
+    mov_imm64(a, RAX, 1);
+    store_home(a, FramedHome::Stack(cache.fallback), RAX, 0);
+    emit_heat_fallback_address(a, SCRATCH, cache);
+    a.bind(ready);
     store_home(a, FramedHome::Stack(cache.pointer), SCRATCH, 0);
-    a.bind(missing);
+    if let Some(register) = cache.register {
+        mov_rr(a, register, SCRATCH);
+    }
 }
 
 /// Resolve once per activation using only reserved scratch registers. The
@@ -8215,6 +8223,9 @@ fn emit_framed_inner(
                 // The existing initializer returns the already validated cell
                 // in RDX. Keep the same frame-local one-edge missing binding.
                 emit_initialized_heat_binding(a, home);
+                // Both success and fallback initialized the raw register from
+                // RDX directly. Do not reload through the pointer stack home.
+                return;
             } else if let Some(control) = poll_control_home {
                 let missing = a.label();
                 let done = a.label();
@@ -15618,6 +15629,130 @@ mod execution_heat_tests {
         a.push(0xc3);
         let bytes = a.finish().unwrap();
         (egcl_rt::jit::JitBuffer::new(&bytes).unwrap(), bytes)
+    }
+
+    fn initialized_fragment(
+        batch: u32,
+        visits: usize,
+        register: Option<u8>,
+    ) -> egcl_rt::jit::JitBuffer {
+        let mut asm = Asm::new();
+        let cache = HeatCacheHomes {
+            pointer: 0,
+            fallback: 1,
+            register,
+        };
+        if let Some(register) = register {
+            push_reg(&mut asm, register);
+        }
+        alu_r_imm(&mut asm, 5, 4, 16);
+        mov_rr(&mut asm, SCRATCH, 7); // emulate the validated initializer's RDX
+        emit_initialized_heat_binding(&mut asm, cache);
+        let heat = BaselineHeat {
+            counter: BaselineHeatCounter::ExecutionOwned(HeatId::new().unwrap()),
+            batch,
+        };
+        mov_imm64(&mut asm, 8, 0);
+        for _ in 0..visits {
+            let slow = asm.label();
+            let done = asm.label();
+            emit_heat_countdown(&mut asm, heat, Some(cache), slow);
+            asm.jmp(done);
+            asm.bind(slow);
+            emit_heat_reload(&mut asm, heat, Some(cache));
+            mov_imm64(&mut asm, 7, 0);
+            emit_heat_request(&mut asm, heat, Some(cache));
+            alu_rr(&mut asm, 0x01, 8, 7);
+            asm.bind(done);
+        }
+        mov_rr(&mut asm, RAX, 8);
+        alu_r_imm(&mut asm, 0, 4, 16);
+        if let Some(register) = register {
+            pop_reg(&mut asm, register);
+        }
+        asm.push(0xc3);
+        egcl_rt::jit::JitBuffer::new(&asm.finish().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn initialized_heat_success_skips_fallback_and_loads_register_directly() {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic, Register};
+        let mut asm = Asm::new();
+        emit_initialized_heat_binding(
+            &mut asm,
+            HeatCacheHomes {
+                pointer: 0,
+                fallback: 1,
+                register: Some(12),
+            },
+        );
+        let bytes = asm.finish().unwrap();
+        let instructions: Vec<_> = Decoder::new(64, &bytes, DecoderOptions::NONE)
+            .into_iter()
+            .collect();
+        assert_eq!(instructions[0].mnemonic(), Mnemonic::Cmp);
+        assert_eq!(instructions[0].op0_register(), Register::RDX);
+        assert_eq!(instructions[1].mnemonic(), Mnemonic::Jne);
+        let ready = instructions
+            .iter()
+            .position(|instruction| instruction.ip() == instructions[1].near_branch_target())
+            .unwrap();
+        assert_eq!(
+            ready, 5,
+            "success skips counter initialization and fallback address construction"
+        );
+        assert_eq!(
+            2 + instructions.len() - ready,
+            4,
+            "four instructions on validated-cell entry"
+        );
+        assert_eq!(instructions[ready].mnemonic(), Mnemonic::Mov);
+        assert_eq!(instructions[ready].memory_base(), Register::RSP);
+        assert_eq!(instructions[ready].memory_displacement64(), 0);
+        assert_eq!(instructions[ready].op1_register(), Register::RDX);
+        assert_eq!(instructions[ready + 1].op0_register(), Register::R12);
+        assert_eq!(instructions[ready + 1].op1_register(), Register::RDX);
+    }
+
+    #[test]
+    fn initialized_heat_keeps_real_countdown_and_initializes_each_missing_fallback() {
+        use std::sync::atomic::AtomicU32;
+        for register in [None, Some(12)] {
+            let code = initialized_fragment(4, 1, register);
+            let run: extern "C" fn(*const AtomicU32) -> u64 =
+                unsafe { std::mem::transmute(code.as_ptr()) };
+            let counter = AtomicU32::new(4);
+            assert_eq!(
+                [run(&counter), run(&counter), run(&counter), run(&counter)],
+                [0, 0, 0, 5]
+            );
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                4,
+                "real binding is never reset at entry"
+            );
+            let repeated = initialized_fragment(4, 3, register);
+            let repeat: extern "C" fn(*const AtomicU32) -> u64 =
+                unsafe { std::mem::transmute(repeated.as_ptr()) };
+            for _ in 0..3 {
+                assert_eq!(
+                    repeat(std::ptr::null()),
+                    3,
+                    "one credit per missing edge, including repeated visits"
+                );
+            }
+            assert_eq!(counter.load(Ordering::Relaxed), 4);
+            assert_eq!(run(&counter), 0);
+            assert_eq!(counter.load(Ordering::Relaxed), 3);
+            let next = AtomicU32::new(4);
+            assert_eq!(run(&next), 0);
+            assert_eq!(next.load(Ordering::Relaxed), 3);
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                3,
+                "a new validated binding does not reuse the old pointer"
+            );
+        }
     }
 
     #[test]
