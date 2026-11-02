@@ -303,7 +303,7 @@ fn resolve(
         let constant = match (data.opcode, &data.aux) {
             (Opcode::ConstFixnum, AuxData::FixnumImm(n)) => Some(EgclVal::from_fixnum(*n)),
             (Opcode::ConstFloat, AuxData::FloatImm(x)) => Some(EgclVal::from_single_float(*x)),
-            (Opcode::ConstChar, AuxData::CharImm(c)) => Some(EgclVal::from_char(*c)),
+            (Opcode::ConstChar, AuxData::CharImm(c)) => Some(EgclVal::from_char_code(*c)),
             (Opcode::ConstSymbol, AuxData::SymbolRef(sym)) => {
                 Some(EgclVal::from_symbol_index(*sym))
             }

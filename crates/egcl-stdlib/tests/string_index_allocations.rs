@@ -84,7 +84,7 @@ fn simple_string_reads_do_not_allocate() {
                 ),
                 (
                     "character access",
-                    |s, i| sequences::string_char_at(s, i).unwrap() as usize,
+                    |s, i| sequences::string_code_at(s, i).unwrap() as usize,
                     last as usize,
                 ),
                 ("LENGTH", |s, _| sequences::length(s).unwrap(), n),
@@ -109,7 +109,7 @@ fn simple_string_reads_do_not_allocate() {
                 allocations.iter().all(|(_, bytes)| *bytes == 0),
                 "simple string length {n}, registered={registered}: {allocations:?}"
             );
-            assert_eq!(sequences::string_char_at(*string, n), None);
+            assert_eq!(sequences::string_code_at(*string, n), None);
             assert!(sequences::elt(*string, n).is_err());
         }
     }
@@ -124,7 +124,7 @@ fn a_registered_pathname_is_not_a_string_sequence() {
             .0
     );
     egcl_stdlib::pathnames::register_string(*pathname, "/tmp/string-read-test.lisp");
-    assert_eq!(sequences::string_char_at(*pathname, 0), None);
+    assert_eq!(sequences::string_code_at(*pathname, 0), None);
     assert_eq!(sequences::string_char_count(*pathname), None);
     assert!(sequences::length(*pathname).is_err());
     assert!(sequences::elt(*pathname, 0).is_err());

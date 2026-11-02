@@ -626,7 +626,10 @@ unsafe fn simple_string_hash(ptr: *const u8) -> u64 {
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut h = FNV_OFFSET;
     let mut buf = [0u8; 4];
-    for c in unsafe { egcl_rt::object::simple_string_chars(ptr) } {
+    // Hash the LOSSY text (a surrogate as U+FFFD), as every other string
+    // representation is hashed via its Rust text: equal strings still hash
+    // alike, and EQUAL itself compares the exact codes (bliss-5fn6m).
+    for c in unsafe { egcl_rt::object::simple_string_codes(ptr) }.map(egcl_rt::text::char_lossy) {
         for &byte in c.encode_utf8(&mut buf).as_bytes() {
             h ^= byte as u64;
             h = h.wrapping_mul(FNV_PRIME);
@@ -860,8 +863,8 @@ fn equalp_number_hash(v: EgclVal) -> Option<u64> {
 }
 
 /// EQUALP hash of a character, case-folded the way EQUALP compares.
-fn equalp_char_hash(c: char) -> u64 {
-    hash_u64(crate::characters::char_upcase(c) as u64)
+fn equalp_char_hash(code: u32) -> u64 {
+    hash_u64(crate::characters::code_upcase(code) as u64)
 }
 
 /// Seed for [`KeyHasher::identity`]'s per-type SXHASH value.
@@ -1011,7 +1014,7 @@ impl KeyHasher {
             return h;
         }
         if object.is_character() {
-            return equalp_char_hash(object.as_char());
+            return equalp_char_hash(object.char_code());
         }
         if object.tag() == TAG_CONS {
             return self.list(object, depth, Self::equalp);
@@ -1027,10 +1030,17 @@ impl KeyHasher {
             }
             // A string is EQUALP to a general vector holding the same characters,
             // so both hash as a length followed by per-element hashes.
-            if let Some(text) = crate::equality::string_text(object) {
-                let mut h = hash_u64(text.chars().count() as u64);
-                for c in text.chars() {
-                    h = combine_hashes(h, if depth == 1 { 0 } else { equalp_char_hash(c) });
+            if let Some(codes) = crate::equality::string_codes(object) {
+                let mut h = hash_u64(codes.len() as u64);
+                for &code in &codes {
+                    h = combine_hashes(
+                        h,
+                        if depth == 1 {
+                            0
+                        } else {
+                            equalp_char_hash(code)
+                        },
+                    );
                 }
                 return h;
             }

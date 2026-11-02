@@ -921,6 +921,24 @@ fn write_str_to(stream: EgclVal, s: &str, env: &mut Env) -> Result<(), EgclError
     // Fresh, not interned: an interned string is never reclaimed, so every
     // distinct text written would leak (bliss-4due).
     egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string_fresh(s));
+    write_lisp_string_to(stream, *sv, env)
+}
+
+/// [`write_str_to`] for exact character codes, which may include surrogates.
+fn write_codes_to(stream: EgclVal, codes: &[u32], env: &mut Env) -> Result<(), EgclError> {
+    let mut stream = stream;
+    egcl_rt::rooted_ref!(_stream_root = &mut stream);
+    check_pending_sigpipe_for_output()?;
+    egcl_rt::rooted!(sv = egcl_stdlib::make_lisp_string_from_codes(codes, false));
+    write_lisp_string_to(stream, *sv, env)
+}
+
+/// Write the whole of a (rooted) Lisp string to a resolved output stream,
+/// dispatching to STREAM-WRITE-STRING for a Gray stream.
+fn write_lisp_string_to(stream: EgclVal, sv: EgclVal, env: &mut Env) -> Result<(), EgclError> {
+    let mut stream = stream;
+    egcl_rt::rooted_ref!(_stream_root = &mut stream);
+    egcl_rt::rooted!(sv = sv);
     if is_gray_stream(stream) {
         invoke_generic_function(
             "STREAM-WRITE-STRING",
@@ -13135,7 +13153,7 @@ fn print_val_body(mut val: EgclVal, out: &mut String) {
         if val.as_char() == ' ' && !egcl_stdlib::format::print_readably_active() {
             out.push(' ');
         } else {
-            out.push_str(&egcl_stdlib::format::character_name(val.as_char()));
+            out.push_str(&egcl_stdlib::format::character_name(val.char_code()));
         }
     } else if val.is_symbol() {
         let name = sym_name(val);
@@ -14081,14 +14099,14 @@ fn is_base_string_value(v: EgclVal) -> bool {
 /// range an 8-bit `SIMPLE_BASE_STRING` stores (spec §1.6.3). EXTENDED-CHAR is
 /// the rest of CHARACTER.
 fn is_base_char_value(v: EgclVal) -> bool {
-    v.is_character() && (v.as_char() as u32) < 256
+    v.is_character() && v.char_code() < 256
 }
 
 /// STANDARD-CHAR: the 96 standard characters, #\Newline plus the printable
 /// ASCII range (matches boot.lisp STANDARD-CHAR-P).
 fn is_standard_char_value(v: EgclVal) -> bool {
     v.is_character() && {
-        let code = v.as_char() as u32;
+        let code = v.char_code();
         code == 10 || (32..127).contains(&code)
     }
 }
@@ -22839,6 +22857,13 @@ fn string_value(v: EgclVal) -> Result<EgclVal, EgclError> {
         return Ok(v);
     }
     let s = if v.is_character() {
+        if egcl_stdlib::characters::is_surrogate_char(v) {
+            // No Rust text holds a surrogate; build the string from its code.
+            return Ok(egcl_stdlib::make_lisp_string_from_codes(
+                &[v.char_code()],
+                false,
+            ));
+        }
         v.as_char().to_string()
     } else {
         val_as_str(v)
@@ -26000,15 +26025,12 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                         expected: "character".into(),
                     });
                 }
-                return Ok(EgclVal::from_fixnum(v.as_char() as i64));
+                return Ok(EgclVal::from_fixnum(i64::from(v.char_code())));
             }
             "CODE-CHAR" => {
                 let (af, _) = cp(cdr);
-                let code = num_val(eval_form(af, env)?)? as u32;
-                return Ok(match char::from_u32(code) {
-                    Some(c) => EgclVal::from_char(c),
-                    None => NIL,
-                });
+                let code = num_val(eval_form(af, env)?)? as i64;
+                return Ok(egcl_stdlib::characters::code_char(code).unwrap_or(NIL));
             }
             "TYPEP" => return eval_builtin_arguments(&name, cdr, env),
             "EQ" => {
@@ -34959,7 +34981,7 @@ fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclErr
     if !base && egcl_stdlib::registered_string(value).is_some() {
         return Ok(value);
     }
-    let mut s = String::new();
+    let mut codes = Vec::new();
     for e in seq_elements(value)? {
         // Every element must fit the string: one that is not a character (or
         // not a BASE-CHAR, for a base string) is a TYPE-ERROR, as in SBCL,
@@ -34970,16 +34992,13 @@ fn coerce_to_string_value(value: EgclVal, base: bool) -> Result<EgclVal, EgclErr
                 expected: if base { "base-char" } else { "character" }.into(),
             });
         }
-        s.push(e.as_char());
+        codes.push(e.char_code());
     }
     // A freshly built string (e.g. from a list, as MAKE-ARRAY does for
     // :element-type character :initial-contents) must be MUTABLE — an
     // interned literal errors on (setf char) (ansi NSTRING-UPCASE.6/.7).
-    Ok(if base {
-        egcl_stdlib::make_lisp_base_string_fresh(&s)
-    } else {
-        egcl_stdlib::make_lisp_string_fresh(&s)
-    })
+    // Built from the codes, so a surrogate character survives (bliss-5fn6m).
+    Ok(egcl_stdlib::make_lisp_string_from_codes(&codes, base))
 }
 
 /// Resolve DEFTYPE and function designators once, for both call paths.
@@ -36862,14 +36881,30 @@ fn string_designator(v: EgclVal) -> String {
     val_as_str(v)
 }
 
-fn string_compare_bounds_values(args: &[EgclVal]) -> Result<(String, String, usize), EgclError> {
+/// [`string_designator`] as exact character codes: a string's or character's
+/// surrogates survive (bliss-5fn6m); other designators go through their text.
+fn string_designator_codes(v: EgclVal) -> Vec<u32> {
+    if v.is_character() {
+        return vec![v.char_code()];
+    }
+    if !v.is_symbol()
+        && let Some(codes) = egcl_stdlib::sequences::string_codes(v)
+    {
+        return codes;
+    }
+    string_designator(v).chars().map(|c| c as u32).collect()
+}
+
+fn string_compare_bounds_values(
+    args: &[EgclVal],
+) -> Result<(Vec<u32>, Vec<u32>, usize), EgclError> {
     if args.len() < 2 {
         return Err(EgclError::ProgramError(
             "string comparison requires two string designators".into(),
         ));
     }
-    let s1: Vec<char> = string_designator(args[0]).chars().collect();
-    let s2: Vec<char> = string_designator(args[1]).chars().collect();
+    let s1 = string_designator_codes(args[0]);
+    let s2 = string_designator_codes(args[1]);
     let kw = &args[2..];
     // ANSI keyword validation (catchable PROGRAM-ERROR): an odd number of
     // keyword arguments, a non-symbol in keyword position, or an unknown
@@ -36928,8 +36963,8 @@ fn string_compare_bounds_values(args: &[EgclVal]) -> Result<(String, String, usi
     let end1 = bound("END1", s1.len()).min(s1.len()).max(start1);
     let start2 = bound("START2", 0).min(s2.len());
     let end2 = bound("END2", s2.len()).min(s2.len()).max(start2);
-    let sub1: String = s1[start1..end1].iter().collect();
-    let sub2: String = s2[start2..end2].iter().collect();
+    let sub1 = s1[start1..end1].to_vec();
+    let sub2 = s2[start2..end2].to_vec();
     Ok((sub1, sub2, start1))
 }
 
@@ -46447,20 +46482,18 @@ fn apply_builtin_fast(
                     expected: "character".into(),
                 }));
             }
-            Some(Ok(EgclVal::from_fixnum(v.as_char() as i64)))
+            Some(Ok(EgclVal::from_fixnum(i64::from(v.char_code()))))
         }
         "CODE-CHAR" if args.len() == 1 => {
             env.clear_mv();
             // Mirrors operator position exactly, including that an out-of-range
-            // or surrogate code answers NIL rather than signalling.
+            // code answers NIL rather than signalling. A surrogate code is a
+            // character, as in SBCL (bliss-5fn6m).
             let code = match num_val(args[0]) {
-                Ok(n) => n as u32,
+                Ok(n) => n as i64,
                 Err(e) => return Some(Err(e)),
             };
-            Some(Ok(match char::from_u32(code) {
-                Some(c) => EgclVal::from_char(c),
-                None => NIL,
-            }))
+            Some(Ok(egcl_stdlib::characters::code_char(code).unwrap_or(NIL)))
         }
         "CHAR-UPCASE" | "CHAR-DOWNCASE" if args.len() == 1 => {
             env.clear_mv();
@@ -47007,9 +47040,7 @@ fn integer_or_float_remainder(a: EgclVal, b: EgclVal, q: i64, av: f64, bv: f64) 
 /// shorter length; `Equal` means identical. Char-based (not byte-based) so it is
 /// correct for non-ASCII. Used by STRING</STRING> to return the ANSI mismatch
 /// index rather than a boolean.
-fn string_mismatch(a: &str, b: &str) -> (usize, std::cmp::Ordering) {
-    let av: Vec<char> = a.chars().collect();
-    let bv: Vec<char> = b.chars().collect();
+fn string_mismatch(av: &[u32], bv: &[u32]) -> (usize, std::cmp::Ordering) {
     let n = av.len().min(bv.len());
     for i in 0..n {
         if av[i] != bv[i] {

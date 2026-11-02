@@ -2884,12 +2884,17 @@ pub const CONTROL_CHAR_NAMES: [&str; 32] = [
     "Us",
 ];
 
-/// CHAR-NAME: the name of `c`, when it has one.  Every non-graphic character
-/// is named so that `#\` output always reads back: the control table above,
+/// CHAR-NAME: the name of the character `code`, when it has one.  Every
+/// non-graphic character is named so that `#\` output always reads back: the
+/// control table above,
 /// Rubout, Next-Line, and `U+XXXX` for the remaining C1 controls; the two
 /// named Unicode spaces keep their names.  Other graphic characters have none.
-pub fn char_name(c: char) -> Option<String> {
-    let code = c as u32;
+pub fn char_name(code: u32) -> Option<String> {
+    // A surrogate is a character but not a Rust `char`; it is named like
+    // SBCL names it, `UD800`, which reads back (bliss-5fn6m).
+    if egcl_rt::text::is_surrogate(code) {
+        return Some(format!("U{code:04X}"));
+    }
     Some(match code {
         0..=31 => CONTROL_CHAR_NAMES[code as usize].to_string(),
         32 => "Space".to_string(),
@@ -2906,14 +2911,15 @@ pub fn char_name(c: char) -> Option<String> {
 /// `char_name` produces, the aliases SBCL and Clozure CL both read
 /// (Nul/Bel/Esc/Altmode, Linefeed/Lf, Cr, Bs, Ht, Sp, Del/Delete,
 /// Ff/Formfeed for Page -- AllegroServe writes `#\ff`), and the
-/// `U+XXXX` / `UXXXX` hexadecimal spellings.
-pub fn char_from_name(name: &str) -> Option<char> {
+/// `U+XXXX` / `UXXXX` hexadecimal spellings of any code below
+/// `CHAR-CODE-LIMIT`, surrogates included. Answers the character code.
+pub fn char_from_name(name: &str) -> Option<u32> {
     let lower = name.to_ascii_lowercase();
     if let Some(pos) = CONTROL_CHAR_NAMES
         .iter()
         .position(|n| n.eq_ignore_ascii_case(name))
     {
-        return char::from_u32(pos as u32);
+        return Some(pos as u32);
     }
     let direct = match lower.as_str() {
         "nul" => '\0',
@@ -2934,10 +2940,12 @@ pub fn char_from_name(name: &str) -> Option<char> {
                 .strip_prefix("u+")
                 .or_else(|| lower.strip_prefix('u'))
                 .filter(|h| h.len() >= 2 && h.chars().all(|d| d.is_ascii_hexdigit()))?;
-            return u32::from_str_radix(hex, 16).ok().and_then(char::from_u32);
+            return u32::from_str_radix(hex, 16)
+                .ok()
+                .filter(|&code| code < egcl_rt::text::CHAR_CODE_LIMIT);
         }
     };
-    Some(direct)
+    Some(direct as u32)
 }
 
 /// `colon_pos` is the byte offset of the token's package marker — the first
@@ -3778,8 +3786,8 @@ fn read_char_literal_input(
     }
     if end - start > 1 {
         let name: String = chars.data()[start..end].iter().collect();
-        if let Some(c) = char_from_name(&name) {
-            return Ok((EgclVal::from_char(c), end));
+        if let Some(code) = char_from_name(&name) {
+            return Ok((EgclVal::from_char_code(code), end));
         }
         if name.len() == 1 {
             return Ok((EgclVal::from_char(name.chars().next().unwrap()), end));

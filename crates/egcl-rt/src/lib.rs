@@ -41,6 +41,7 @@ pub mod symbols;
 #[cfg_attr(windows, path = "syscall/windows.rs")]
 #[cfg_attr(any(target_os = "macos", target_os = "ios"), path = "syscall/macos.rs")]
 pub mod syscall;
+pub mod text;
 pub mod types;
 pub mod value;
 

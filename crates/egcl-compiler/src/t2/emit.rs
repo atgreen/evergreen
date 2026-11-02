@@ -6981,7 +6981,7 @@ fn emit_framed_inner(
                     const_tagged.insert(r, ((v.to_bits() as u64) << 32) | 0b100);
                 }
                 (Opcode::ConstChar, AuxData::CharImm(c)) => {
-                    const_tagged.insert(r, egcl_rt::value::EgclVal::from_char(*c).0);
+                    const_tagged.insert(r, egcl_rt::value::EgclVal::from_char_code(*c).0);
                 }
                 (Opcode::ConstSymbol, AuxData::SymbolRef(idx)) => {
                     const_tagged.insert(r, egcl_rt::value::EgclVal::from_symbol_index(*idx).0);

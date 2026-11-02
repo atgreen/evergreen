@@ -86,6 +86,19 @@ impl EgclVal {
         EgclVal(((c as u64) << 3) | TAG_CHARACTER)
     }
 
+    /// Create a character value from any code below `CHAR-CODE-LIMIT`
+    /// (`#x110000`), including the surrogate codes `#xD800`-`#xDFFF`, which a
+    /// Rust `char` cannot hold but which are characters in EGCL as in SBCL
+    /// (bliss-5fn6m). The caller has checked the range.
+    #[inline(always)]
+    pub fn from_char_code(code: u32) -> Self {
+        debug_assert!(
+            code < crate::text::CHAR_CODE_LIMIT,
+            "character code {code:#x} out of range"
+        );
+        EgclVal(((code as u64) << 3) | TAG_CHARACTER)
+    }
+
     /// Create a single-float immediate from an f32.
     /// The f32 bits are stored in bits 63:32, tag in bits 2:0.
     pub fn from_single_float(f: f32) -> Self {
@@ -320,11 +333,27 @@ impl EgclVal {
         (self.0 as i64) >> 3
     }
 
-    /// Extract the character value. Panics if not a character.
+    /// The character's code (CHAR-CODE): any value below `CHAR-CODE-LIMIT`,
+    /// surrogates included. Panics if not a character. Prefer this to
+    /// [`as_char`](Self::as_char) wherever a Rust `char` is not required.
+    #[inline(always)]
+    pub fn char_code(self) -> u32 {
+        assert!(
+            self.is_character(),
+            "char_code called on non-character value"
+        );
+        (self.0 >> 3) as u32
+    }
+
+    /// The character as a Rust `char`, for code that hands it to Rust text
+    /// (`String`, `str` APIs). A surrogate code (`#xD800`-`#xDFFF`) is a
+    /// character in EGCL but not a Rust `char`, so it becomes U+FFFD
+    /// REPLACEMENT CHARACTER here: this view is LOSSY for exactly those codes.
+    /// Use [`char_code`](Self::char_code) for character semantics (codes,
+    /// comparison, hashing, storage). Panics if not a character.
+    #[inline]
     pub fn as_char(self) -> char {
-        assert!(self.is_character(), "as_char called on non-character value");
-        let codepoint = (self.0 >> 3) as u32;
-        char::from_u32(codepoint).expect("invalid Unicode codepoint in character value")
+        crate::text::char_lossy(self.char_code())
     }
 
     /// Extract the single-float value. Panics if not a single-float.
@@ -413,7 +442,10 @@ impl core::fmt::Debug for EgclVal {
                 TAG_FIXNUM => write!(f, "Fixnum({})", self.as_fixnum()),
                 TAG_CONS => write!(f, "Cons({:#x})", self.0 & !TAG_MASK),
                 TAG_HEAP_OBJECT => write!(f, "HeapObj({:#x})", self.0 & !TAG_MASK),
-                TAG_CHARACTER => write!(f, "Char({:?})", self.as_char()),
+                TAG_CHARACTER => match char::from_u32(self.char_code()) {
+                    Some(c) => write!(f, "Char({c:?})"),
+                    None => write!(f, "Char(U+{:04X})", self.char_code()),
+                },
                 TAG_SINGLE_FLOAT => write!(f, "SingleFloat({})", self.as_single_float()),
                 TAG_SYMBOL => write!(f, "Symbol({})", self.as_symbol_index()),
                 TAG_FUNCTION => write!(f, "Function({:#x})", self.0 & !TAG_MASK),

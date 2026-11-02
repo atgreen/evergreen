@@ -13677,10 +13677,16 @@ impl BbuConstPool {
         if v.is_character() {
             let mut bytes = Vec::new();
             put_u8(&mut bytes, 7);
-            put_u32(&mut bytes, v.as_char() as u32);
+            put_u32(&mut bytes, v.char_code());
             return Some(self.intern_encoded(bytes));
         }
         if v.is_string() {
+            // A string constant is stored as UTF-8, which cannot carry a
+            // surrogate character; such a literal is not externalizable here,
+            // rather than silently becoming U+FFFD (bliss-5fn6m).
+            if egcl_stdlib::sequences::string_has_surrogate(v) {
+                return None;
+            }
             return Some(self.string(&val_as_str(v)));
         }
         // A string with a fill pointer or adjustable storage, such as the ones
@@ -13688,6 +13694,9 @@ impl BbuConstPool {
         // its active elements (CLHS 3.2.4.2.2), so it loads as a simple string.
         // Without this, one such literal made the whole file source-only.
         if let Some(contents) = egcl_stdlib::cvec_char_contents(v) {
+            if egcl_stdlib::sequences::string_has_surrogate(v) {
+                return None;
+            }
             return Some(self.string(&contents));
         }
         if v.is_symbol() {
@@ -16837,9 +16846,9 @@ fn allocate_bbu_constants(constants: &[BbuConstant]) -> Result<Vec<EgclVal>, Egc
                     .collect();
                 egcl_rt::bignum::BigInt::from_mag(if *negative { -1 } else { 1 }, limbs).to_val()
             }
-            BbuConstant::Character(code) => char::from_u32(*code)
-                .map(EgclVal::from_char)
-                .ok_or_else(|| bbu_error(format!("invalid character scalar {code}")))?,
+            // Any code below CHAR-CODE-LIMIT, surrogates included (bliss-5fn6m).
+            BbuConstant::Character(code) => egcl_stdlib::characters::code_char(i64::from(*code))
+                .ok_or_else(|| bbu_error(format!("invalid character code {code}")))?,
             BbuConstant::String(value) => arena_str(value),
             BbuConstant::Package { name_ref, .. } => arena_str(bbu_string(constants, *name_ref)?),
             BbuConstant::Symbol {

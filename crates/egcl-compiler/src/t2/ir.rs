@@ -531,7 +531,8 @@ pub enum AuxData {
     FloatImm(f32),
     /// The IEEE bits of a raw double constant (`ConstDouble`).
     DoubleImm(u64),
-    CharImm(char),
+    /// A character code; surrogates included (bliss-5fn6m).
+    CharImm(u32),
     SymbolRef(u32),
     /// Address of the moving-GC value's owning constant-pool slot. Generated
     /// code loads through this slot; the compiler client must keep it rooted

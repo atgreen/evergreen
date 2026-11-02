@@ -7109,6 +7109,23 @@ pub fn alloc_character_string(s: &str) -> EgclVal {
     }
 }
 
+/// Allocate a fresh 32-bit `SIMPLE_CHARACTER_STRING` holding exactly `codes`,
+/// on the GC heap like [`alloc_character_string`]. Unlike a `&str`, a code
+/// slice can hold a surrogate character (bliss-5fn6m). Each code must be below
+/// `CHAR-CODE-LIMIT`.
+pub fn alloc_character_string_codes(codes: &[u32]) -> EgclVal {
+    let padded = crate::object::simple_string_size(codes.len(), 4);
+    let body_size = padded - OBJECT_HEADER_SIZE;
+    let body = alloc_typed(body_size, crate::object::type_id::SIMPLE_CHARACTER_STRING)
+        .unwrap_or_else(|| panic!("{}", allocation_failure_message("character-string")));
+    unsafe {
+        *(body as *mut u64) = codes.len() as u64;
+        std::ptr::copy_nonoverlapping(codes.as_ptr(), body.add(8) as *mut u32, codes.len());
+        let off = body_header_offset(body_size);
+        EgclVal::from_heap_ptr(body.sub(off))
+    }
+}
+
 /// Allocate an 8-bit `SIMPLE_BASE_STRING` holding one character per octet of
 /// `bytes`, on the GC heap like [`alloc_character_string`]. The image-embedded
 /// file registry stores file contents this way: a base string costs one byte

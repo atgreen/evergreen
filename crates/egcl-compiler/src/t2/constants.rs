@@ -17,7 +17,7 @@ pub enum ConstantDescription {
     Nil,
     True,
     Fixnum(i64),
-    Character(char),
+    Character(u32),
     SingleFloat(f32),
     Symbol {
         index: u32,
@@ -49,7 +49,7 @@ impl ConstantPoolSnapshot {
                 } else if value.is_fixnum() {
                     ConstantDescription::Fixnum(value.as_fixnum())
                 } else if value.is_character() {
-                    ConstantDescription::Character(value.as_char())
+                    ConstantDescription::Character(value.char_code())
                 } else if value.is_single_float() {
                     ConstantDescription::SingleFloat(value.as_single_float())
                 } else if value.is_symbol() {
