@@ -210,6 +210,13 @@ pub(super) unsafe extern "C" fn cold_call(
             return;
         }
     }
+    if unsafe { (*request).reserved == 0 && (*request).symbol <= u64::from(u32::MAX) } {
+        crate::cli::builtin_census::note(
+            unsafe { (*request).symbol } as u32,
+            crate::cli::builtin_census::Route::OrdinaryCold,
+            unsafe { (*request).nargs },
+        );
+    }
     egcl_rt::rooted_ref!(_closure = unsafe { &mut *std::ptr::addr_of_mut!((*request).closure) });
     unsafe {
         root_publication::published(image, || {
@@ -306,6 +313,11 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
             return;
         }
     }
+    crate::cli::builtin_census::note(
+        unsafe { super::super::call_table::cell_symbol(cell) },
+        crate::cli::builtin_census::Route::Ordinary,
+        count,
+    );
     #[cfg(test)]
     if !ordinary_primitives::is_private(unsafe { super::super::call_table::cell_symbol(cell) }) {
         NAMED_ENTRIES.with(|count| count.set(count.get() + 1));

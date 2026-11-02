@@ -629,6 +629,15 @@
 
 ### Performance
 
+- On x86-64 Linux, optimized code answers ATOM, LISTP, SYMBOLP, PLUSP,
+  MINUSP, BIT, SBIT, GET, three-argument LOGAND/LOGIOR/LOGXOR, and TYPEP of a
+  structure type name without the general runtime call: about 11 ns a call
+  instead of 280-300 ns, GET 50 ns instead of 3 us, and a structure TYPEP 130
+  ns instead of 500 ns. Compiling SBCL's `src/compiler/sset` while hosting its
+  cross-compiler takes 7% less time. `EGCL_BUILTIN_CENSUS=<path>` writes a
+  count of the calls that still take the general route, by callee and route
+  ([#975](https://github.com/atgreen/evergreen/pull/975)).
+
 - More functions that create closures now compile instead of running in the
   interpreter: a closure over a MULTIPLE-VALUE-BIND variable, a HANDLER-CASE
   clause variable, or a local function's parameter no longer forces its whole

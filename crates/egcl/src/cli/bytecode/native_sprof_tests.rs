@@ -59,9 +59,9 @@ const LOOP_BODY: &str = "((let ((left 0))
     (if (< left n) (go again)))
   42))";
 const ITERATIONS: i64 = 4096;
-// Three-argument LOGXOR retains a real helper call in T2. Its result is used,
+// Four-argument LOGXOR retains a real helper call in T2. Its result is used,
 // so the fixture cannot drop that publication as dead arithmetic.
-const PUBLICATION_BODY: &str = "((if (= (logxor n n n) n) 42 0))";
+const PUBLICATION_BODY: &str = "((if (= (logxor n n n 0) n) 42 0))";
 
 #[test]
 fn publications_sample_actual_ordinary_and_mapped_native_caller_and_callee() {

@@ -6878,6 +6878,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 .map(|v| v.as_fixnum() as u32)
                 .unwrap_or(1000);
             sprof::start(hz);
+            builtin_census::reset();
             Ok(T)
         }),
 

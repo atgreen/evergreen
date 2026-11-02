@@ -1622,6 +1622,7 @@ pub fn restore_clos_state(data: &[u8], remap: &dyn Fn(u64) -> u64) -> Result<usi
         for class in structs {
             install_struct_info(state, class);
         }
+        mark_structure_names(state);
     });
     install_clos_state_root_scanner();
     // Rewrite every restored instance's wrapper word through the map. An
@@ -2263,6 +2264,7 @@ pub fn set_structure_class(class: EgclVal) {
     let structure_class = with_state_mut(|st| {
         st.structure_classes.insert(class);
         install_struct_info(st, class);
+        mark_structure_names(st);
         st.structure_class
     });
     // A DEFSTRUCT class is an instance of STRUCTURE-CLASS, so CLASS-OF must
@@ -2293,6 +2295,9 @@ pub fn set_find_class(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
         }
 
         st.class_registry.insert(name, class);
+        if st.structure_classes.contains(&class) {
+            mark_structure_name(name);
+        }
         if let Some(key) = key {
             st.class_by_name.insert(key, class);
         }
@@ -2348,6 +2353,9 @@ pub fn bind_class_name(name: EgclVal, class: EgclVal) -> Result<(), EgclError> {
             return Ok(());
         }
         st.class_registry.insert(name, class);
+        if st.structure_classes.contains(&class) {
+            mark_structure_name(name);
+        }
         if let Some(key) = key {
             st.class_by_name.insert(key, class);
         }
@@ -2416,6 +2424,9 @@ fn define_class_with_shared_slots_mode(
             }
 
             st.class_registry.insert(name, class);
+            if st.structure_classes.contains(&class) {
+                mark_structure_name(name);
+            }
             if let Some(key) = key {
                 st.class_by_name.insert(key, class);
             }
@@ -4081,6 +4092,64 @@ pub fn structure_instance_typep(object: EgclVal, name: EgclVal) -> Option<bool> 
             .borrow()
             .get(&actual)
             .map(|cpl| cpl.contains(&expected))
+    })
+}
+
+/// A conservative filter over the symbols that name a structure class: a
+/// name registered for a structure class always has its bit set, and a clear
+/// bit lets [`structure_typep_leaf`] decline with one load. Bits are never
+/// cleared; a stale set bit only costs the full check.
+static STRUCTURE_NAME_FILTER: [AtomicU64; 1024] = [const { AtomicU64::new(0) }; 1024];
+
+fn structure_name_bit(name: EgclVal) -> Option<(usize, u64)> {
+    let index = name.symbol_index()? as usize & 0xFFFF;
+    Some((index >> 6, 1u64 << (index & 63)))
+}
+
+fn mark_structure_name(name: EgclVal) {
+    if let Some((word, bit)) = structure_name_bit(name) {
+        STRUCTURE_NAME_FILTER[word].fetch_or(bit, Ordering::Relaxed);
+    }
+}
+
+/// Mark every name the registry maps to a structure class.
+fn mark_structure_names(st: &ClosState) {
+    for (&name, class) in &st.class_registry {
+        if st.structure_classes.contains(class) {
+            mark_structure_name(name);
+        }
+    }
+}
+
+fn may_name_structure_class(name: EgclVal) -> bool {
+    structure_name_bit(name)
+        .is_some_and(|(word, bit)| STRUCTURE_NAME_FILTER[word].load(Ordering::Relaxed) & bit != 0)
+}
+
+/// [`structure_instance_typep`] extended to objects that can never be
+/// structure instances: a fixnum, character, cons or symbol (NIL included) is
+/// of no structure type, so `(typep object 'NAME)` is false when NAME is
+/// registered under this exact symbol as a structure class. None defers to
+/// the general TYPEP path exactly as `structure_instance_typep` does. Does not
+/// allocate (bliss-gg3i1.7.15.10.2).
+pub fn structure_typep_leaf(object: EgclVal, name: EgclVal) -> Option<bool> {
+    if !name.is_symbol() || name.is_nil() || !may_name_structure_class(name) {
+        return None;
+    }
+    if object.is_heap_object() && !object.is_cons() && !object.is_symbol() {
+        return structure_instance_typep(object, name);
+    }
+    if !(object.is_fixnum()
+        || object.is_character()
+        || object.is_cons()
+        || object.is_symbol()
+        || object.is_nil())
+    {
+        return None;
+    }
+    with_state(|st| {
+        let expected = *st.class_registry.get(&name)?;
+        st.structure_classes.contains(&expected).then_some(false)
     })
 }
 

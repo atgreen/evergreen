@@ -25,6 +25,7 @@ use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 mod bytecode;
 mod structure_subtype;
 use structure_subtype::raw_structure_boolean_subtypep;
+pub mod builtin_census;
 mod class_protocol;
 mod control_payload;
 mod env_counts;
@@ -29675,6 +29676,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-EXT:SPROF-STOP" => {
                 let _ = eval_args(cdr, env)?;
                 sprof::stop();
+                builtin_census::write_window();
                 return Ok(EgclVal::from_fixnum(sprof::sample_count() as i64));
             }
             "EGCL-EXT:SPROF-FOLD" => {
@@ -44607,6 +44609,10 @@ const DIRECT_FAST: &[&str] = &[
     "INTEGER-LENGTH",
     "LOGCOUNT",
     "GETHASH",
+    // GET is a plist scan, but without an entry every compiled call stayed on
+    // the cold path, resolving the callee by name: ~3 us a call
+    // (bliss-gg3i1.7.15.10.2).
+    "GET",
     // The symbol and package functions UIOP's DEFINE-PACKAGE calls per
     // symbol of every package it defines: ~45 of them made up most of a
     // 5-12 s (require :asdf). Leaf -- they signal PACKAGE-ERROR or TYPE-ERROR
