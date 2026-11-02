@@ -196,6 +196,154 @@ pub fn bit_vector_bool_op(op: u8, a: EgclVal, b: EgclVal, dst: EgclVal) -> bool 
     true
 }
 
+/// Read `n` (1..=64) bits starting at bit `pos` of the packed LSB-first bits at
+/// `data`, as the low bits of the result. Touches only the bytes that hold
+/// those bits.
+///
+/// # Safety
+/// `data` must hold at least `(pos + n).div_ceil(8)` bytes.
+unsafe fn load_bits(data: *const u8, pos: usize, n: usize) -> u64 {
+    debug_assert!((1..=64).contains(&n));
+    let first = pos / 8;
+    let shift = pos % 8;
+    let last = (pos + n - 1) / 8;
+    let mut acc: u128 = 0;
+    for (k, byte) in (first..=last).enumerate() {
+        acc |= (unsafe { *data.add(byte) } as u128) << (8 * k);
+    }
+    let bits = (acc >> shift) as u64;
+    if n == 64 {
+        bits
+    } else {
+        bits & ((1u64 << n) - 1)
+    }
+}
+
+/// Store the low `n` (1..=64) bits of `value` at bit `pos` of the packed
+/// LSB-first bits at `data`, leaving every other bit as it was.
+///
+/// # Safety
+/// `data` must hold at least `(pos + n).div_ceil(8)` writable bytes.
+unsafe fn store_bits(data: *mut u8, pos: usize, n: usize, value: u64) {
+    debug_assert!((1..=64).contains(&n));
+    let first = pos / 8;
+    let shift = pos % 8;
+    let last = (pos + n - 1) / 8;
+    let mask: u128 = (if n == 64 {
+        u64::MAX as u128
+    } else {
+        ((1u64 << n) - 1) as u128
+    }) << shift;
+    let bits = ((value as u128) << shift) & mask;
+    for (k, byte) in (first..=last).enumerate() {
+        let m = (mask >> (8 * k)) as u8;
+        let b = (bits >> (8 * k)) as u8;
+        unsafe {
+            let p = data.add(byte);
+            *p = (*p & !m) | b;
+        }
+    }
+}
+
+/// Store `bit` (0 or 1) in bits `start..end` of a simple bit-vector, a whole
+/// byte at a time between the partial edge bytes (FILL). Returns `false`,
+/// touching nothing, if `v` is not a bit-vector or the range is out of bounds.
+/// No allocation — GC-safe anywhere.
+pub fn bit_vector_fill(v: EgclVal, start: usize, end: usize, bit: u8) -> bool {
+    let Some(len) = bit_vector_len(v) else {
+        return false;
+    };
+    if start > end || end > len {
+        return false;
+    }
+    if start == end {
+        return true;
+    }
+    let pattern = if bit != 0 { u64::MAX } else { 0 };
+    unsafe {
+        let data = v.as_ptr().add(24);
+        let mut pos = start;
+        // Leading bits up to a byte boundary.
+        let head = ((8 - pos % 8) % 8).min(end - pos);
+        if head > 0 {
+            store_bits(data, pos, head, pattern);
+            pos += head;
+        }
+        // Whole bytes.
+        let bytes = (end - pos) / 8;
+        if bytes > 0 {
+            std::ptr::write_bytes(data.add(pos / 8), pattern as u8, bytes);
+            pos += bytes * 8;
+        }
+        // Trailing bits.
+        if pos < end {
+            store_bits(data, pos, end - pos, pattern);
+        }
+    }
+    true
+}
+
+/// Copy `count` bits of simple bit-vector `src` from bit `src_start` to `dst`
+/// from bit `dst_start`, 64 bits at a time (REPLACE). `dst` and `src` may be
+/// the same vector with overlapping ranges: the result is as if the source
+/// range were copied first. Returns `false`, touching nothing, if either is not
+/// a bit-vector or a range is out of bounds. No allocation — GC-safe anywhere.
+pub fn bit_vector_copy(
+    dst: EgclVal,
+    dst_start: usize,
+    src: EgclVal,
+    src_start: usize,
+    count: usize,
+) -> bool {
+    let (Some(dst_len), Some(src_len)) = (bit_vector_len(dst), bit_vector_len(src)) else {
+        return false;
+    };
+    let (Some(dst_end), Some(src_end)) =
+        (dst_start.checked_add(count), src_start.checked_add(count))
+    else {
+        return false;
+    };
+    if dst_end > dst_len || src_end > src_len {
+        return false;
+    }
+    if count == 0 {
+        return true;
+    }
+    unsafe {
+        let d = dst.as_ptr().add(24);
+        let s = src.as_ptr().add(24).cast_const();
+        // Copying downward (or between different vectors) front to back reads
+        // each source chunk before any store can reach it; copying upward
+        // within one vector runs back to front for the same reason.
+        if dst == src && src_start < dst_start {
+            let mut remaining = count;
+            while remaining > 0 {
+                let n = remaining.min(64);
+                remaining -= n;
+                let word = load_bits(s, src_start + remaining, n);
+                store_bits(d, dst_start + remaining, n, word);
+            }
+        } else if dst_start % 8 == 0 && src_start % 8 == 0 && dst != src {
+            let bytes = count / 8;
+            std::ptr::copy_nonoverlapping(s.add(src_start / 8), d.add(dst_start / 8), bytes);
+            let done = bytes * 8;
+            if done < count {
+                let word = load_bits(s, src_start + done, count - done);
+                store_bits(d, dst_start + done, count - done, word);
+            }
+        } else {
+            let mut done = 0;
+            while done < count {
+                let n = (count - done).min(64);
+                let word = load_bits(s, src_start + done, n);
+                store_bits(d, dst_start + done, n, word);
+                done += n;
+            }
+        }
+    }
+    true
+}
+
 /// Store bit `i` of a bit-vector in place (bliss-27f5). Returns `false` if
 /// `v` is not a bit-vector or `i` is out of bounds. `bit` is stored as 0 for
 /// zero, 1 otherwise. No allocation — GC-safe anywhere.

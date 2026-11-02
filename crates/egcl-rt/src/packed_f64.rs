@@ -87,3 +87,48 @@ pub fn set(array: EgclVal, index: usize, value: f64) -> bool {
     }
     true
 }
+
+/// Store `value` in elements `start..end` (FILL). Returns `false`, touching
+/// nothing, if `array` is not a packed double-float vector or the range is out
+/// of bounds. No allocation.
+pub fn fill(array: EgclVal, start: usize, end: usize, value: f64) -> bool {
+    let Some(body) = body(array) else {
+        return false;
+    };
+    let length = unsafe { body.add(LENGTH_OFFSET).cast::<u64>().read() } as usize;
+    if start > end || end > length {
+        return false;
+    }
+    let data = unsafe { body.add(DATA_OFFSET).cast::<f64>() };
+    for index in start..end {
+        unsafe { data.add(index).write(value) };
+    }
+    true
+}
+
+/// Copy `count` elements of `src` from `src_start` into `dst` from
+/// `dst_start` (REPLACE), as one memmove, so overlapping ranges of one vector
+/// behave as if the source were copied first. Returns `false`, touching
+/// nothing, if either is not a packed double-float vector or a range is out of
+/// bounds. No allocation.
+pub fn copy(dst: EgclVal, dst_start: usize, src: EgclVal, src_start: usize, count: usize) -> bool {
+    let (Some(d), Some(s)) = (body(dst), body(src)) else {
+        return false;
+    };
+    let (Some(dst_len), Some(src_len)) = (len(dst), len(src)) else {
+        return false;
+    };
+    if dst_start.checked_add(count).is_none_or(|e| e > dst_len)
+        || src_start.checked_add(count).is_none_or(|e| e > src_len)
+    {
+        return false;
+    }
+    unsafe {
+        std::ptr::copy(
+            s.add(DATA_OFFSET).cast::<f64>().add(src_start),
+            d.add(DATA_OFFSET).cast::<f64>().add(dst_start),
+            count,
+        )
+    };
+    true
+}

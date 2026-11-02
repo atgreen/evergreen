@@ -2317,6 +2317,30 @@ pub fn replace_direct(
     start2: usize,
     count: usize,
 ) -> Result<bool, EgclError> {
+    // Two vectors of one raw element type copy as a memmove (or, for bits, 64
+    // at a time); each helper declines anything else.
+    if egcl_rt::types::bit_vector_copy(dst, start1, src, start2, count)
+        || egcl_rt::packed_u8::copy(dst, start1, src, start2, count)
+        || egcl_rt::packed_f64::copy(dst, start1, src, start2, count)
+    {
+        return Ok(true);
+    }
+    if is_vector(dst) && is_vector(src) {
+        let (dst_len, src_len) = (vector_length(dst), vector_length(src));
+        if start1.checked_add(count).is_some_and(|e| e <= dst_len)
+            && start2.checked_add(count).is_some_and(|e| e <= src_len)
+        {
+            let (d, s) = unsafe { (dst.as_ptr(), src.as_ptr()) };
+            unsafe {
+                std::ptr::copy(
+                    s.add(vector_payload_offset(s) + 8 + start2 * 8),
+                    d.add(vector_payload_offset(d) + 8 + start1 * 8),
+                    count * 8,
+                );
+            }
+            return Ok(true);
+        }
+    }
     if !direct_vector(dst) || !direct_vector(src) {
         return Ok(false);
     }
@@ -2334,21 +2358,99 @@ pub fn replace_direct(
 }
 
 /// Boot FILL's native case: store ITEM in `seq[start..end]`, the caller
-/// having checked the bounds. Returns `false` without storing when `seq` is
-/// not a [`direct_vector`]. Nothing here allocates.
+/// having checked the bounds. Covers every vector: simple vectors, simple
+/// strings, bit-vectors and packed octet and double-float vectors are filled
+/// in one pass over their storage (a memset where the element is raw bits),
+/// and a complex vector element by element. ITEM is type-checked once, with
+/// the error `(SETF ELT)` would signal, and only when the range is non-empty.
+/// Returns `false` without storing when `seq` is not a vector. Nothing here
+/// allocates.
 pub fn fill_direct(
     seq: EgclVal,
     item: EgclVal,
     start: usize,
     end: usize,
 ) -> Result<bool, EgclError> {
-    if !direct_vector(seq) {
-        return Ok(false);
+    let out_of_bounds = |len: usize| EgclError::TypeError {
+        datum: seq,
+        expected: format!("index {} in bounds (length {})", end.saturating_sub(1), len),
+    };
+    if is_vector(seq) {
+        let len = vector_length(seq);
+        if end > len {
+            return Err(out_of_bounds(len));
+        }
+        let ptr = unsafe { seq.as_ptr() };
+        let slots = unsafe { ptr.add(vector_payload_offset(ptr) + 8) } as *mut EgclVal;
+        for index in start..end {
+            unsafe { slots.add(index).write(item) };
+        }
+        return Ok(true);
     }
-    for index in start..end {
-        set_elt(seq, index, item)?;
+    if start >= end {
+        return Ok(direct_vector(seq)
+            || egcl_rt::types::bit_vector_p(seq)
+            || egcl_rt::packed_u8::is_vector(seq)
+            || egcl_rt::packed_f64::is_vector(seq)
+            || is_complex_vector(seq));
     }
-    Ok(true)
+    if seq.is_string() {
+        // The first store makes every check (a literal, the item's type, the
+        // index, a code point a base string cannot hold); the rest cannot fail.
+        string_set_char(seq, start, item)?;
+        let ptr = unsafe { seq.as_ptr() };
+        let len = unsafe { egcl_rt::object::simple_string_char_count(ptr) };
+        if end > len {
+            return Err(out_of_bounds(len));
+        }
+        let ch = item.as_char();
+        for index in start + 1..end {
+            unsafe { egcl_rt::object::simple_string_set_char(ptr, index, ch) };
+        }
+        return Ok(true);
+    }
+    if egcl_rt::types::bit_vector_p(seq) {
+        if !item.is_fixnum() || !matches!(item.as_fixnum(), 0 | 1) {
+            return Err(EgclError::TypeError {
+                datum: item,
+                expected: "bit (0 or 1)".to_string(),
+            });
+        }
+        if !egcl_rt::types::bit_vector_fill(seq, start, end, item.as_fixnum() as u8) {
+            return Err(out_of_bounds(
+                egcl_rt::types::bit_vector_len(seq).unwrap_or(0),
+            ));
+        }
+        return Ok(true);
+    }
+    if egcl_rt::packed_u8::is_vector(seq) {
+        let value = u8_value(item)?;
+        if !egcl_rt::packed_u8::fill(seq, start, end, value) {
+            return Err(out_of_bounds(egcl_rt::packed_u8::len(seq).unwrap_or(0)));
+        }
+        return Ok(true);
+    }
+    if egcl_rt::packed_f64::is_vector(seq) {
+        if !item.is_double_float() {
+            return Err(EgclError::TypeError {
+                datum: item,
+                expected: "DOUBLE-FLOAT".into(),
+            });
+        }
+        if !egcl_rt::packed_f64::fill(seq, start, end, item.as_double_float()) {
+            return Err(out_of_bounds(egcl_rt::packed_f64::len(seq).unwrap_or(0)));
+        }
+        return Ok(true);
+    }
+    if is_complex_vector(seq) {
+        // ITEM is the caller's value and nothing below allocates, so it stays
+        // valid across the stores.
+        for index in start..end {
+            set_elt(seq, index, item)?;
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Boot SEARCH's native case: the EQL test and no key, the caller having
