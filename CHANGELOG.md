@@ -26,6 +26,14 @@
 
 ### Fixed
 
+- Read large simple base and character strings correctly from native
+  `CHAR`, `SCHAR`, and `ELT` accessors
+  ([#978](https://github.com/atgreen/evergreen/pull/978)).
+
+- Evaluate numeric `LOOP ... AND ...` initializers before binding the group's
+  variables, and compile independent numeric groups while preserving parallel
+  termination values ([#978](https://github.com/atgreen/evergreen/pull/978)).
+
 - MAPCAN and MAPCON now join their results destructively with NCONC, as the
   standard requires, instead of copying them with APPEND.
   ([#965](https://github.com/atgreen/evergreen/pull/965))
