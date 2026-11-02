@@ -38,7 +38,10 @@
   shared captures, public function names and definition-time macro ordering
   ([#981](https://github.com/atgreen/evergreen/pull/981)).
 
-- Create eligible heap closures through ordinary T1 and T2 entries while
+- Enter warmed named closures through their shared native template entries
+  ([#981](https://github.com/atgreen/evergreen/pull/981)).
+
+- Create eligible control-free heap closures through ordinary T1 and T2 entries while
   preserving captured values and retained definitions
   ([#981](https://github.com/atgreen/evergreen/pull/981)).
 

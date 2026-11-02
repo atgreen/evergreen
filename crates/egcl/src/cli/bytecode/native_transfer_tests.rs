@@ -20,6 +20,7 @@ mod lambda_list_entries;
 mod lazy_publication;
 mod linkage;
 mod live_signaling;
+mod named_closure_entry;
 mod nested;
 mod ordinary_captured_context;
 pub(super) mod ordinary_catch_osr;
