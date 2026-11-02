@@ -11818,6 +11818,13 @@ fn rename_special_parameters(
 /// defaulted bindings; a docstring is dropped. A body that declares anything
 /// SPECIAL is left alone, as for [`optional_entry_prologue`].
 fn key_default_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal, EgclVal)> {
+    // An earlier rename may have declined because a default needs a live
+    // dynamic binding. Moving that default past the remaining special
+    // parameters would hide the reason for declining from the later rewrite.
+    // A called function can read a later special without naming it here.
+    if lambda_list_names_special(params_form) {
+        return None;
+    }
     egcl_rt::rooted!(params = list_to_vec(params_form));
     if !list_tail(params_form).is_nil() {
         return None;
