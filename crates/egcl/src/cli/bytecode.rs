@@ -1649,7 +1649,13 @@ fn bytecode_for_callable(sym: u32, function: EgclVal) -> Option<(u32, Arc<Byteco
     {
         return None;
     }
-    if egcl_rt::symbols::is_uninterned(sym) {
+    // An uninterned public alias can differ from this object's private code
+    // identity too (a compiled creator DEFUN keeps its public name). Only the
+    // actual compilation owner may take the private-registry shortcut.
+    if egcl_rt::symbols::is_uninterned(sym)
+        && (!egcl_rt::function::is_interpreted_function(function)
+            || egcl_rt::function::definition_index(function) == sym)
+    {
         return registry_get(sym).map(|body| (sym, body));
     }
     #[cfg(test)]
@@ -3173,6 +3179,7 @@ pub fn bail_report() -> Vec<(String, u32)> {
 /// operator masquerading as a call.
 #[allow(dead_code)] // retained as documentation of the original slice-1 surface
 const PRIMITIVE_ALLOWLIST: &[&str] = &[
+    "EGCL::%DEFUN-CLOSURE",
     // `lower_progv`'s own expansion: without it a PROGV in opportunistic code
     // (and so every lambda containing one) bailed on its generated call.
     "EGCL::%PROGV",
@@ -21174,7 +21181,13 @@ fn load_bbu_definitions(
                 // and evaluate it with the tree-walker (load-source fallback).
                 let mut form = constants[action.arg0 as usize];
                 egcl_rt::rooted_ref!(_form_root = &mut form);
-                last = eval_form(form, env)?;
+                // A file-compiled `(let (...) (defun ...))` arrives here as
+                // source; compile it whole rather than leave its functions to
+                // a live tree-walker frame (bliss-gg3i1.7.15.7).
+                last = match eval_toplevel_let_defuns(form, env) {
+                    Some(result) => result?,
+                    None => eval_form(form, env)?,
+                };
             }
             11 => {
                 let mut initializer_env = env.null_lexical_child();
@@ -22091,19 +22104,25 @@ pub(super) fn run_compiler_macro_function(
     environment: EgclVal,
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
-    let name = egcl_rt::function::name(function);
-    let entry = registry_get(name.as_symbol_index())
+    egcl_rt::rooted!(function = function);
+    egcl_rt::rooted!(args = args.to_vec());
+    egcl_rt::rooted!(whole = whole);
+    egcl_rt::rooted!(environment = environment);
+    let name = egcl_rt::function::name(*function);
+    let (owner, entry) = name
+        .symbol_index()
+        .and_then(|symbol| bytecode_for_callable(symbol, *function))
         .ok_or_else(|| EgclError::ProgramError("missing compiled compiler macro".into()))?;
     run_with_binding(
         entry,
-        args,
-        function,
-        name.as_symbol_index(),
+        &args,
+        *function,
+        owner,
         env,
         true,
         MacroCallContext {
-            whole: Some(whole),
-            environment: Some(environment),
+            whole: Some(*whole),
+            environment: Some(*environment),
             lexical_environment: None,
         },
     )
@@ -34414,6 +34433,11 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
         return eval_form(form, env);
     }
 
+    // `(let (...) (defun f ...))`: compile the whole form, DEFUNs included.
+    if let Some(result) = eval_toplevel_let_defuns(form, env) {
+        return result;
+    }
+
     // Any other form: compile a thunk, else fall back. On an opportunistic bail
     // (a capturing flet/labels or closure needs the heap-frame machinery) retry
     // in portable mode before tree-walking — same rationale as lazy_compile_defun
@@ -34455,6 +34479,317 @@ pub fn eval_toplevel(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclEr
             eval_form(form, env)
         }
     }
+}
+
+/// Compile and run a top-level `(let|let* (bindings) ... (defun f ...) ...)`
+/// as one thunk (bliss-gg3i1.7.15.7). Each DEFUN in the binding form's body
+/// (directly, or in a PROGN there) whose name is a symbol becomes
+///
+/// ```lisp
+/// (egcl::%defun-closure 'f #'(lambda params decls... (block f . forms)))
+/// ```
+///
+/// so its body is a nested compiled closure over the LET's variables, resolved
+/// when the form is compiled. The tree-walker instead evaluated the form,
+/// recorded its live frame for F, and lazily compiled F against that frame;
+/// making its initial calls tree-walked and retaining name-based host frames.
+/// The compiled creator instead creates the closure in its own heap environment.
+///
+/// Returns `None`, leaving the caller's path, when the form has no such DEFUN,
+/// is in the scope of a lexical INLINE/NOTINLINE declaration or a TriView
+/// recording (both of which DEFUN snapshots into the definition), or does not
+/// compile.
+pub(super) fn eval_toplevel_let_defuns(
+    form: EgclVal,
+    env: &mut Env,
+) -> Option<Result<EgclVal, EgclError>> {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !backend_is_bytecode()
+        || !env.active_declarations.is_empty()
+        || egcl_rt::events::enabled()
+        || *DISABLED
+            .get_or_init(|| std::env::var_os("EGCL_DISABLE_LET_DEFUN_COMPILATION").is_some())
+    {
+        return None;
+    }
+    egcl_rt::rooted!(rewritten = rewrite_let_defuns(form, env)?);
+    reset_last_bail_reason();
+    let compiled = match compile_thunk(*rewritten, env, false) {
+        Some(fast) if contains_host_eval(&fast) => {
+            // A DEFUN body left to the host evaluator would be a tree-walker
+            // closure; prefer the complete lowering when it exists.
+            let fast = Arc::new(fast);
+            egcl_rt::rooted!(_fast_root = ActiveBytecodeRoot::new(&fast));
+            reset_last_bail_reason();
+            compile_thunk(*rewritten, env, true)
+                .map(Arc::new)
+                .unwrap_or(fast)
+        }
+        Some(fast) => Arc::new(fast),
+        None => compile_thunk(*rewritten, env, true).map(Arc::new)?,
+    };
+    // This path exists to compile the complete creator. A nested fallback
+    // must keep the original DEFUN path, rather than publish a host closure.
+    if contains_load_time_values(&compiled) || contains_host_eval(&compiled) {
+        return None;
+    }
+    trace("compiled let-defuns");
+    Some(run(compiled, &[], NIL, env))
+}
+
+/// `form` with each DEFUN of a symbol in its LET/LET* body rewritten as
+/// [`eval_toplevel_let_defuns`] describes, or `None` if there is none.
+fn rewrite_let_defuns(form: EgclVal, env: &Env) -> Option<EgclVal> {
+    if !form.is_cons() {
+        return None;
+    }
+    let (op, tail) = cp(form);
+    let package = egcl_stdlib::find_package("COMMON-LISP")?;
+    let core = |name| egcl_stdlib::find_present_symbol(package, name) == Some(op);
+    if !(core("LET") || core("LET*")) || !tail.is_cons() || !list_tail(form).is_nil() {
+        return None;
+    }
+    egcl_rt::rooted!(form = form);
+    // Do not expand a DEFUN before an initializer or earlier body form that
+    // may change its macro environment. The old path defines it only after
+    // those effects have run. This read-only check precedes every rewrite or
+    // speculative macro expansion.
+    if !let_creator_definition_order_safe(*form, env, package) {
+        return None;
+    }
+    egcl_rt::rooted!(body = list_to_vec(cp(tail).1));
+    // Lexical declaration policy around a DEFUN is retained in its source by
+    // eval_defun. Leave that path until the installer shares that machinery.
+    if body.iter().any(|form| {
+        form.is_cons()
+            && cp(*form).0.is_symbol()
+            && super::sym_bare_name_rc(cp(*form).0).as_ref() == "DECLARE"
+    }) {
+        return None;
+    }
+    let mut rewrote = false;
+    for index in 0..body.len() {
+        if let Some(replacement) = rewrite_body_defun(body[index], env, &mut rewrote) {
+            body[index] = replacement;
+        }
+    }
+    if !rewrote {
+        return None;
+    }
+    egcl_rt::rooted!(rebuilt = form_list(&body));
+    // Re-read the original tail after allocation: its conses can move.
+    let (op, tail) = cp(*form);
+    egcl_rt::rooted!(rebuilt = arena_cons(cp(tail).0, *rebuilt));
+    Some(arena_cons(op, *rebuilt))
+}
+
+/// A small effect-free initializer cohort. Exact CL constructors are safe only
+/// without a local function/macro binding; symbol macros can hide opaque calls.
+/// This analysis never macroexpands or allocates on the Lisp heap.
+fn let_creator_pure_expression(
+    form: EgclVal,
+    env: &Env,
+    package: EgclVal,
+    budget: &mut usize,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    if !form.is_cons() {
+        return !form
+            .symbol_index()
+            .is_some_and(|symbol| env.has_symbol_macro(symbol));
+    }
+    let (op, mut arguments) = cp(form);
+    if egcl_stdlib::find_present_symbol(package, "QUOTE") == Some(op) {
+        return arguments.is_cons() && cp(arguments).1.is_nil();
+    }
+    let list = egcl_stdlib::find_present_symbol(package, "LIST") == Some(op);
+    let cons = egcl_stdlib::find_present_symbol(package, "CONS") == Some(op);
+    if (!list && !cons)
+        || env
+            .funs
+            .borrow()
+            .contains_key(&super::lexical_function_name_key(op))
+        || super::macro_defined(env, &sym_name(op))
+    {
+        return false;
+    }
+    let mut count = 0;
+    while arguments.is_cons() {
+        let (argument, rest) = cp(arguments);
+        if !let_creator_pure_expression(argument, env, package, budget) {
+            return false;
+        }
+        count += 1;
+        arguments = rest;
+    }
+    arguments.is_nil() && (!cons || count == 2)
+}
+
+fn let_creator_definition_order_safe(form: EgclVal, env: &Env, package: EgclVal) -> bool {
+    fn body_form(
+        form: EgclVal,
+        env: &Env,
+        package: EgclVal,
+        opaque_seen: &mut bool,
+        budget: &mut usize,
+    ) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if form.is_cons() {
+            let (op, mut rest) = cp(form);
+            if egcl_stdlib::find_present_symbol(package, "DEFUN") == Some(op) {
+                return !*opaque_seen;
+            }
+            if egcl_stdlib::find_present_symbol(package, "PROGN") == Some(op) {
+                while rest.is_cons() {
+                    let (child, tail) = cp(rest);
+                    if !body_form(child, env, package, opaque_seen, budget) {
+                        return false;
+                    }
+                    rest = tail;
+                }
+                return rest.is_nil();
+            }
+        }
+        *opaque_seen |= !let_creator_pure_expression(form, env, package, budget);
+        true
+    }
+    let (_, tail) = cp(form);
+    let (mut bindings, mut body) = cp(tail);
+    let mut budget = 512;
+    while bindings.is_cons() {
+        let (binding, rest) = cp(bindings);
+        if binding.is_cons() {
+            let (_, initializer) = cp(binding);
+            if !initializer.is_nil()
+                && (!initializer.is_cons()
+                    || !cp(initializer).1.is_nil()
+                    || !let_creator_pure_expression(cp(initializer).0, env, package, &mut budget))
+            {
+                return false;
+            }
+        } else if !binding.is_symbol() {
+            return false;
+        }
+        bindings = rest;
+    }
+    if !bindings.is_nil() {
+        return false;
+    }
+    let mut opaque_seen = false;
+    while body.is_cons() {
+        let (form, rest) = cp(body);
+        if !body_form(form, env, package, &mut opaque_seen, &mut budget) {
+            return false;
+        }
+        body = rest;
+    }
+    body.is_nil()
+}
+
+/// The replacement for one body form of a top-level binding form: a DEFUN of a
+/// symbol, or a PROGN containing some. `None` keeps the form.
+fn rewrite_body_defun(form: EgclVal, env: &Env, rewrote: &mut bool) -> Option<EgclVal> {
+    if !form.is_cons() {
+        return None;
+    }
+    let (op, tail) = cp(form);
+    if !op.is_symbol() {
+        return None;
+    }
+    let package = egcl_stdlib::find_package("COMMON-LISP")?;
+    if egcl_stdlib::find_present_symbol(package, "PROGN") == Some(op) {
+        egcl_rt::rooted!(form = form);
+        egcl_rt::rooted!(forms = list_to_vec(tail));
+        let mut changed = false;
+        for index in 0..forms.len() {
+            if let Some(replacement) = rewrite_body_defun(forms[index], env, &mut changed) {
+                forms[index] = replacement;
+            }
+        }
+        if !changed {
+            return None;
+        }
+        *rewrote = true;
+        let op = cp(*form).0;
+        egcl_rt::rooted!(rest = form_list(&forms));
+        return Some(arena_cons(op, *rest));
+    }
+    if egcl_stdlib::find_present_symbol(package, "DEFUN") != Some(op)
+        || !tail.is_cons()
+        || !list_tail(form).is_nil()
+    {
+        return None;
+    }
+    let (name, rest) = cp(tail);
+    egcl_rt::rooted!(name = name);
+    egcl_rt::rooted!(rest = rest);
+    if !name.is_symbol() || name.is_nil() || *name == T || !rest.is_cons() {
+        return None;
+    }
+    let (params, body) = cp(*rest);
+    // A declared FTYPE result is a contract DEFUN snapshots into the named
+    // definition's retained source; a closure has none, so keep DEFUN.
+    if declared_primary_result(name.as_symbol_index()).is_some() {
+        return None;
+    }
+    egcl_rt::rooted!(params = params);
+    egcl_rt::rooted!(forms = list_to_vec(body));
+    // Docstring (only when more forms follow) and leading declarations.
+    let mut start = 0;
+    let mut doc = None;
+    while start < forms.len() {
+        let item = forms[start];
+        if item.is_string() && doc.is_none() && start + 1 < forms.len() {
+            doc = Some(start);
+        } else if !(item.is_cons()
+            && cp(item).0.is_symbol()
+            && sym_bare_name_rc(cp(item).0).as_ref() == "DECLARE")
+        {
+            break;
+        }
+        start += 1;
+    }
+    let block_op = resolve_sym("BLOCK")?;
+    egcl_rt::rooted!(block_forms = vec![block_op, *name]);
+    block_forms.extend(forms[start..].iter().copied());
+    egcl_rt::rooted!(block = form_list(&block_forms));
+    let lambda_op = resolve_sym("LAMBDA")?;
+    egcl_rt::rooted!(lambda = vec![lambda_op, *params]);
+    lambda.extend(
+        forms[..start]
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != doc)
+            .map(|(_, item)| *item),
+    );
+    lambda.push(*block);
+    egcl_rt::rooted!(lambda = form_list(&lambda));
+    let function_op = resolve_sym("FUNCTION")?;
+    let quote = resolve_sym("QUOTE")?;
+    egcl_rt::rooted!(function = form_list(&[function_op, *lambda]));
+    egcl_rt::rooted!(quoted = form_list(&[quote, *name]));
+    let install = resolve_sym("EGCL::%DEFUN-CLOSURE")?;
+    egcl_rt::rooted!(install = form_list(&[install, *quoted, *function]));
+    // DEFUN records a docstring when the documentation table exists.
+    if let Some(doc) = doc {
+        let setter = resolve_sym("EGCL-INTERNAL::%SET-DOCUMENTATION")?;
+        if !super::fn_bound(env, &sym_name(setter)) {
+            return None;
+        }
+        let kind = resolve_sym("FUNCTION")?;
+        egcl_rt::rooted!(quoted_kind = form_list(&[quote, kind]));
+        egcl_rt::rooted!(set_doc = form_list(&[setter, *quoted, *quoted_kind, forms[doc]]));
+        let progn = resolve_sym("PROGN")?;
+        *install = form_list(&[progn, *set_doc, *install]);
+    }
+    *rewrote = true;
+    Some(*install)
 }
 
 /// A private callable identity for a compiled top-level form that contains a
@@ -38053,3 +38388,68 @@ mod raw_slot_reader_tests;
 
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 mod method_helper_elision_tests;
+
+#[cfg(test)]
+mod renamed_uninterned_callable_tests {
+    use super::*;
+
+    fn private_function(value: i64, env: &Env) -> EgclVal {
+        egcl_rt::rooted!(body = form_list(&[EgclVal::from_fixnum(value)]));
+        compile_and_reify_lambda_inner("RETAINED-UNINTERNED-ALIAS", NIL, *body, env)
+            .expect("compile private constant function")
+    }
+
+    #[test]
+    fn renamed_uninterned_callables_keep_exact_private_bodies_after_rebinding() {
+        let _lock = super::super::heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env_root = &mut env);
+        egcl_rt::rooted!(old = private_function(41, &env));
+        egcl_rt::rooted!(replacement = private_function(99, &env));
+        egcl_rt::rooted!(public = egcl_rt::symbols::make_uninterned("PUBLIC-DEFUN-NAME"));
+        let symbol = public.as_symbol_index();
+        let old_owner = egcl_rt::function::definition_index(*old);
+        let new_owner = egcl_rt::function::definition_index(*replacement);
+        assert_ne!(symbol, old_owner);
+        assert_ne!(old_owner, new_owner);
+        // Both private callables are new and exclusively owned by this test;
+        // only their public introspection name changes, never their code key.
+        unsafe {
+            egcl_rt::function::set_name(*old, *public);
+            egcl_rt::function::set_name(*replacement, *public);
+        }
+        egcl_rt::symbols::set_symbol_function(symbol, *old);
+        let (owner, body) = bytecode_for_callable(symbol, *old).expect("old private body");
+        assert_eq!(owner, old_owner);
+        egcl_rt::rooted!(_old_body_root = ActiveBytecodeRoot::new(&body));
+        egcl_rt::symbols::set_symbol_function(symbol, *replacement);
+        // The public name owns no registry body: resolving either definition
+        // must use its exact callable, not the newly selected symbol cell.
+        assert!(registry_get(symbol).is_none());
+        let (retained_owner, retained) = bytecode_for_callable(symbol, *old).unwrap();
+        let (selected_owner, selected) = bytecode_for_callable(symbol, *replacement).unwrap();
+        assert_eq!(retained_owner, old_owner);
+        assert_eq!(selected_owner, new_owner);
+        assert!(Arc::ptr_eq(&body, &retained));
+        assert!(!Arc::ptr_eq(&retained, &selected));
+        egcl_rt::rooted!(_new_body_root = ActiveBytecodeRoot::new(&selected));
+        assert_eq!(
+            run_with_sym(retained, &[], *old, retained_owner, &mut env).unwrap(),
+            EgclVal::from_fixnum(41)
+        );
+        assert_eq!(
+            run_with_sym(selected, &[], *replacement, selected_owner, &mut env).unwrap(),
+            EgclVal::from_fixnum(99)
+        );
+        assert_eq!(
+            run_compiler_macro_function(*old, &[], NIL, NIL, &mut env).unwrap(),
+            EgclVal::from_fixnum(41)
+        );
+        assert_eq!(
+            run_compiler_macro_function(*replacement, &[], NIL, NIL, &mut env).unwrap(),
+            EgclVal::from_fixnum(99)
+        );
+    }
+}

@@ -492,6 +492,16 @@ pub fn name(f: EgclVal) -> EgclVal {
     unsafe { (*data(f)).name }
 }
 
+/// Set the display/introspection name of this exact callable, without changing
+/// its prototype, definition identity, counters or native entry.
+///
+/// # Safety
+/// `f` must be an interpreted function exclusively owned by the caller before
+/// publication. Never rename a shared closure-template prototype this way.
+pub unsafe fn set_name(f: EgclVal, name: EgclVal) {
+    unsafe { crate::gc::store_ref(core::ptr::addr_of_mut!((*data(f)).name), name) };
+}
+
 /// Immutable identity of the semantic definition, independent of its binding.
 pub fn definition_index(f: EgclVal) -> u32 {
     unsafe { (*data(f)).definition_index }
@@ -806,5 +816,31 @@ mod tests {
         assert!(!f.is_fixnum());
         assert!(!f.is_symbol());
         assert!(f.is_heap_object());
+    }
+
+    #[test]
+    fn naming_fresh_instances_keeps_the_prototype_and_saved_names() {
+        use crate::Collector;
+        let _g = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        crate::rooted!(prototype = alloc_interpreted(NIL, NIL, NIL, NIL));
+        unsafe { mark_closure_template(*prototype) };
+        crate::rooted!(first = alloc_closure_instance(*prototype, 0));
+        crate::rooted!(second = alloc_closure_instance(*prototype, 0));
+        crate::rooted!(first_name = crate::symbols::make_uninterned("FIRST-NAME"));
+        crate::rooted!(second_name = crate::symbols::make_uninterned("SECOND-NAME"));
+        unsafe {
+            set_name(*first, *first_name);
+            set_name(*second, *second_name);
+        }
+        assert_eq!(name(*prototype), NIL);
+        assert_eq!(name(*first), *first_name);
+        assert_eq!(name(*second), *second_name);
+        assert_eq!(closure_prototype(*first), Some(*prototype));
+        assert_eq!(definition_index(*first), definition_index(*prototype));
+        assert_eq!(definition_index(*second), definition_index(*prototype));
+        crate::HeapCollector::new().minor_gc().unwrap();
+        assert_eq!(name(*first), *first_name);
+        assert_eq!(name(*second), *second_name);
+        assert_eq!(name(*prototype), NIL);
     }
 }

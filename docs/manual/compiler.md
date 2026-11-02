@@ -286,6 +286,7 @@ not a portable Common Lisp interface, and many are read once.
 | `EGCL_BACKEND=tree-walker` | Compare against the tree-walking execution path |
 | `EGCL_LAZY_COMPILE=0` | Request eager bytecode compilation rather than lazy compilation |
 | `EGCL_FASL_EAGER_T1=1` | Compile named FASL-loaded functions and their nested closure templates to T1 before continuing the load; off by default |
+| `EGCL_DISABLE_LET_DEFUN_COMPILATION=1` | Compare top-level lexical `DEFUN` creators against their original execution path |
 | `EGCL_T1_THRESHOLD` | Override the T1 invocation threshold |
 | `EGCL_T2_THRESHOLD` | Compatibility override for the T2 invocation threshold |
 | `EGCL_OSR_THRESHOLD` | Override named-loop OSR threshold; default 100,000 back edges |
@@ -302,6 +303,17 @@ invocation heat or request T2 compilation. Forced `interp`/`t0` tiers, disabled
 profiling, and builds without T1 take precedence. Core-image restoration keeps
 its existing policy. Compare load time and steady execution separately before
 enabling this experimental control for a workload.
+
+Eligible top-level `LET` and `LET*` forms that define functions compile as one
+creator, sharing captured locations between their functions. Forms requiring
+definition-time declaration policies, event recording, unsupported closure
+operations, or declared result contracts retain their existing path. The creator
+also retains that path when an initializer or a body form preceding a definition
+can perform opaque effects, so runtime macro changes precede definition-time
+expansion. The compiled cohort accepts literals, ordinary variable references,
+quoted data, and exact unshadowed CL `LIST`/`CONS` constructors as initializers.
+Installed definitions keep their public function names without renaming shared
+closure prototypes or changing their private code identities.
 
 A threshold does not expand the target backend's supported instruction set.
 See [Platform support](user/reference/platforms.md) and
