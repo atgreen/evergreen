@@ -509,16 +509,12 @@ fn alu_rr(a: &mut Asm, opcode: u8, dst: u8, src: u8) {
 const KEYWORD_BIND_STACK: usize = 4096;
 
 /// Whether an ordinary entry binds its arguments after building its frame
-/// (bliss-gg3i1.7.15.10.4): a helper-bound `&key`/`&rest` entry, or an
-/// `&optional` entry with stack-passed parameters. The register-only
-/// `&optional` entry pads its registers before the frame instead.
+/// (bliss-gg3i1.7.15.10.4): a helper-bound `&key`/`&rest` entry or an
+/// `&optional` entry with more than three parameters. One with at most
+/// three binds them in registers before the frame, which is cheaper.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn framed_binding(options: &OrdinaryLispEntryOptions) -> bool {
-    match options.binding {
-        Some(OrdinaryArgumentBinding::Keywords(_)) => true,
-        Some(OrdinaryArgumentBinding::Optional(_)) => options.arity > 3,
-        None => false,
-    }
+    options.binding.is_some() && options.arity > 3
 }
 
 fn mov_rr(a: &mut Asm, dst: u8, src: u8) {
@@ -8294,10 +8290,49 @@ fn emit_framed_inner(
             }
             a.jmp(binding_entry);
         }
-        if framed_binding_entry.is_none()
-            && matches!(options.binding, Some(OrdinaryArgumentBinding::Keywords(_)))
+        if let Some(OrdinaryArgumentBinding::Keywords(keywords)) =
+            options.binding.filter(|_| framed_binding_entry.is_none())
         {
-            return Err(EmitError::UnsupportedOp(0xFA));
+            // At most three bound values: bind before the frame, in registers.
+            // Every count needs binding, even one equal to `arity`. The bind
+            // helper is a noncollecting, nonsignalling C leaf: nothing here
+            // is a safepoint, and callee-saved registers (R13 included) keep
+            // the caller's values across it. 56 bytes keep the call aligned:
+            // [0,24) actual register arguments, [24,48) bound values, [48]
+            // the count. Overflow arguments stay above the return address.
+            if options.arity > 3 {
+                return Err(EmitError::UnsupportedOp(0xFA));
+            }
+            let declined = a.label();
+            alu_r_imm(&mut a, 5, 4, 56); // sub rsp,56
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate() {
+                store_to_rsp(&mut a, reg, index as i32 * 8);
+            }
+            store_to_rsp(&mut a, 1, 48);
+            mov_imm64(&mut a, 7, keywords.plan as i64);
+            mov_rr(&mut a, 6, 4); // rsi = actual register arguments
+            a.extend_from_slice(&[0x48, 0x8d, 0x54, 0x24, 64]); // lea rdx,[rsp+64]: overflow
+            a.extend_from_slice(&[0x4c, 0x8d, 0x44, 0x24, 24]); // lea r8,[rsp+24]: bound values
+            mov_imm64(&mut a, RAX, keywords.bind as i64);
+            a.extend_from_slice(&[0xff, 0xd0]); // call rax
+            a.extend_from_slice(&[0x48, 0x85, 0xc0]); // test rax,rax
+            a.jcc(Cc::E, declined);
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate() {
+                load_from_rsp(&mut a, reg, 24 + index as i32 * 8);
+            }
+            alu_r_imm(&mut a, 0, 4, 56); // add rsp,56
+            mov_imm64(&mut a, 1, options.arity as i64);
+            mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+            a.jmp(accepted);
+            a.bind(declined);
+            for (index, reg) in [7u8, 6, 2].into_iter().enumerate() {
+                load_from_rsp(&mut a, reg, index as i32 * 8);
+            }
+            load_from_rsp(&mut a, 1, 48);
+            alu_r_imm(&mut a, 0, 4, 56); // add rsp,56
+            mov_imm64(&mut a, RAX, egcl_rt::value::NIL.0 as i64);
+            mov_imm64(&mut a, 11, keywords.decline as i64);
+            a.extend_from_slice(&[0x41, 0xFF, 0xE3]); // jmp r11, all incoming values intact
         } else if framed_binding_entry.is_none() {
             // Declared parameter types are checked here for every caller except
             // proven self calls, which check at their call site and enter at
