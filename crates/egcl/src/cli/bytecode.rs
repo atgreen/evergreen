@@ -18332,7 +18332,9 @@ fn make_heap_closure_instance(nested: &Arc<BytecodeFunction>, env: &Env) -> Opti
     let scope_empty = env.block_stack.is_empty() && env.tag_stack.is_empty();
     let control =
         (!control_free && !scope_empty).then(|| (env.block_stack.clone(), env.tag_stack.clone()));
-    Some(closure_templates::make_instance(nested, None, control, false))
+    Some(closure_templates::make_instance(
+        nested, None, control, false,
+    ))
 }
 
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly

@@ -1580,13 +1580,13 @@ impl TransferCode {
         drop(old);
         // Recorded with the root, never separately: the bits name the object
         // only while this root keeps it alive.
-        self.callable_cache.last_callable_pinned.set(
-            if egcl_rt::function::is_pinned(*function) {
+        self.callable_cache
+            .last_callable_pinned
+            .set(if egcl_rt::function::is_pinned(*function) {
                 function.0
             } else {
                 0
-            },
-        );
+            });
         root
     }
 
