@@ -43,6 +43,8 @@ fn ordinary_function_designators_preserve_lookup_redefinition_errors_and_values(
     let mut reference = None;
     for (tier, disabled, stress) in [
         ("interp", false, false),
+        ("t1", false, false),
+        ("t1", false, true),
         ("t2", false, false),
         ("t2", true, false),
         ("t2", false, true),

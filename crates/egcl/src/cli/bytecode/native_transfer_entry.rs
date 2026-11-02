@@ -1361,7 +1361,9 @@ impl TransferCode {
         // its local tag records from the exact scope map (bliss-tudsy). The
         // non-speculating retry keeps the generic native-cleanups build.
         let local_tags = optimize && t1_ordinary_tagbody_body(&body);
-        let optimize = optimize && (scope_free_native_body(&body, false) || local_tags);
+        let function_lookup = t1_ordinary_function_lookup_body(&body);
+        let optimize =
+            optimize && (scope_free_native_body(&body, false) || local_tags || function_lookup);
         // Mandatory result guards also need exact recovery metadata in the
         // baseline tier, including when VALUES produced the checked primary.
         // This does not enable speculation for multiple-value bodies.
@@ -1373,6 +1375,7 @@ impl TransferCode {
         let (ir, ordinary_ir, deopt_metadata) = if scope_free_native_body(&body, false)
             || result_recovery
             || t1_ordinary_tagbody_body(&body)
+            || function_lookup
         {
             // A method's callable lives in an uninterned symbol whose name,
             // "(METHOD ...)", does not read back; the installed symbol is its
@@ -2540,6 +2543,23 @@ pub(super) fn t1_ordinary_tagbody_body(body: &BytecodeFunction) -> bool {
         && body.code.iter().all(|op| {
             local_control_op(op, false, false, true)
                 || matches!(op, Instr::PushTag { .. } | Instr::Go { .. })
+        })
+}
+
+/// A scope-free T1 body that reads a global function cell. The transfer builder
+/// preserves the lookup as SymbolFunction, which ordinary primitive lowering
+/// routes through the same private helper T2 uses. Captured environments and
+/// local TAGBODYs retain their separate admission and OSR rules.
+fn t1_ordinary_function_lookup_body(body: &BytecodeFunction) -> bool {
+    ordinary_function_designators_enabled()
+        && !body.has_env
+        && slot_parameters(body, false)
+        && body
+            .code
+            .iter()
+            .any(|op| matches!(op, Instr::LoadFunction(_)))
+        && body.code.iter().all(|op| {
+            local_control_op(op, false, false, true) || matches!(op, Instr::LoadFunction(_))
         })
 }
 

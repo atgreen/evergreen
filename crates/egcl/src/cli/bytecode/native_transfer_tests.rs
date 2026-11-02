@@ -37,6 +37,7 @@ mod ordinary_self_calls;
 mod ordinary_self_guardless;
 pub(super) mod ordinary_special_osr;
 mod ordinary_t1;
+mod ordinary_t1_function_lookup;
 pub(super) mod ordinary_t2;
 mod ordinary_tail;
 mod ordinary_two_calls;
