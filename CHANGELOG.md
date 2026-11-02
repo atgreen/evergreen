@@ -632,7 +632,7 @@
   4.5 ns instead of 18. `EGCL_HEAP_ENV_LABELS=0` keeps recursive LABELS
   functions on the previous representation. The image format is now version
   20; images saved by earlier versions must be saved again.
-  ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
+  ([#973](https://github.com/atgreen/evergreen/pull/973))
 - On x86-64 Linux, a compiled call from one optimized function to another
   named, fixed-arity, optimized function is cheaper. The function object now
   carries its own native entry, so the caller loads the name's current
