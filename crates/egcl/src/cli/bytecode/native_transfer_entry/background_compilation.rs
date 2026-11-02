@@ -116,13 +116,16 @@ impl EmittedTransfer {
         roots: Arc<ActiveBytecodeRoot>,
         metadata: Option<Arc<T2InstalledMetadata>>,
     ) -> Result<TransferCode, EmitDecline> {
-        if let Some((id, batch)) = self.execution_heat {
+        let execution_heat_binding = if let Some((id, batch)) = self.execution_heat {
             // Owner-side publication, before exposing an executable entry.
             // Rust allocation here cannot collect Lisp objects or park.
             let context = egcl_rt::thread::current_execution_context_for_native()
                 .ok_or(EmitDecline::ExecutingIdentity)?;
             unsafe { &*context }.heat().install(id, batch);
-        }
+            Some(native_poll::installed_heat(unsafe { &*context }, id))
+        } else {
+            None
+        };
         let debug_info = self
             .code
             .install_debug_info_with_arguments(&body.name, self.arguments.as_ref())
@@ -180,6 +183,7 @@ impl EmittedTransfer {
             _capture: self._capture,
             _poll: self._poll,
             _heat_counter: self._heat_counter,
+            execution_heat_binding,
             _completion: self._completion,
             _recursive_prepare: self._recursive_prepare,
             _deopt_capture: self._deopt_capture,
@@ -367,13 +371,17 @@ impl EmittedTransfer {
                         batch: native_poll::heat_batch(),
                     })
             });
-        let poll_fast_path =
-            context
-                .poll_fast_path
-                .map(|fast| egcl_compiler::t2::emit::NativePollFastPath {
-                    baseline_heat,
-                    ..fast
-                });
+        let poll_fast_path = context.poll_fast_path.map(|fast| {
+            let fast = if execution_heat.is_some() {
+                native_poll::with_execution_heat(fast)
+            } else {
+                fast
+            };
+            egcl_compiler::t2::emit::NativePollFastPath {
+                baseline_heat,
+                ..fast
+            }
+        });
         let poll_helper = match tier {
             CompilationTier::T1 => poll_t1_or_transfer,
             CompilationTier::T2 => poll_t2_or_transfer,

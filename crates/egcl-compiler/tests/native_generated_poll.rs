@@ -67,6 +67,7 @@ fn generated_loop_poll_checks_each_pending_source_and_reloads_moved_roots() {
     let epoch = AtomicU64::new(0);
     let fast = NativePollFastPath {
         initialize: initialize as *const () as u64,
+        initialize_with_execution_heat: false,
         gc_requested: &gc as *const _ as u64,
         sigusr1_pending: &sigusr1 as *const _ as u64,
         posted_signal: &posted as *const _ as u64,

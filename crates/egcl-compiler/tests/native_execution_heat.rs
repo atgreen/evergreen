@@ -1,10 +1,12 @@
+// SPDX-FileCopyrightText: Copyright (C) 2026 Anthony Green <green@moxielogic.com>
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 //! Exercise full mapped entry initialization and GC maps, using one emitted
 //! artifact with synthetic execution contexts, not shared TransferCode caches.
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use egcl_compiler::t2::emit::{
     BaselineHeat, BaselineHeatCounter, NativePollControl, NativePollFastPath,
-    NativeRootPublication, emit_framed_native_handlers_with_entries_and_poll_fast_path,
+    NativePollInitialization, NativeRootPublication,
+    emit_framed_native_handlers_with_entries_and_poll_fast_path,
 };
 use egcl_rt::bytecode::{BytecodeFunction, Instr};
 use egcl_rt::exec_context::{ExecutionKind, LispExecutionContext};
@@ -16,9 +18,26 @@ thread_local! {
     static CONTROL: Cell<*mut NativePollControl> = const { Cell::new(std::ptr::null_mut()) };
     static CREDITS: Cell<usize> = const { Cell::new(0) };
     static COLLECT: Cell<bool> = const { Cell::new(false) };
+    static HEAT_ID: Cell<Option<HeatId>> = const { Cell::new(None) };
 }
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 extern "C" fn initialize() -> *mut NativePollControl {
     CONTROL.with(Cell::get)
+}
+extern "C" fn initialize_with_heat(ordinal: usize) -> NativePollInitialization {
+    let control = initialize();
+    let heat = HEAT_ID
+        .with(Cell::get)
+        .and_then(|id| {
+            if id.ordinal() != ordinal {
+                return None;
+            }
+            let control = unsafe { control.as_ref() }?;
+            let execution = unsafe { control.execution.as_ref() }?;
+            execution.heat().counter(id).map(std::ptr::from_ref)
+        })
+        .unwrap_or(std::ptr::null());
+    NativePollInitialization { control, heat }
 }
 extern "C" fn unrelated_helper(_: *mut u64) -> u64 {
     NIL.0
@@ -36,6 +55,15 @@ extern "C" fn poll(request: *mut u64) -> u64 {
 }
 #[test]
 fn mapped_execution_heat_accumulates_across_activations_and_preserves_moving_roots() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    run_case(false);
+}
+#[test]
+fn initialized_execution_heat_preserves_exact_bindings_fallback_and_moving_roots() {
+    let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    run_case(true);
+}
+fn run_case(initialized: bool) {
     let a = LispExecutionContext::new(ExecutionKind::Fiber, 1, 1);
     let b = LispExecutionContext::new(ExecutionKind::Fiber, 2, 1);
     let missing = LispExecutionContext::new(ExecutionKind::Fiber, 3, 1);
@@ -43,6 +71,7 @@ fn mapped_execution_heat_accumulates_across_activations_and_preserves_moving_roo
         assert!(execution.begin_poll());
     }
     let id = HeatId::new().unwrap();
+    HEAT_ID.with(|slot| slot.set(Some(id)));
     a.heat().install(id, 4);
     b.heat().install(id, 4);
     let mut control = NativePollControl {
@@ -60,6 +89,7 @@ fn mapped_execution_heat_accumulates_across_activations_and_preserves_moving_roo
         fn drop(&mut self) {
             CONTROL.with(|slot| slot.set(std::ptr::null_mut()));
             COLLECT.with(|slot| slot.set(false));
+            HEAT_ID.with(|slot| slot.set(None));
         }
     }
     let _reset = Reset;
@@ -69,7 +99,12 @@ fn mapped_execution_heat_accumulates_across_activations_and_preserves_moving_roo
     let errors = AtomicUsize::new(0);
     let epoch = AtomicU64::new(0);
     let fast = NativePollFastPath {
-        initialize: initialize as *const () as u64,
+        initialize: if initialized {
+            initialize_with_heat as *const () as u64
+        } else {
+            initialize as *const () as u64
+        },
+        initialize_with_execution_heat: initialized,
         gc_requested: &gc as *const _ as u64,
         sigusr1_pending: &sigusr1 as *const _ as u64,
         posted_signal: &posted as *const _ as u64,

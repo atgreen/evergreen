@@ -1539,6 +1539,16 @@ pub struct NativePollControl {
     pub test_skips: *mut usize,
 }
 
+/// Optional initializer ABI: SysV returns these two words in RAX and RDX.
+/// The second word is a binding for the requested physical heat identity,
+/// validated by the managed installation against the active execution.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[repr(C)]
+pub struct NativePollInitialization {
+    pub control: *mut NativePollControl,
+    pub heat: *const std::sync::atomic::AtomicU32,
+}
+
 /// Process-lifetime flag addresses, using the runtime's atomic widths and
 /// ordering. `initialize` is noncollecting and returns the current activation's
 /// control pointer, or null to require the existing published poll every time.
@@ -1546,6 +1556,9 @@ pub struct NativePollControl {
 #[derive(Clone, Copy)]
 pub struct NativePollFastPath {
     pub initialize: u64,
+    /// `initialize(heat_ordinal)` returns NativePollInitialization rather than
+    /// just a control pointer. Only managed mapped T1 installations use this.
+    pub initialize_with_execution_heat: bool,
     pub gc_requested: u64,
     pub sigusr1_pending: u64,
     pub posted_signal: u64,
@@ -1602,6 +1615,16 @@ fn emit_heat_fallback(a: &mut Asm, cache: HeatCacheHomes) {
     store_home(a, FramedHome::Stack(cache.fallback), RAX, 0);
     emit_heat_fallback_address(a, RAX, cache);
     store_home(a, FramedHome::Stack(cache.pointer), RAX, 0);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn emit_initialized_heat_binding(a: &mut Asm, cache: HeatCacheHomes) {
+    let missing = a.label();
+    emit_heat_fallback(a, cache);
+    alu_r_imm(a, 7, SCRATCH, 0);
+    a.jcc(Cc::E, missing);
+    store_home(a, FramedHome::Stack(cache.pointer), SCRATCH, 0);
+    a.bind(missing);
 }
 
 /// Resolve once per activation using only reserved scratch registers. The
@@ -8120,6 +8143,13 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     let initialize_poll = |a: &mut Asm| {
         if let Some((fast, home)) = poll_fast_path.zip(poll_control_home) {
+            if fast.initialize_with_execution_heat {
+                let id = match selected_heat.map(|heat| heat.counter) {
+                    Some(BaselineHeatCounter::ExecutionOwned(id)) => id.ordinal(),
+                    _ => usize::MAX,
+                };
+                mov_imm64(a, 7, id as i64);
+            }
             mov_imm64(a, RAX, fast.initialize as i64);
             a.extend_from_slice(&[0xff, 0xd0]); // noncollecting, once per entry
             store_home(a, home, RAX, 0);
@@ -8127,7 +8157,7 @@ fn emit_framed_inner(
         }
     };
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    let initialize_heat = |a: &mut Asm| {
+    let initialize_heat = |a: &mut Asm, ordinary_ingress: bool| {
         if let Some((
             BaselineHeat {
                 counter: BaselineHeatCounter::ExecutionOwned(id),
@@ -8136,8 +8166,12 @@ fn emit_framed_inner(
             home,
         )) = selected_heat.zip(heat_cache)
         {
-            if ordinary_call_mode {
+            if ordinary_call_mode || ordinary_ingress {
                 emit_heat_binding(a, id, 13, home);
+            } else if poll_fast_path.is_some_and(|fast| fast.initialize_with_execution_heat) {
+                // The existing initializer returns the already validated cell
+                // in RDX. Keep the same frame-local one-edge missing binding.
+                emit_initialized_heat_binding(a, home);
             } else if let Some(control) = poll_control_home {
                 let missing = a.label();
                 let done = a.label();
@@ -8394,7 +8428,7 @@ fn emit_framed_inner(
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     initialize_poll(&mut a);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    initialize_heat(&mut a);
+    initialize_heat(&mut a, false);
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     if let Some(recursion) = native_recursion {
         store_home(&mut a, native_stack_home.unwrap(), 6, 0);
@@ -8804,7 +8838,7 @@ fn emit_framed_inner(
             parallel_home_move(&mut a, &bound_moves);
             a.bind(parameters_moved);
         }
-        initialize_heat(&mut a);
+        initialize_heat(&mut a, true);
         if ordinary_call_mode {
             mov_imm64(&mut a, RAX, 0);
             store_home(&mut a, frame_base_home.unwrap(), RAX, 0);
@@ -11644,7 +11678,7 @@ fn emit_framed_inner(
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
         initialize_poll(&mut a);
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        initialize_heat(&mut a);
+        initialize_heat(&mut a, false);
         // The header state names values that are not live at the target and
         // so are never imported — deopt-only loop phis. Give those homes NIL
         // first, so a later deopt stub (a failed entry check, or any guard in
