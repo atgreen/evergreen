@@ -3303,7 +3303,7 @@ impl<'a> Builder<'a> {
                         },
                         &[(IRType::TOP, ValueRepresentation::Tagged)],
                     );
-// Calls in native-cleanup builds become Invokes below; the
+                    // Calls in native-cleanup builds become Invokes below; the
                     // pass splits those too (bliss-3k0xm).
                     if n == 2
                         && policy != InlinePolicy::NotInline

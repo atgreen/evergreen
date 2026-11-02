@@ -43,8 +43,8 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun fc-inner (a b) (+ a b)) (defun fc-kw (f a &key (b (1+ 0))) (funcall f a b)) \
-         (defun fc-one (f a &key (b (1+ 0))) (funcall f a))",
+        "(defun fc-inner (a b) (+ a b)) (defun fc-kw (f a &key (b (1+ 0)) &aux (aux-z 0)) (funcall f a b)) \
+         (defun fc-one (f a &key (b (1+ 0)) &aux (aux-z 0)) (funcall f a))",
         &mut env,
     )
     .unwrap();
@@ -59,7 +59,7 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     );
     let (outer, outer_code) = super::ordinary_t2::install(
         "FC-KW",
-        "(f a &key (b (1+ 0)))",
+        "(f a &key (b (1+ 0)) &aux (aux-z 0))",
         "((funcall f a b))",
         &mut env,
     );
@@ -84,7 +84,7 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     // signals the standard argument-count error.
     let (one, _) = super::ordinary_t2::install(
         "FC-ONE",
-        "(f a &key (b (1+ 0)))",
+        "(f a &key (b (1+ 0)) &aux (aux-z 0))",
         "((funcall f a))",
         &mut env,
     );
@@ -121,14 +121,14 @@ fn apply_runs_the_fast_target_and_sees_a_redefinition() {
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
         "(defun fa-inner (a b) (+ a b)) \
-         (defun fa-kw (a &key (b (1+ 0))) (apply (symbol-function 'fa-inner) a b nil))",
+         (defun fa-kw (a &key (b (1+ 0)) &aux (aux-z 0)) (apply (symbol-function 'fa-inner) a b nil))",
         &mut env,
     )
     .unwrap();
     let (inner, _) = super::ordinary_t2::install("FA-INNER", "(a b)", "((+ a b))", &mut env);
     let (outer, _) = super::ordinary_t2::install(
         "FA-KW",
-        "(a &key (b (1+ 0)))",
+        "(a &key (b (1+ 0)) &aux (aux-z 0))",
         "((apply (symbol-function 'fa-inner) a b nil))",
         &mut env,
     );
@@ -166,14 +166,14 @@ fn a_collection_retires_fast_targets() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     super::super::super::read_eval_all_env(
-        "(defun fg-inner (a b) (+ a b)) (defun fg-kw (f a &key (b (1+ 0))) (funcall f a b))",
+        "(defun fg-inner (a b) (+ a b)) (defun fg-kw (f a &key (b (1+ 0)) &aux (aux-z 0)) (funcall f a b))",
         &mut env,
     )
     .unwrap();
     let (inner, _) = super::ordinary_t2::install("FG-INNER", "(a b)", "((+ a b))", &mut env);
     let (outer, _) = super::ordinary_t2::install(
         "FG-KW",
-        "(f a &key (b (1+ 0)))",
+        "(f a &key (b (1+ 0)) &aux (aux-z 0))",
         "((funcall f a b))",
         &mut env,
     );

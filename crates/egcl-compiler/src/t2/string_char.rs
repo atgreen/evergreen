@@ -291,8 +291,14 @@ fn admit_string_char_invokes(f: &mut Function, calls: &HashSet<Inst>) {
                 aux: AuxData::None,
                 flags: InstFlags::default(),
                 targets: vec![
-                    BlockCall { block: fast, args: vec![] },
-                    BlockCall { block: slow, args: vec![] },
+                    BlockCall {
+                        block: fast,
+                        args: vec![],
+                    },
+                    BlockCall {
+                        block: slow,
+                        args: vec![],
+                    },
                 ],
                 frame_state: None,
                 source_pos,
@@ -325,7 +331,10 @@ fn admit_string_char_invokes(f: &mut Function, calls: &HashSet<Inst>) {
                 results: vec![],
                 aux: AuxData::None,
                 flags: InstFlags::default(),
-                targets: vec![BlockCall { block: normal, args: vec![character] }],
+                targets: vec![BlockCall {
+                    block: normal,
+                    args: vec![character],
+                }],
                 frame_state: None,
                 source_pos,
             },
@@ -484,8 +493,16 @@ mod tests {
             .expect("builds");
             super::super::verify::verify(&f).expect("split IR verifies");
             assert_eq!(count(&f, Opcode::StringCharOrNil), 1, "{name}");
-            assert_eq!(count(&f, Opcode::Invoke), 1, "{name}: the slow arm keeps the invoke");
-            assert_eq!(count(&f, Opcode::ClearMv), 1, "{name}: the fast arm resets values");
+            assert_eq!(
+                count(&f, Opcode::Invoke),
+                1,
+                "{name}: the slow arm keeps the invoke"
+            );
+            assert_eq!(
+                count(&f, Opcode::ClearMv),
+                1,
+                "{name}: the fast arm resets values"
+            );
             let invoke = f
                 .block_order()
                 .iter()
@@ -501,7 +518,10 @@ mod tests {
                 .map(|inst| f.inst(inst))
                 .find(|data| {
                     data.opcode == Opcode::Jump
-                        && data.targets.first().is_some_and(|target| target.block == normal)
+                        && data
+                            .targets
+                            .first()
+                            .is_some_and(|target| target.block == normal)
                 })
                 .expect("the fast arm joins the invoke's normal successor");
             assert_eq!(jump.targets[0].args.len(), 1, "{name}");
