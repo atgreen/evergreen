@@ -1590,18 +1590,20 @@ fn string_key_eq_str(key: EgclVal, text: &str) -> bool {
     if !key.is_heap_object() {
         return false;
     }
-    if crate::pathnames::is_registered_string(key) {
-        return crate::pathnames::registered_string(key).is_some_and(|s| s == text);
-    }
-    // Safety: not a sentinel, so a heap-tagged value points at a live header.
+    // Every registered string is a real heap string whose registry text is
+    // its own contents (see `is_vector` in sequences.rs), so the header read
+    // is safe and an in-place comparison gives the registry's answer. Asking
+    // the registry first took its lock on every probe of every package
+    // symbol table, once any string had been registered.
+    // Safety: a heap-tagged value points at a live header.
     unsafe {
         let ptr = key.as_ptr();
         let tid = (*(ptr as *const ObjectHeader)).type_id();
-        if tid != type_id::SIMPLE_BASE_STRING && tid != type_id::SIMPLE_CHARACTER_STRING {
-            return false;
+        if tid == type_id::SIMPLE_BASE_STRING || tid == type_id::SIMPLE_CHARACTER_STRING {
+            return egcl_rt::object::simple_string_eq_str(ptr, text);
         }
-        egcl_rt::object::simple_string_eq_str(ptr, text)
     }
+    crate::pathnames::registered_string(key).is_some_and(|s| s == text)
 }
 
 /// `GETHASH` of the string whose characters are `text` in an EQUAL table,
