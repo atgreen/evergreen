@@ -16,6 +16,7 @@ mod fibers;
 mod funcall_fast;
 mod handlers;
 mod inline_specials;
+mod lambda_list_entries;
 mod linkage;
 mod live_signaling;
 mod nested;

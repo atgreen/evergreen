@@ -6930,6 +6930,63 @@ pub fn native_alloc_layout() -> Option<NativeAllocLayout> {
     })
 }
 
+/// Build a proper list of `values` from this thread's generated-code
+/// allocation window, exactly as inline generated code allocates conses, or
+/// return `None` having allocated nothing (bliss-gg3i1.7.15.10.4). It never
+/// collects, polls or signals, so a native entry can call it before its
+/// frame publishes any root; on `None` the caller takes a rooted path that
+/// may collect. An empty `values` is NIL. A disabled window, a window from
+/// before the last moving collection, or one too small for the whole list
+/// declines; GC stress keeps the window small, so stressed runs exercise the
+/// rooted path too.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub fn try_native_list(values: &[EgclVal]) -> Option<EgclVal> {
+    if values.is_empty() {
+        return Some(crate::value::NIL);
+    }
+    let (footprint, large) = object_footprint(16);
+    if large || native_alloc_offset().is_none() {
+        return None;
+    }
+    let header = {
+        let mut word = 0u64;
+        // SAFETY: a small object's header is one word, written into a local.
+        unsafe { write_object_header((&raw mut word).cast(), crate::object::type_id::CONS, 16) };
+        word
+    };
+    let bytes = footprint.checked_mul(values.len())?;
+    let start = NATIVE_TLAB
+        .try_with(|window| {
+            let cursor = window.cursor.get();
+            let end = cursor.checked_add(bytes)?;
+            (window.limit.get() != 0
+                && window.epoch.get() == GC_MOVE_EPOCH.load(Ordering::Acquire)
+                && end <= window.limit.get())
+            .then(|| {
+                window.cursor.set(end);
+                cursor
+            })
+        })
+        .ok()
+        .flatten()?;
+    // SAFETY: the window handed out these bytes of this thread's TLAB, as it
+    // does to generated code; each cons is fully initialized before the list
+    // can be observed, and nothing here can collect.
+    unsafe {
+        for (index, &car) in values.iter().enumerate() {
+            let at = start + index * footprint;
+            *(at as *mut u64) = header;
+            *((at + 8) as *mut EgclVal) = car;
+            *((at + 16) as *mut EgclVal) = if index + 1 < values.len() {
+                EgclVal::from_cons_ptr((at + footprint + 8) as *mut u8)
+            } else {
+                crate::value::NIL
+            };
+        }
+        Some(EgclVal::from_cons_ptr((start + 8) as *mut u8))
+    }
+}
+
 /// Advance `allocator` past the objects generated code bump-allocated from its
 /// TLAB, counting their bytes. A window from another epoch, or one that does
 /// not lie within this TLAB, has nothing to give back.

@@ -376,7 +376,10 @@ fn emit_ordinary_call_body(
             },
             cold,
             // Under the bounded 0–4 signature, rounded capacity is 0 or 16.
-            tail: allow_tail && (call.args.len() <= 3 || entry.arity == 4),
+            // A binding entry's caller may have passed fewer words than it
+            // binds, so only a fixed entry is known to own a fourth slot.
+            tail: allow_tail
+                && (call.args.len() <= 3 || (entry.arity == 4 && entry.binding.is_none())),
             guard,
             poll_veneer: None,
             self_calls: &[],
@@ -1002,6 +1005,9 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::ConstSymbol
                 | Opcode::ConstChar
                 | Opcode::ClearMv
+                // Reads the tuple through the noncollecting MV leaf into
+                // frame words (bliss-gg3i1.7.15.10.4).
+                | Opcode::TakeValuesToLocals
                 | Opcode::CurrentCallable
                 | Opcode::FixnumCmpEq
                 | Opcode::FixnumCmpLt
@@ -1067,15 +1073,16 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
     // Calls contain the complete lifecycle poll. A cycle without a call would
     // otherwise suppress signals, collection and fiber yielding indefinitely.
     // Remove call-containing blocks and require the remaining graph acyclic.
+    // VALUES runs as a nonpolling leaf, so it does not count.
     let mut pending: std::collections::HashSet<_> = f
         .block_order()
         .iter()
         .copied()
         .filter(|&block| {
-            !f.block(block)
-                .insts
-                .iter()
-                .any(|&inst| f.inst(inst).opcode == Opcode::Call)
+            !f.block(block).insts.iter().any(|&inst| {
+                f.inst(inst).opcode == Opcode::Call
+                    && super::inline_leaf::ordinary_values_helper(f.inst(inst)).is_none()
+            })
         })
         .collect();
     while poll_veneer == 0 && !pending.is_empty() {

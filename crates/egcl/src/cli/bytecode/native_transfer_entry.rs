@@ -2277,20 +2277,21 @@ fn invalid_capture() -> EgclError {
     EgclError::Internal("invalid native transfer capture".into())
 }
 
-/// Parameters the ordinary entry binds itself: fixed ones, or up to three
-/// positional parameters of which the trailing ones are `&optional`. The
-/// entry pads an omitted one with the unsupplied marker (bliss-6m6ca).
+/// Parameters the ordinary entry binds itself: fixed ones; positional
+/// parameters of which the trailing ones are `&optional`, where the entry
+/// pads an omitted one with the unsupplied marker (bliss-6m6ca), in
+/// registers or, past the third, in its frame (bliss-gg3i1.7.15.10.4); or a
+/// `&rest`/`&key` list whose plan binds every call without evaluation.
 fn ordinary_entry_parameters(body: &BytecodeFunction) -> bool {
     fixed_tagged_parameters(body)
         || ordinary_outer_capture_body(body)
         || (positional_tagged_parameters(body)
             && body.min_args < body.arity
-            && body.arity <= 3
             && body.param_types.iter().all(|ty| ty.is_any()))
         || (body.variadic
             && !body.has_env
             && body.param_types.iter().all(|ty| ty.is_any())
-            && super::variadic_plan::VariadicPlan::native_keywords(body).is_some())
+            && super::variadic_plan::VariadicPlan::native_binding(body).is_some())
 }
 
 pub(super) fn fixed_tagged_parameters(body: &BytecodeFunction) -> bool {
@@ -2597,7 +2598,8 @@ fn ordinary_native_op(op: &Instr) -> bool {
         )
         // VALUES publishes its tuple through a noncollecting leaf and the
         // ordinary return descriptor (bliss-gg3i1.7.15.10.4).
-        || (matches!(op, Instr::SetValues(_)) && ordinary_values_enabled())
+        || (matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. })
+            && ordinary_values_enabled())
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
         || (matches!(op, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
             && ordinary_special_bindings_enabled())
@@ -2686,13 +2688,15 @@ pub(super) fn ordinary_function_designators_enabled() -> bool {
 
 /// Whether specialization removed every primary-value binder the body's
 /// bytecode contains, so the ordinary entry never needs multiple values.
+/// Ordinary code now reads multiple values itself (bliss-gg3i1.7.15.10.4)
+/// unless `EGCL_DISABLE_ORDINARY_VALUES` asks for the old behaviour.
 fn ordinary_primary_transport_eliminated(ir: &egcl_compiler::t2::ir::Function) -> bool {
-    ir.block_order().iter().all(|&block| {
-        ir.block(block)
-            .insts
-            .iter()
-            .all(|&inst| ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals)
-    })
+    ordinary_values_enabled()
+        || ir.block_order().iter().all(|&block| {
+            ir.block(block).insts.iter().all(|&inst| {
+                ir.inst(inst).opcode != egcl_compiler::t2::ir::Opcode::TakeValuesToLocals
+            })
+        })
 }
 
 /// The first instruction `ordinary_native_body` refuses, for its decline log.

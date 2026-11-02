@@ -944,7 +944,7 @@ impl EmissionContext {
             });
         let keyword_plan = body
             .variadic
-            .then(|| super::super::variadic_plan::VariadicPlan::native_keywords(body))
+            .then(|| super::super::variadic_plan::VariadicPlan::native_binding(body))
             .flatten()
             .map(|plan| {
                 (

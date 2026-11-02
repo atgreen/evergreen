@@ -673,12 +673,17 @@
   functions on the previous representation. The image format is now version
   20; images saved by earlier versions must be saved again.
   ([#973](https://github.com/atgreen/evergreen/pull/973))
-- On x86-64 Linux, an optimized function that returns multiple values with
-  `VALUES` (including zero values) now runs as ordinary native code instead of
-  through the slower mapped entry, and a caller that returns its result passes
-  the values through unchanged. A call from optimized code to such a function
-  drops from about 3.5 µs to about 40 ns.
-  `EGCL_DISABLE_ORDINARY_VALUES=1` restores the old behaviour for comparison.
+- On x86-64 Linux, more optimized functions use the fast native calling
+  convention instead of a slower entry that goes through the runtime:
+  functions with `&rest` lists, with `&optional` parameters beyond the
+  third, or with `&key` lists of any size (including `&allow-other-keys`);
+  calls passing eight or more arguments; functions that return multiple
+  values with `VALUES`; and callers that bind multiple values with
+  `MULTIPLE-VALUE-BIND`. A call to such a function from optimized code drops
+  from 0.9–3.8 µs to tens of nanoseconds. `FUNCALL` of a compiled function
+  with up to 15 arguments also stays native.
+  `EGCL_DISABLE_ORDINARY_VALUES=1` keeps multiple-value functions on the old
+  path for comparison.
   ([#NNN](https://github.com/atgreen/evergreen/pull/NNN))
 - On x86-64 Linux, a compiled call from one optimized function to another
   named, fixed-arity, optimized function is cheaper. The function object now

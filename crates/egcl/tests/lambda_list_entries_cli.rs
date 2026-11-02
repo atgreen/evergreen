@@ -53,6 +53,11 @@ const PROGRAM: &str = r#"
 (defun c-fix5 (k) (s-fix5 k 1 2 3 4))
 (defun c-fix7 (k) (s-fix7 k 1 2 3 4 5 6))
 (defun c-nlx (k) (catch 'out (s-nlx k 5 6 7)))
+(defun c-funcall7 (k) (funcall 's-fix7 k 1 2 3 4 5 6))
+(defun c-funcall-rest (k) (funcall #'s-rest k 1 2 3 4))
+(defun c-funcall-key (k) (funcall #'s-key5 :e k :a 1 :c 3))
+(defun s-wide (a b c d e f g h i j) (list j i h g f e d c b a))
+(defun c-wide (k) (s-wide k 2 3 4 5 6 7 8 9 10))
 
 (defun drive (k)
   (list
@@ -64,6 +69,7 @@ const PROGRAM: &str = r#"
    (c-rest k) (c-rest0 k) (c-rest4 k)
    (c-key k) (c-key-dup k) (c-key-aok k) (c-key-aok-call k) (c-rest-key k)
    (c-key5 k) (c-fix5 k) (c-fix7 k) (c-nlx k)
+   (c-funcall7 k) (c-funcall-rest k) (c-funcall-key k) (c-wide k)
    (handler-case (s-err-key k :zz 1) (error () :unknown-key))
    (handler-case (funcall 's-err-key k :b) (error () :odd))
    (handler-case (funcall 's-fix5 k 1) (error () :few))
@@ -149,8 +155,8 @@ fn every_tier_agrees_on_each_lambda_list_and_values_shape() {
         &[("EGCL_T2_THRESHOLD", "20"), ("EGCL_T2_LOG", "stderr")],
     );
     assert_eq!(natural, expected, "natural tiering");
-    // The values producers and their forwarding callers must really run
-    // through the ordinary entry, not a mapped one.
+    // The values producers, their forwarding callers and the binding
+    // entries must really run through the ordinary entry, not a mapped one.
     for name in [
         "S-MV",
         "S-MV0",
@@ -159,6 +165,17 @@ fn every_tier_agrees_on_each_lambda_list_and_values_shape() {
         "C-MV",
         "C-MV0",
         "C-MV-BRANCH",
+        "S-OPT5",
+        "S-REST",
+        "S-REST4",
+        "S-KEY",
+        "S-KEY-AOK",
+        "S-REST-KEY",
+        "S-KEY5",
+        "S-FIX7",
+        "S-WIDE",
+        "C-WIDE",
+        "C-FUNCALL7",
     ] {
         assert!(
             log.lines().any(|line| line.starts_with(&format!(

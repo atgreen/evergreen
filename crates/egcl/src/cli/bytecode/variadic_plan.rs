@@ -54,10 +54,18 @@ pub(super) struct VariadicPlan {
     rest: bool,
     keys: Option<Vec<Key>>,
     allow_other_keys: bool,
+    /// Raw bits of keywords an `&allow-other-keys` list has ignored, for
+    /// the ordinary entry's binder (0 when empty).
+    ignored: [AtomicU64; IGNORED_KEYS],
+    /// The `ignored` entry the next newly ignored keyword replaces.
+    next_ignored: std::sync::atomic::AtomicUsize,
     aux: Vec<Initial>,
     /// Number of bound variables, in `param_layout` order.
     values: usize,
 }
+
+/// Ignored keywords each plan remembers.
+const IGNORED_KEYS: usize = 4;
 
 #[cfg(test)]
 thread_local! {
@@ -65,6 +73,9 @@ thread_local! {
     pub(super) static GENERAL_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// Make every plan decline, to compare it against the general binder.
     pub(super) static PLANS_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `&rest` lists an ordinary entry's binder built itself.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    pub(super) static NATIVE_REST_BINDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The largest plan bound with on-stack buffers; bigger ones use the heap.
@@ -130,6 +141,8 @@ impl VariadicPlan {
             rest: false,
             keys: None,
             allow_other_keys: false,
+            ignored: Default::default(),
+            next_ignored: std::sync::atomic::AtomicUsize::new(0),
             aux: Vec::new(),
             values: 0,
         };
@@ -283,6 +296,15 @@ impl VariadicPlan {
                             keys[index].seen.store(key.0, Ordering::Relaxed);
                         } else if !self.allow_other_keys {
                             return false;
+                        } else if !self
+                            .ignored
+                            .iter()
+                            .any(|seen| seen.load(Ordering::Relaxed) == key.0)
+                        {
+                            // Its name matches no parameter, so it never will.
+                            let slot =
+                                self.next_ignored.fetch_add(1, Ordering::Relaxed) % IGNORED_KEYS;
+                            self.ignored[slot].store(key.0, Ordering::Relaxed);
                         }
                         index
                     }
@@ -409,20 +431,28 @@ impl VariadicPlan {
 
 // The ordinary x86-64 Lisp entry is the only caller of what follows.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-/// The most bound values an ordinary `&key` entry passes in registers.
-pub(super) const NATIVE_KEYWORD_VALUES: usize = 3;
+/// The most values an ordinary binding entry binds into its frame.
+pub(super) const NATIVE_BOUND_VALUES: usize = 32;
+/// The most `&key` parameters an ordinary binding entry matches.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const NATIVE_KEYS: usize = 16;
+/// The longest `&rest` list an ordinary binding entry builds itself.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const NATIVE_REST: usize = 64;
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl VariadicPlan {
     /// The plan for `func` when every call it can bind needs no evaluation:
-    /// required, `&optional` and `&key` parameters with constant defaults,
-    /// no `&rest`, and at most [`NATIVE_KEYWORD_VALUES`] bound values. An
-    /// ordinary `&key` entry binds through [`native_keyword_bind`] with it.
-    pub(super) fn native_keywords(func: &BytecodeFunction) -> Option<&VariadicPlan> {
+    /// a `&rest` or `&key` list whose required, `&optional`, `&key` and
+    /// `&aux` parameters have constant defaults, binding at most
+    /// [`NATIVE_BOUND_VALUES`] values. An ordinary binding entry binds
+    /// through [`native_keyword_bind`] with it (bliss-gg3i1.7.15.10.4).
+    pub(super) fn native_binding(func: &BytecodeFunction) -> Option<&VariadicPlan> {
         let plan = Self::of(func)?;
         let constant = |initial: &Initial| matches!(initial, Initial::Constant(_));
-        (plan.keys.is_some() && !plan.rest
-            && plan.values <= NATIVE_KEYWORD_VALUES
+        ((plan.keys.is_some() || plan.rest)
+            && plan.values <= NATIVE_BOUND_VALUES
+            && plan.keys.as_ref().is_none_or(|keys| keys.len() <= NATIVE_KEYS)
             && plan.optionals.iter().all(|optional| constant(&optional.initial))
             && plan.keys.iter().flatten().all(|key| constant(&key.initial))
             && plan.aux.iter().all(constant)
@@ -431,47 +461,89 @@ impl VariadicPlan {
         .then_some(plan)
     }
 
+    /// Whether the general binder has seen `key` as a keyword this
+    /// `&allow-other-keys` list ignores.
+    fn ignores(&self, key: EgclVal) -> bool {
+        self.allow_other_keys
+            && self
+                .ignored
+                .iter()
+                .any(|seen| seen.load(Ordering::Relaxed) == key.0)
+    }
+
     /// `bind` for an ordinary entry: the values it would store in slots
     /// `0..values`, written to `out`, or `false` having written nothing.
     /// It reads only immediate argument words and recognizes a keyword only
-    /// by the symbol `bind` last matched, so it takes no lock, allocates
-    /// nothing and cannot collect, signal or panic. Every call it declines,
-    /// the general binder handles, and teaches it the keywords used.
+    /// by a symbol `bind` has already classified, so it takes no lock and
+    /// cannot collect, signal or panic. It allocates only a `&rest` list, from
+    /// the generated-code allocation window, and declines when that window
+    /// cannot hold it. Every call it declines, the general binder handles,
+    /// and teaches it the keywords used.
     fn bind_native(
         &self,
         args: impl Fn(usize) -> EgclVal,
         count: usize,
         out: &mut [EgclVal],
     ) -> bool {
-        let Some(keys) = &self.keys else { return false };
         let positional = self.required + self.optionals.len();
-        if count < self.required || out.len() != self.values {
+        if count < self.required
+            || out.len() != self.values
+            || (self.keys.is_none() && !self.rest && count > positional)
+        {
             return false;
         }
         let tail_start = count.min(positional);
-        if (count - tail_start) % 2 != 0 {
-            return false;
-        }
-        // `native_keywords` admits at most this many keys.
-        if keys.len() > NATIVE_KEYWORD_VALUES {
-            return false;
-        }
         let mut supplied: u64 = 0;
-        let mut key_values = [0usize; NATIVE_KEYWORD_VALUES];
-        for at in (tail_start..count).step_by(2) {
-            let key = args(at);
-            // `:allow-other-keys` and an unknown keyword never match a cached
-            // spec; the general binder decides what they mean.
-            let index = keys
-                .iter()
-                .position(|spec| key.is_symbol() && spec.seen.load(Ordering::Relaxed) == key.0);
-            let Some(index) = index else { return false };
-            // The first occurrence of a keyword supplies it (CLHS 3.4.1.4).
-            if supplied & (1 << index) == 0 {
-                supplied |= 1 << index;
-                key_values[index] = at + 1;
+        let mut key_values = [0usize; NATIVE_KEYS];
+        if let Some(keys) = &self.keys {
+            if keys.len() > NATIVE_KEYS || (count - tail_start) % 2 != 0 {
+                return false;
+            }
+            for at in (tail_start..count).step_by(2) {
+                let key = args(at);
+                if !key.is_symbol() {
+                    return false;
+                }
+                // `:allow-other-keys` and an unclassified keyword never match;
+                // the general binder decides what they mean.
+                match keys
+                    .iter()
+                    .position(|spec| spec.seen.load(Ordering::Relaxed) == key.0)
+                {
+                    // The first occurrence of a keyword supplies it (CLHS 3.4.1.4).
+                    Some(index) => {
+                        if supplied & (1 << index) == 0 {
+                            supplied |= 1 << index;
+                            key_values[index] = at + 1;
+                        }
+                    }
+                    None if self.ignores(key) => {}
+                    None => return false,
+                }
             }
         }
+        // The `&rest` list is the only allocation, made before anything is
+        // written. It cannot collect, so no argument word moves.
+        let rest = if self.rest {
+            let length = count - tail_start;
+            if length > NATIVE_REST {
+                return false;
+            }
+            let mut tail = [NIL; NATIVE_REST];
+            for (index, value) in tail[..length].iter_mut().enumerate() {
+                *value = args(tail_start + index);
+            }
+            match egcl_rt::gc::try_native_list(&tail[..length]) {
+                Some(list) => {
+                    #[cfg(test)]
+                    NATIVE_REST_BINDS.with(|binds| binds.set(binds.get() + 1));
+                    list
+                }
+                None => return false,
+            }
+        } else {
+            NIL
+        };
         let mut at = 0;
         let mut push = |value: EgclVal| {
             out[at] = value;
@@ -494,7 +566,10 @@ impl VariadicPlan {
                 push(if given { T } else { NIL });
             }
         }
-        for (index, key) in keys.iter().enumerate() {
+        if self.rest {
+            push(rest);
+        }
+        for (index, key) in self.keys.iter().flatten().enumerate() {
             let Initial::Constant(initial) = key.initial else {
                 return false;
             };
@@ -523,9 +598,10 @@ impl VariadicPlan {
 /// as the ordinary ABI passes them; `out` receives the bound values.
 ///
 /// # Safety
-/// `plan` comes from [`VariadicPlan::native_keywords`] for a body its code
+/// `plan` comes from [`VariadicPlan::native_binding`] for a body its code
 /// retains; the argument areas hold `count` words and `out` holds the plan's
-/// value count. Called from generated code before the entry's frame exists.
+/// value count. Called from generated code before the entry publishes any
+/// root, so nothing it does may collect.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe extern "C" fn native_keyword_bind(
     plan: *const VariadicPlan,

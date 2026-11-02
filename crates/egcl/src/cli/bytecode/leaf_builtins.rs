@@ -853,6 +853,7 @@ pub(super) fn install() {
     });
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(egcl_no_t2)))]
 use egcl_rt::native_transfer::NativeReturnValues;
 
 /// VALUES in ordinary T2 code (bliss-gg3i1.7.15.10.4): publish `args[..n]` as
@@ -862,6 +863,7 @@ use egcl_rt::native_transfer::NativeReturnValues;
 /// never allocates a Lisp object, collects, polls, signals or unwinds. The
 /// arguments are the caller's mapped outgoing slots and the tuple the
 /// descriptor borrows belongs to the Env, which traces it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux", not(egcl_no_t2)))]
 extern "C" fn ordinary_values(args: *const EgclVal, n: u64, out: *mut NativeReturnValues) -> u64 {
     let env = NATIVE_ENV.with(std::cell::Cell::get);
     // SAFETY: ordinary native code runs with its parked Env published, and
