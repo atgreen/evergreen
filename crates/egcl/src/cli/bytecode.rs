@@ -1500,8 +1500,16 @@ fn lambda_form_application(op: EgclVal, args: EgclVal) -> LowerResult<Option<Egc
     }
     egcl_rt::rooted!(params = list_to_vec(params));
     egcl_rt::rooted!(body = body);
-    let simple = params.len() == args.len()
-        && params
+    // Required parameters, then optionally `&aux` specs: SBCL's
+    // MAKE-MACRO-LAMBDA binds a user's &WHOLE that way, and DEF-IR1-TRANSLATOR
+    // and DEF-TYPE-TRANSLATOR apply that lambda inline (IR1-CONVERT-SETQ,
+    // PARSE-<SATISFIES>; bliss-gg3i1.7.15.7).
+    let aux_at = params
+        .iter()
+        .position(|p| p.is_symbol() && sym_name(*p) == "&AUX")
+        .unwrap_or(params.len());
+    let simple = aux_at == args.len()
+        && params[..aux_at]
             .iter()
             .all(|p| p.is_symbol() && !p.is_nil() && *p != T && !sym_name(*p).starts_with('&'));
     if !simple {
@@ -1509,9 +1517,67 @@ fn lambda_form_application(op: EgclVal, args: EgclVal) -> LowerResult<Option<Egc
     }
     let let_sym = resolve_sym("LET").ok_or(Bail)?;
     egcl_rt::rooted!(bindings = Vec::<EgclVal>::new());
-    for i in 0..params.len() {
+    for i in 0..aux_at {
         let binding = form_list(&[params[i], args[i]]);
         bindings.push(binding);
+    }
+    if aux_at < params.len() {
+        // `(let ((p a)*) (let* (aux*) . body))`: the arguments are evaluated
+        // outside every binding, and each &AUX init form sees the parameters
+        // and earlier &AUX variables (CLHS 3.4.1.5). The body's declarations
+        // move into the LET*; a SPECIAL one would then miss the parameter
+        // bindings, so keep the original path for it.
+        // Flattened (var, init) pairs; an init form is a heap object.
+        egcl_rt::rooted!(aux = Vec::<EgclVal>::new());
+        for spec in &params[aux_at + 1..] {
+            let (var, init) = if spec.is_symbol() {
+                (*spec, NIL)
+            } else if spec.is_cons() {
+                let items = list_to_vec(*spec);
+                if items.is_empty() || items.len() > 2 {
+                    return Ok(None);
+                }
+                (items[0], items.get(1).copied().unwrap_or(NIL))
+            } else {
+                return Ok(None);
+            };
+            if !var.is_symbol() || var.is_nil() || var == T || sym_name(var).starts_with('&') {
+                return Ok(None);
+            }
+            aux.extend([var, init]);
+        }
+        egcl_rt::rooted!(forms = list_to_vec(*body));
+        let mut start = 0;
+        while start < forms.len() {
+            let form = forms[start];
+            let declaration =
+                form.is_cons() && cp(form).0.is_symbol() && sym_name(cp(form).0) == "DECLARE";
+            if declaration && declares_special(form) {
+                return Ok(None);
+            }
+            // A docstring is only one when more forms follow it.
+            let docstring = start == 0 && form.is_string() && forms.len() > 1;
+            if !declaration && !docstring {
+                break;
+            }
+            start += 1;
+        }
+        egcl_rt::rooted!(aux_bindings = Vec::<EgclVal>::new());
+        for pair in 0..aux.len() / 2 {
+            let binding = form_list(&[aux[pair * 2], aux[pair * 2 + 1]]);
+            aux_bindings.push(binding);
+        }
+        let let_star = resolve_sym("LET*").ok_or(Bail)?;
+        egcl_rt::rooted!(inner = vec![let_star, form_list(&aux_bindings)]);
+        let inner_forms: Vec<EgclVal> = forms
+            .iter()
+            .enumerate()
+            .filter(|(index, form)| *index >= start || !form.is_string())
+            .map(|(_, form)| *form)
+            .collect();
+        inner.extend(inner_forms);
+        egcl_rt::rooted!(inner = form_list(&inner));
+        *body = arena_cons(*inner, NIL);
     }
     egcl_rt::rooted!(binding_list = form_list(&bindings));
     egcl_rt::rooted!(rest = arena_cons(*binding_list, *body));
