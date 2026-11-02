@@ -29,6 +29,7 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
     let program = format!(
         r#"
 (format *error-output* "HOST-PRESSURE-WORKLOAD-BEGIN~%")
+(room nil)
 (let ((sum 0) (kept '()))
   (dotimes (i {CLOSURES})
     (let ((x i))
@@ -40,6 +41,7 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
   (assert (= (reduce #'+ (mapcar (lambda (f) (funcall f 1)) kept)) {kept_sum}))
   (format t "REGISTRY ~D~%" (first (egcl::%bc-registry-sizes)))
   (format t "HOST-PRESSURE-LIVENESS-OK~%"))
+(room nil)
 (format *error-output* "HOST-PRESSURE-WORKLOAD-END~%")
 "#
     );
@@ -104,10 +106,10 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
         "{binding}: peak RSS {peak_rss} bytes; status {status}\n{stdout}\n{stderr}"
     );
     assert!(stdout.contains("HOST-PRESSURE-LIVENESS-OK"), "{stdout}");
-    // Closures with a captured frame own host-side state, tracked as host
-    // bytes; heap-environment closures (Backpack) own none, and their pinned
-    // function objects are counted instead. Either must request the major
-    // collections that free dead closures during the workload.
+    // Legacy closures with host state and closures with control scopes remain
+    // pinned and request majors. Control-free heap-environment instances are
+    // nursery objects: minor collections reclaim them within the same RSS cap.
+    // The unit regression additionally proves that the callable itself moves.
     let requests_during_workload = stderr
         .split_once("HOST-PRESSURE-WORKLOAD-BEGIN")
         .and_then(|(_, tail)| tail.split_once("HOST-PRESSURE-WORKLOAD-END"))
@@ -118,9 +120,26 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
                     .count()
         })
         .unwrap_or(0);
+    let minor_counts: Vec<u64> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("GCs:")?
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    assert_eq!(
+        minor_counts.len(),
+        2,
+        "missing before/after ROOM counts\n{stdout}"
+    );
+    let minor_collections = minor_counts[1].saturating_sub(minor_counts[0]);
     assert!(
-        requests_during_workload > 0,
-        "closure pressure never requested a major collection during the workload\n{stderr}"
+        requests_during_workload > 0 || minor_collections > 0,
+        "closure pressure neither requested a major nor collected the nursery during the workload\n{stdout}\n{stderr}"
     );
     assert!(
         !stderr.contains("request-major reason=legacy-count"),
@@ -135,7 +154,7 @@ fn closure_pressure_keeps_escaped_values(binding: &str) {
         .parse()
         .unwrap();
     eprintln!(
-        "{binding}: major requests {requests_during_workload}, registry {registry}, peak RSS {peak_rss}"
+        "{binding}: major requests {requests_during_workload}, minor collections {minor_collections}, registry {registry}, peak RSS {peak_rss}"
     );
     assert!(
         registry < 300000,

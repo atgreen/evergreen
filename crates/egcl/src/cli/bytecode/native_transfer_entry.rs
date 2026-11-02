@@ -1578,7 +1578,7 @@ impl TransferCode {
         // Recorded with the root, never separately: the bits name the object
         // only while this root keeps it alive.
         self.callable_cache.last_callable_pinned.set(
-            if egcl_rt::function::is_interpreted_function(*function) {
+            if egcl_rt::function::is_pinned(*function) {
                 function.0
             } else {
                 0
@@ -1596,9 +1596,9 @@ impl TransferCode {
     ) -> Option<Arc<egcl_rt::CrossThreadRoot<EgclVal>>> {
         // Clone out of the cell before the GC-gated read, which may park.
         let previous = self.callable_cache.last_callable.borrow().clone()?;
-        // An interpreted function object never moves, and `previous` holds it
-        // alive, so equal bits are equal identity without the gate. That is
-        // every steady-state call of a named function (GitHub #487).
+        // Pinned definitions/prototypes never move, and `previous` holds them
+        // alive, so their equal bits prove identity without the gate. Movable
+        // closure instances must compare the traced root below instead.
         let pinned = self.callable_cache.last_callable_pinned.get();
         if pinned != 0 && pinned == function.0 {
             return Some(previous);

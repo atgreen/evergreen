@@ -12,7 +12,9 @@
 //! cache identity, deopt/tracing/debug identity, and precise GC roots — none of
 //! which a name→struct map can provide.
 //!
-//! Function objects are **pinned and identity-stable**. Ordinary DEFUN installs
+//! Definitions, prototypes and closures owning host state are pinned. A
+//! heap-environment closure with no host state can move with its traced roots.
+//! Ordinary DEFUN installs
 //! a fresh object in the symbol's function cell, so saved references retain the
 //! previous definition. Tier changes preserve the object's identity. Explicit
 //! in-place restoration uses `redefine`; callers must also invalidate compiled
@@ -195,15 +197,31 @@ pub fn alloc_closure_instance(prototype: EgclVal, state: usize) -> EgclVal {
     debug_assert!(is_interpreted_function(prototype));
     crate::rooted!(prototype = prototype);
     let body_ptr = alloc_function_body();
-    // SAFETY: fresh FUNCTION_INTERPRETED body, as in `alloc_interpreted`; the
-    // rooted prototype is pinned and live.
+    initialize_closure_instance(*prototype, state, body_ptr)
+}
+
+/// Allocate a movable closure instance with no host-owned state. Its prototype
+/// remains pinned and owns its counters and code identity. The returned object
+/// must never acquire host state: minor reclamation has no host-state finalizer.
+/// The caller roots the heap environment before allocating and attaches it with
+/// [`set_closure_env`] before publishing the result.
+pub fn alloc_movable_closure_instance(prototype: EgclVal) -> Option<EgclVal> {
+    debug_assert!(is_closure_template(prototype));
+    crate::rooted!(prototype = prototype);
+    let body_ptr = crate::gc::alloc_typed(body_size(), type_id::FUNCTION_INTERPRETED)?;
+    Some(initialize_closure_instance(*prototype, 0, body_ptr))
+}
+
+fn initialize_closure_instance(prototype: EgclVal, state: usize, body_ptr: *mut u8) -> EgclVal {
+    // SAFETY: callers provide a fresh FUNCTION_INTERPRETED body and a live
+    // pinned prototype. Initialization allocates nothing and cannot collect.
     unsafe {
         let header = body_ptr.sub(header_size());
         let d = header as *mut FunctionData;
-        let p = data(*prototype);
+        let p = data(prototype);
         (*d).lambda_list = (*p).lambda_list;
         (*d).body = crate::value::NIL;
-        (*d).env = *prototype;
+        (*d).env = prototype;
         (*d).name = (*p).name;
         (*d).invoke_count = 0.into();
         (*d).back_edge_count = 0.into();
@@ -242,6 +260,12 @@ pub unsafe fn mark_closure_template(f: EgclVal) {
             .flags
             .fetch_or(FLAG_CLOSURE_TEMPLATE, Ordering::AcqRel);
     }
+}
+
+/// Whether a function's address stays stable across collections. A rooted
+/// movable instance still changes address; identity caches must read its root.
+pub fn is_pinned(f: EgclVal) -> bool {
+    is_interpreted_function(f) && unsafe { (*(f.as_ptr() as *const ObjectHeader)).is_pinned() }
 }
 
 /// Whether `f` is an instance of a closure template.
@@ -301,8 +325,13 @@ pub unsafe fn closure_state(f: EgclVal) -> usize {
 /// `gc::set_closure_state_release_fn`).
 ///
 /// # Safety
-/// `f` must be an interpreted-function object.
+/// `f` must be an interpreted-function object. A nonzero state requires a
+/// pinned object, since host-state finalization runs only during major GC.
 pub unsafe fn set_closure_state(f: EgclVal, state: usize) -> usize {
+    assert!(
+        state == 0 || is_pinned(f),
+        "movable closure cannot own host state"
+    );
     unsafe { (*data(f)).closure_state.swap(state, Ordering::AcqRel) }
 }
 
@@ -469,8 +498,9 @@ pub fn definition_index(f: EgclVal) -> u32 {
 }
 
 /// Address of this exact interpreted definition's 32-bit atomic call counter.
-/// Returns `None` for other value kinds. Interpreted function objects are pinned,
-/// so the address is stable across collections, but the caller must retain a
+/// Returns `None` for other value kinds. Definitions and template prototypes
+/// own the counters and remain pinned, so even a movable instance's delegated
+/// counter address is stable across collections. The caller must retain a
 /// traced root for `f` throughout any later pointer use. Installing a replacement
 /// function does not redirect this pointer to the replacement's counter.
 /// Generated increments must be atomic read-modify-write operations with at

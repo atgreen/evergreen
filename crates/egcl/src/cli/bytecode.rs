@@ -18315,13 +18315,24 @@ fn note_heap_closure_instance() {
 /// it owns no lexical frame, only the control scope a free exit needs, and
 /// never shares the template prototype, since its caller attaches the
 /// captured environment to it.
-fn make_heap_closure_instance(nested: &Arc<BytecodeFunction>, env: &Env) -> EgclVal {
-    note_heap_closure_instance();
+fn make_heap_closure_instance(nested: &Arc<BytecodeFunction>, env: &Env) -> Option<EgclVal> {
     let control_free = closure_templates::control_free(nested);
+    if control_free {
+        // No host state to finalize: the nursery can reclaim this instance.
+        // The template remains pinned and owns all tier/counter/code identity.
+        egcl_rt::rooted!(_body_root = ActiveBytecodeRoot::new(nested));
+        egcl_rt::safepoint::poll_safepoint();
+        collect_requested_major_before_closure();
+        let (prototype, _) = closure_templates::template_for(nested);
+        #[cfg(test)]
+        method_context_use::helper_values::record_creation(nested);
+        return egcl_rt::function::alloc_movable_closure_instance(prototype);
+    }
+    note_heap_closure_instance();
     let scope_empty = env.block_stack.is_empty() && env.tag_stack.is_empty();
     let control =
         (!control_free && !scope_empty).then(|| (env.block_stack.clone(), env.tag_stack.clone()));
-    closure_templates::make_instance(nested, None, control, false)
+    Some(closure_templates::make_instance(nested, None, control, false))
 }
 
 /// Lazy (deferred) compilation of top-level DEFUNs (bliss-x5y). Eagerly
