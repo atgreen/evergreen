@@ -45,6 +45,7 @@ mod background_compile_tests;
     all(target_arch = "s390x", target_os = "linux")
 ))]
 mod background_t1;
+mod eager_fasl;
 #[cfg(all(
     test,
     any(
@@ -21120,6 +21121,9 @@ fn load_bbu_definitions(
                 // Keep the function object's tier metadata tied to this loaded
                 // definition; publication has already invalidated old native code.
                 egcl_rt::function::set_tier(fn_obj, 0);
+                if !restoring {
+                    eager_fasl::promote(sym, fn_obj);
+                }
                 last = symbol;
             }
             4 => {
