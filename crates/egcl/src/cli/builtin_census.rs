@@ -62,25 +62,34 @@ pub(crate) fn enabled() -> bool {
     match STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
-        _ => {
-            let on = std::env::var_os("EGCL_BUILTIN_CENSUS").is_some();
-            STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
+        _ => initialize(),
     }
 }
 
-/// Count one call of `symbol` with `nargs` arguments through `route`.
-#[inline]
+#[cold]
+#[inline(never)]
+fn initialize() -> bool {
+    let on = std::env::var_os("EGCL_BUILTIN_CENSUS").is_some();
+    STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+/// Count one call of `symbol` with `nargs` arguments through `route`. Only a
+/// relaxed load and a branch are inlined into the counted paths.
+#[inline(always)]
 pub(crate) fn note(symbol: u32, route: Route, nargs: usize) {
-    if !enabled() {
+    if STATE.load(Ordering::Relaxed) == 1 {
         return;
     }
     note_slow(symbol, route, nargs);
 }
 
 #[cold]
+#[inline(never)]
 fn note_slow(symbol: u32, route: Route, nargs: usize) {
+    if !enabled() {
+        return;
+    }
     let nargs = u8::try_from(nargs).unwrap_or(u8::MAX);
     if let Ok(mut counts) = COUNTS.lock() {
         *counts
