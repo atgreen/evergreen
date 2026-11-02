@@ -22199,6 +22199,11 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                 // stops being a plain builtin stops being dispatched as one.
                 // `None` from either step falls through to the general path,
                 // which is always correct.
+                super::builtin_census::note(
+                    sym,
+                    super::builtin_census::Route::T0,
+                    nargs as usize,
+                );
                 let direct = match (fn_val == EgclVal::from_symbol_index(sym))
                     .then(|| super::direct_builtin_slot_memoized(sym, nargs as usize))
                     .flatten()
@@ -24224,8 +24229,13 @@ extern "C" fn c2i_call_builtin_regs(
     if n > 3 {
         return NIL.0;
     }
+    super::builtin_census::note(
+        idx_and_sym as u32,
+        super::builtin_census::Route::T2Direct,
+        n as usize,
+    );
     let storage = [EgclVal(a0), EgclVal(a1), EgclVal(a2)];
-    c2i_call_builtin(idx_and_sym, n, storage.as_ptr(), baked_gen)
+    c2i_call_builtin_impl(idx_and_sym, n, storage.as_ptr(), baked_gen)
 }
 
 /// Install the direct-builtin hooks into the T2 emitter. The builtin table
@@ -24356,6 +24366,15 @@ extern "C" fn c2i_call_builtin(
     args: *const EgclVal,
     baked_gen: u64,
 ) -> u64 {
+    super::builtin_census::note(
+        idx_and_sym as u32,
+        super::builtin_census::Route::T1Direct,
+        n as usize,
+    );
+    c2i_call_builtin_impl(idx_and_sym, n, args, baked_gen)
+}
+
+fn c2i_call_builtin_impl(idx_and_sym: u64, n: u64, args: *const EgclVal, baked_gen: u64) -> u64 {
     let sym = idx_and_sym & 0xFFFF_FFFF;
     let slot = (idx_and_sym >> 32) as u32;
     // An unrelated definition changes the coarse generation too. Revalidate
@@ -24501,6 +24520,7 @@ fn c2i_call_result(sym: u64, args: &[EgclVal], profile_site: u64) -> Result<Egcl
 }
 
 fn c2i_call_args(sym: u64, args: &[EgclVal], profile_site: u64) -> u64 {
+    super::builtin_census::note(sym as u32, super::builtin_census::Route::C2i, args.len());
     finish_c2i_call(c2i_call_result(sym, args, profile_site))
 }
 

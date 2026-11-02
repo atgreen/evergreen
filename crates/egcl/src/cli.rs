@@ -29,6 +29,7 @@ mod class_protocol;
 mod control_payload;
 mod env_counts;
 mod evaluated_builtins;
+pub mod builtin_census;
 pub mod events;
 mod generic_binding;
 mod generic_call;
@@ -29675,6 +29676,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
             "EGCL-EXT:SPROF-STOP" => {
                 let _ = eval_args(cdr, env)?;
                 sprof::stop();
+                builtin_census::write_window();
                 return Ok(EgclVal::from_fixnum(sprof::sample_count() as i64));
             }
             "EGCL-EXT:SPROF-FOLD" => {
