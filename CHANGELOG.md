@@ -4,6 +4,10 @@
 
 ### Added
 
+- Add opt-in execution-context linkage for ordinary x86-64 Linux calls with
+  `EGCL_R13_CALL_LINKAGE=1`
+  ([#982](https://github.com/atgreen/evergreen/pull/982)).
+
 - Add opt-in eager T1 compilation for named FASL-loaded functions and their
   nested closure templates with `EGCL_FASL_EAGER_T1=1`
   ([#981](https://github.com/atgreen/evergreen/pull/981)).

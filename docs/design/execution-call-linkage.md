@@ -42,7 +42,8 @@ validation also covers allocating adapters, actual relocation, suspension,
 redefinition, arity and multiple values.
 
 The predeclared release comparison uses five fresh-process samples per mode
-with balanced ordering and two million warmed calls. Reporting gates are
+with balanced ordering, twenty million warmed calls for fast call cohorts and
+two million for an escaping private-array allocation cohort. Reporting gates are
 3% CPU overhead for lean named calls, 10% for descriptor/private-primitive
 calls and 15% for instructions where measurement is available. A missed gate
 does not justify changing the default or weakening correctness checks.
