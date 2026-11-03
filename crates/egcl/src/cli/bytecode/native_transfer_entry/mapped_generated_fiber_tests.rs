@@ -132,7 +132,7 @@ fn generated_fiber() -> EgclVal {
     let (symbol, outer) = install_mapped(
         &mut env,
         "GENERATED-HOT-FIBER-OUTER",
-        "(a b c d &key (seed (1+ 0)))",
+        "(a b c d &key (seed (1+ 0)) &aux (u 0))",
         "(progn (generated-hot-fiber-middle 1 2 3 4) (generated-hot-fiber-middle d c b a))",
     );
     assert!(owner(&outer).ordinary_entry.is_none());
