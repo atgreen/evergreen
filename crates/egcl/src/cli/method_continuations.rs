@@ -844,6 +844,13 @@ static RELOCATE_NEXT_TAIL: egcl_rt::execution_local::ExecutionLocal<std::cell::C
 mod tests {
     use super::*;
 
+    // These units intentionally use raw Env, without installing the prelude's
+    // shared global function cells. Spell DEFVAR/DEFPARAMETER's boot.lisp
+    // primitive expansions below, retaining proclamation/BOUNDP ordering and
+    // raw symbol identity. The generic-name check likewise uses the canonical
+    // primitive delegated to by EGCL-MOP:GENERIC-FUNCTION-NAME. Public wrapper
+    // and boot coverage belong to the CLI integration tests.
+
     #[test]
     fn uninterned_generic_snapshot_retains_name_identity_across_calls() {
         let _lock = heap_test_lock()
@@ -863,7 +870,7 @@ mod tests {
          (equal (funcall (fdefinition name) 3) '(3))
          (equal (funcall saved 4) '(4))
          (fboundp name)
-         (eq (generic-function-name saved) name))))
+         (eq (%generic-function-name saved) name))))
 "#,
             &mut env,
         )
@@ -904,10 +911,12 @@ mod tests {
         egcl_rt::rooted_ref!(_env = &mut env);
         read_eval_all_env(
             r#"
-(defvar *retired-later* nil)
+(%proclaim-special '(*retired-later*))
+(unless (boundp '*retired-later*) (setq *retired-later* nil))
 (defgeneric retire-later (object))
 (defmethod retire-later (object) :old)
-(defparameter *old-later* (find-method #'retire-later nil (list (find-class 't))))
+(%proclaim-special '(*old-later*))
+(setq *old-later* (find-method #'retire-later nil (list (find-class 't))))
 (defun replace-later-once ()
   (unless *retired-later*
     (setf *retired-later* t)
@@ -930,14 +939,26 @@ mod tests {
             ids.iter().any(|id| !method_context_unused(*id)),
             "mutable user call conservatively retains context"
         );
+        let old_primary = env.methods.borrow()["RETIRE-LATER"]
+            .iter()
+            .find(|method| method.qualifier == egcl_stdlib::MethodQualifier::Primary)
+            .unwrap()
+            .method_id;
         ENCODINGS.with(|count| count.set(0));
         assert_eq!(
             read_eval_all_env("(retire-later 1)", &mut env).unwrap(),
             resolve_sym(":OLD").unwrap()
         );
+        assert_eq!(
+            ENCODINGS.with(std::cell::Cell::get),
+            0,
+            "retained source context needs no serialization without a lexical consumer"
+        );
         assert!(
-            ENCODINGS.with(std::cell::Cell::get) > 0,
-            "retired later body really used its original source context"
+            !env.methods.borrow()["RETIRE-LATER"]
+                .iter()
+                .any(|method| method.method_id == old_primary),
+            "the before method actually retired the old primary"
         );
         assert_eq!(
             read_eval_all_env("(retire-later 2)", &mut env).unwrap(),
@@ -956,7 +977,8 @@ mod tests {
             r#"
 (defgeneric remove-later (object))
 (defmethod remove-later (object) :original)
-(defparameter *remove-later-primary* (find-method #'remove-later nil (list (find-class 't))))
+(%proclaim-special '(*remove-later-primary*))
+(setq *remove-later-primary* (find-method #'remove-later nil (list (find-class 't))))
 (defmethod remove-later :before (object)
   (remove-method #'remove-later *remove-later-primary*))
 "#,
@@ -971,14 +993,26 @@ mod tests {
             ids.iter().all(|id| method_context_unused(*id)),
             "canonical removal and constant bodies have actual no-use proofs"
         );
+        let old_primary = env.methods.borrow()["REMOVE-LATER"]
+            .iter()
+            .find(|method| method.qualifier == egcl_stdlib::MethodQualifier::Primary)
+            .unwrap()
+            .method_id;
         ENCODINGS.with(|count| count.set(0));
         assert_eq!(
             read_eval_all_env("(remove-later 1)", &mut env).unwrap(),
             resolve_sym(":ORIGINAL").unwrap()
         );
+        assert_eq!(
+            ENCODINGS.with(std::cell::Cell::get),
+            0,
+            "the removing prefix retains the snapshot without serializing unused context"
+        );
         assert!(
-            ENCODINGS.with(std::cell::Cell::get) > 0,
-            "multi-method dispatch retains metadata before the removing prefix"
+            !env.methods.borrow()["REMOVE-LATER"]
+                .iter()
+                .any(|method| method.method_id == old_primary),
+            "the before method actually retired the old primary"
         );
     }
 
@@ -989,7 +1023,7 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         let mut env = Env::new(false);
         egcl_rt::rooted_ref!(_env = &mut env);
-        read_eval_all_env("(defclass no-proof-class () ((cell :initform 17 :accessor no-proof-cell))) (defparameter *no-proof-object* (make-instance 'no-proof-class))", &mut env).unwrap();
+        read_eval_all_env("(defclass no-proof-class () ((cell :initform 17 :accessor no-proof-cell))) (%proclaim-special '(*no-proof-object*)) (setq *no-proof-object* (make-instance 'no-proof-class))", &mut env).unwrap();
         let id = env.methods.borrow()["NO-PROOF-CELL"][0].method_id;
         let function = METHOD_COMPILED.borrow_mut().remove(&id.0);
         METHOD_CONTEXT_UNUSED.borrow_mut().remove(&id.0);
@@ -1008,7 +1042,7 @@ mod tests {
             0,
             "authoritative callback-free accessor does not need compiled proof"
         );
-        read_eval_all_env("(defvar *slot-protocol-effects* 0) (defmethod slot-unbound ((class standard-class) object (slot (eql 'cell))) (incf *slot-protocol-effects*) :handled) (slot-makunbound *no-proof-object* 'cell)", &mut env).unwrap();
+        read_eval_all_env("(%proclaim-special '(*slot-protocol-effects*)) (unless (boundp '*slot-protocol-effects*) (setq *slot-protocol-effects* 0)) (defmethod slot-unbound ((class standard-class) object (slot (eql 'cell))) (setq *slot-protocol-effects* (1+ *slot-protocol-effects*)) :handled) (slot-makunbound *no-proof-object* 'cell)", &mut env).unwrap();
         ENCODINGS.with(|count| count.set(0));
         assert_eq!(
             read_eval_all_env("(no-proof-cell *no-proof-object*)", &mut env).unwrap(),
@@ -1020,7 +1054,181 @@ mod tests {
         );
         assert!(
             ENCODINGS.with(std::cell::Cell::get) > 0,
-            "protocol fallback retains the original activation before callbacks"
+            "unproved accessor fallback retains its original context before protocol callbacks"
+        );
+    }
+
+    // Distinguish retaining a dispatch snapshot from serializing state for
+    // actual lexical next-method consumers. The simple cases above need none.
+    fn required_next_method_after_retirement(replace: bool) {
+        let _lock = heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        let name = if replace {
+            "needed-replace"
+        } else {
+            "needed-remove"
+        };
+        let replacement = if replace {
+            format!("(defmethod {name} (object) :new)")
+        } else {
+            "nil".to_owned()
+        };
+        read_eval_all_env(
+            &format!(
+                r#"
+(%proclaim-special '(*{name}-once* *{name}-old*))
+(setq *{name}-once* nil)
+(defgeneric {name} (object))
+(defmethod {name} (object) :old)
+(setq *{name}-old* (find-method #'{name} nil (list (find-class 't))))
+(defun {name}-once ()
+  (unless *{name}-once*
+    (setq *{name}-once* t)
+    (remove-method #'{name} *{name}-old*)
+    {replacement}))
+(defmethod {name} :before (object) ({name}-once))
+"#
+            ),
+            &mut env,
+        )
+        .unwrap();
+        let key = name.to_ascii_uppercase();
+        let original_ids: Vec<_> = env.methods.borrow()[key.as_str()]
+            .iter()
+            .map(|method| method.method_id)
+            .collect();
+        let old_primary = env.methods.borrow()[key.as_str()]
+            .iter()
+            .find(|method| method.qualifier == egcl_stdlib::MethodQualifier::Primary)
+            .unwrap()
+            .method_id;
+        assert!(
+            method_context_unused(old_primary),
+            "original constant primary has no-use proof"
+        );
+        read_eval_all_env(
+            &format!("(defmethod {name} ((object integer)) (call-next-method))"),
+            &mut env,
+        )
+        .unwrap();
+        let delegate = env.methods.borrow()[key.as_str()]
+            .iter()
+            .find(|method| !original_ids.contains(&method.method_id))
+            .unwrap()
+            .method_id;
+        assert!(
+            !method_context_unused(delegate),
+            "actual next-method consumer requires owned context"
+        );
+        ENCODINGS.with(|count| count.set(0));
+        assert_eq!(
+            read_eval_all_env(&format!("({name} 1)"), &mut env).unwrap(),
+            resolve_sym(":OLD").unwrap()
+        );
+        assert!(
+            ENCODINGS.with(std::cell::Cell::get) > 0,
+            "lexical CALL-NEXT-METHOD serializes its retained invocation"
+        );
+        assert!(
+            !env.methods.borrow()[key.as_str()]
+                .iter()
+                .any(|method| method.method_id == old_primary),
+            "the prefix really retired the primary reached by the saved continuation"
+        );
+        if replace {
+            assert_eq!(
+                read_eval_all_env(&format!("({name} 2)"), &mut env).unwrap(),
+                resolve_sym(":NEW").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn before_replacement_serializes_required_next_method_context() {
+        required_next_method_after_retirement(true);
+    }
+
+    #[test]
+    fn before_removal_serializes_required_next_method_context() {
+        required_next_method_after_retirement(false);
+    }
+
+    #[test]
+    fn protocol_callback_serializes_observed_next_method_state() {
+        let _lock = heap_test_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut env = Env::new(false);
+        egcl_rt::rooted_ref!(_env = &mut env);
+        read_eval_all_env(
+            r#"
+(defclass needed-protocol-class () ((value :initform 17 :accessor needed-protocol-value)))
+(%proclaim-special '(*needed-protocol-object* *needed-protocol-effects* *needed-protocol-next*))
+(setq *needed-protocol-object* (make-instance 'needed-protocol-class)
+      *needed-protocol-effects* 0 *needed-protocol-next* :not-called)
+"#,
+            &mut env,
+        )
+        .unwrap();
+        let id = env.methods.borrow()["NEEDED-PROTOCOL-VALUE"][0].method_id;
+        let function = METHOD_COMPILED.borrow_mut().remove(&id.0);
+        METHOD_CONTEXT_UNUSED.borrow_mut().remove(&id.0);
+        if let Some(function) = function {
+            set_compiled_method_cell(function, false);
+        }
+        assert!(ACCESSOR_METHODS.borrow().contains_key(&id.0));
+        assert!(!method_context_unused(id));
+        ENCODINGS.with(|count| count.set(0));
+        assert_eq!(
+            read_eval_all_env("(needed-protocol-value *needed-protocol-object*)", &mut env)
+                .unwrap(),
+            EgclVal::from_fixnum(17)
+        );
+        assert_eq!(
+            ENCODINGS.with(std::cell::Cell::get),
+            0,
+            "bound authoritative reader remains context-free"
+        );
+        read_eval_all_env(
+            r#"
+(defmethod slot-unbound ((class standard-class) object (slot (eql 'value)))
+  (setq *needed-protocol-next* (if (next-method-p) :has-next :no-next))
+  (setq *needed-protocol-effects* (1+ *needed-protocol-effects*))
+  :handled)
+(slot-makunbound *needed-protocol-object* 'value)
+"#,
+            &mut env,
+        )
+        .unwrap();
+        let protocol = env.methods.borrow()["SLOT-UNBOUND"]
+            .last()
+            .unwrap()
+            .method_id;
+        assert!(
+            !method_context_unused(protocol),
+            "observable lexical helper use requires real context"
+        );
+        ENCODINGS.with(|count| count.set(0));
+        assert_eq!(
+            read_eval_all_env("(needed-protocol-value *needed-protocol-object*)", &mut env)
+                .unwrap(),
+            resolve_sym(":HANDLED").unwrap()
+        );
+        assert_eq!(
+            read_eval_all_env("*needed-protocol-effects*", &mut env).unwrap(),
+            EgclVal::from_fixnum(1)
+        );
+        egcl_rt::rooted!(seen = read_eval_all_env("*needed-protocol-next*", &mut env).unwrap());
+        assert!(
+            *seen == resolve_sym(":HAS-NEXT").unwrap() || *seen == resolve_sym(":NO-NEXT").unwrap(),
+            "helper result is observable without assuming absence of builtin fallback"
+        );
+        assert!(
+            ENCODINGS.with(std::cell::Cell::get) > 0,
+            "protocol callback serializes context actually read by NEXT-METHOD-P"
         );
     }
 
