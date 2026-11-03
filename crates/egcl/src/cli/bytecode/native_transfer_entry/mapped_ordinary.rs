@@ -395,25 +395,58 @@ pub(super) unsafe fn call(
     env: &mut Env,
     cell: Option<u64>,
 ) -> Option<Result<EgclVal, EgclError>> {
+    use crate::cli::activation_census::AdmissionReason as Reason;
+    let decline = |reason| {
+        crate::cli::activation_census::admission(reason, || {
+            (
+                code.installed_symbol,
+                Some(code.census_shape()),
+                Some(code.census_entry()),
+            )
+        });
+        None
+    };
     let parent = CAPTURE.with(Cell::get);
-    if parent.is_null() || !current_poll_idle() || native_error_pending() {
-        return None;
+    if parent.is_null() {
+        return decline(Reason::BridgeNoContext);
     }
-    // Only a managed mapped activation owns this reusable lane. An ordinary
-    // activation or a compatibility reentry keeps its authoritative old path.
-    if unsafe { (*parent).ordinary_bridge || (*(*parent).owner).ordinary_entry.is_some() }
-        || !code.body.self_call_sites.is_empty()
-    {
-        return None;
+    if !current_poll_idle() {
+        return decline(Reason::BridgePollPending);
+    }
+    if native_error_pending() {
+        return decline(Reason::BridgeNativeError);
+    }
+    // Same ordered checks as before. These reasons describe the context's
+    // capabilities; caller identity comes only from the checked request's PC.
+    if unsafe { (*parent).ordinary_bridge } {
+        return decline(Reason::BridgeContextIsBridge);
+    }
+    if unsafe { (*(*parent).owner).ordinary_entry.is_some() } {
+        return decline(Reason::BridgeContextHasOrdinaryEntry);
+    }
+    if !code.body.self_call_sites.is_empty() {
+        return decline(Reason::BridgeSelfCalls);
     }
     let slot = unsafe { (*parent).mapped_ordinary };
-    if slot.is_null() || args.len() != usize::from(code.body.arity) {
-        return None;
+    if slot.is_null() {
+        return decline(Reason::BridgeNoLanes);
+    }
+    if args.len() != usize::from(code.body.arity) {
+        return decline(Reason::BridgeArity);
     }
     if code.native_callable_slot.is_some() && !code.accepts_explicit_callable(function) {
-        return None;
+        return decline(Reason::BridgeReceiver);
     }
-    let execution = egcl_rt::thread::current_execution_context_for_native()?;
+    let Some(execution) = egcl_rt::thread::current_execution_context_for_native() else {
+        return decline(Reason::BridgeNoExecution);
+    };
+    crate::cli::activation_census::admission(Reason::BridgeEligible, || {
+        (
+            code.installed_symbol,
+            Some(code.census_shape()),
+            Some(code.census_entry()),
+        )
+    });
     // No Rust borrow of the GC-scanned cache survives an allocating callee.
     // Generated pointers remain limited to their first four stable slots.
     // Append-only Rust spill leases reuse context/body roots within a parent;

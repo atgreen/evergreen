@@ -115,6 +115,7 @@ impl ActivationState {
                     variadic: code.body.variadic,
                 },
                 recycle,
+                || code.census_entry(),
             );
         }
     }

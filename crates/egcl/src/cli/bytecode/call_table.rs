@@ -857,7 +857,9 @@ pub(super) unsafe fn lean_native_target(
     usize,
 )> {
     let state = unsafe { state(cell) };
+    use crate::cli::activation_census::AdmissionReason as Reason;
     if state.cell.is_cold() {
+        note_lean_admission(Reason::SelectorCold, state.symbol, None);
         return None;
     }
     let target = state.target.borrow();
@@ -867,34 +869,93 @@ pub(super) unsafe fn lean_native_target(
         promote,
     }) = target.as_ref()
     else {
+        note_non_native_admission(state.symbol, target.as_ref());
         return None;
     };
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        note_lean_admission(Reason::SelectorNonMapped, state.symbol, Some(code));
         return None;
     };
     // Preserve the old T2 cohort. For T1 the threshold call still belongs to
     // cold dispatch, which owns scheduling/publishing the replacement tier.
-    if (code.is_t2 && *promote)
-        || (!code.is_t2
-            && (!t1_ordinary_child_enabled()
-                || !fixed_ordinary_child_shape(code)
-                || (*promote && promotion_due(*function))))
-        || mapped.needs_recompile()
-        || !code
-            .body
-            .as_ref()
-            .is_some_and(|body| arity_accepts(body, nargs))
-        || NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap()
+    let decline = |reason| {
+        note_lean_admission(reason, state.symbol, Some(code));
+        None
+    };
+    if code.is_t2 && *promote {
+        return decline(Reason::SelectorT2Promote);
+    }
+    if !code.is_t2 {
+        if !t1_ordinary_child_enabled() {
+            return decline(Reason::SelectorT1Disabled);
+        }
+        if !fixed_ordinary_child_shape(code) {
+            return decline(Reason::SelectorT1Shape);
+        }
+        if *promote && promotion_due(*function) {
+            return decline(Reason::SelectorPromotion);
+        }
+    }
+    if mapped.needs_recompile() {
+        return decline(Reason::SelectorRecompile);
+    }
+    if !code
+        .body
+        .as_ref()
+        .is_some_and(|body| arity_accepts(body, nargs))
     {
-        return None;
+        return decline(Reason::SelectorArity);
+    }
+    if NATIVE_DEPTH.with(|depth| depth.get()) >= native_depth_cap() {
+        return decline(Reason::SelectorDepth);
     }
     // This excludes optional/variadic binding and T1 loops that need a mapped
     // OSR companion. Every rejection above or here leaves warm's count intact.
-    let offset = mapped.lean_root_entry()?;
+    let Some(offset) = mapped.lean_root_entry() else {
+        return decline(Reason::SelectorNoLeanEntry);
+    };
     if !code.is_t2 && !profiling_disabled() {
         egcl_rt::function::record_invocation(*function);
     }
+    note_lean_admission(Reason::SelectorAccepted, state.symbol, Some(code));
     Some((Rc::clone(mapped), *function, state.symbol, offset))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[inline]
+fn note_non_native_admission(symbol: u32, target: Option<&Target>) {
+    use crate::cli::activation_census::{self, AdmissionReason as Reason};
+    if !activation_census::origins_enabled() {
+        return;
+    }
+    let reason = match target {
+        None => Reason::SelectorMissingTarget,
+        Some(Target::Function(_)) => Reason::SelectorFunctionTarget,
+        Some(Target::Bytecode { .. }) => Reason::SelectorBytecodeTarget,
+        Some(Target::Builtin { .. }) => Reason::SelectorBuiltinTarget,
+        _ => Reason::SelectorOtherTarget,
+    };
+    note_lean_admission(reason, symbol, None);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[inline]
+fn note_lean_admission(
+    reason: crate::cli::activation_census::AdmissionReason,
+    symbol: u32,
+    native: Option<&NativeCode>,
+) {
+    crate::cli::activation_census::admission(reason, || {
+        let mapped = native.and_then(|native| match &native._storage {
+            NativeCodeStorage::Mapped(code) => Some(code),
+            _ => None,
+        });
+        (
+            Some(symbol),
+            mapped.map(|code| code.census_shape()),
+            mapped.map(|code| code.census_entry()),
+        )
+    });
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Activation census diagnostics can report exact native-call admission reasons
+  and installed argument metadata, keeping eligibility events separate from
+  managed preparation counts
+  ([#994](https://github.com/atgreen/evergreen/pull/994)).
+
 - Inherited shared-slot writes and unbinds update the defining class cell when
   queried through a subclass ([#999](https://github.com/atgreen/evergreen/pull/999)).
 
