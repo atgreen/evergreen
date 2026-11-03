@@ -7851,14 +7851,15 @@ fn runtime_class_slot_cell(env: &Env, class: EgclVal, slot_name: &str) -> Option
 }
 
 fn runtime_write_class_slot(env: &Env, class: EgclVal, slot_name: &str, value: Option<EgclVal>) {
-    let owner = runtime_class_slot_owner(env, class, slot_name).unwrap_or(class);
+    // Ownership lookup and cell keys must use the same slot spelling. A
+    // qualified query otherwise misses the inherited bare-name declaration and
+    // falls back to the receiver's class, splitting its superclass's cell.
+    let slot_name = symbol_bare_name(slot_name);
+    let owner = runtime_class_slot_owner(env, class, &slot_name).unwrap_or(class);
     if let Some(cells) = egcl_stdlib::clos::class_runtime_shared_cells(owner).or_else(|| {
         runtime_class_definition(env, owner).map(|definition| definition.class_slot_values)
     }) {
-        cells
-            .lock()
-            .unwrap()
-            .insert(symbol_bare_name(slot_name), value);
+        cells.lock().unwrap().insert(slot_name, value);
     }
 }
 

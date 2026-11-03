@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Inherited shared-slot writes and unbinds update the defining class cell when
+  queried through a subclass ([#999](https://github.com/atgreen/evergreen/pull/999)).
+
 - Empty NIL-element string comparisons honor active length for displaced and
   fill-pointer vectors ([#996](https://github.com/atgreen/evergreen/pull/996)).
 
