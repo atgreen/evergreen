@@ -34,6 +34,10 @@ use activation::ActivationState;
 pub(super) use activation::fail_next_guard_reservation_for_test;
 #[cfg(test)]
 pub(super) use activation::take_fresh_prepares_for_test;
+#[cfg(test)]
+pub(super) use activation::{
+    activation_counts_for_test, start_activation_counts_for_test, take_activation_counts_for_test,
+};
 use condition_osr::{relocate_condition_clusters, validate_condition_clusters};
 use special_bindings::{SavedSpecial, special_request, validate_special_bindings};
 mod deopt;
@@ -80,6 +84,8 @@ pub(super) use background_compilation::{
     CompiledT1, EmissionContext, PreparedT1, compile_background_t1, install_background_t1,
     prepare_background_t1,
 };
+#[cfg(test)]
+mod mapped_funcall_fiber_tests;
 mod mapped_generated;
 #[cfg(test)]
 mod mapped_generated_fiber_tests;
@@ -425,6 +431,7 @@ pub(super) struct TransferCode {
     /// whole struct (bliss-nkzx6).
     #[allow(clippy::vec_box)]
     state_pool: std::cell::RefCell<Vec<Box<ActivationState>>>,
+    bridge_pool: mapped_ordinary::Pool,
     /// Cache state has no strong code edge. Dirty weak tokens cover current,
     /// retired and externally retained code without a registry ownership cycle.
     callable_cache: Rc<CallableIdentityCache>,
@@ -804,10 +811,23 @@ unsafe extern "C" fn checked_call_published(
     }
 }
 
-/// A mapped caller's named call whose warm target is installed ordinary T2
-/// code enters that code's lean root directly, as the checked call would after
-/// `warm` and `run_native_callable` selected it (GitHub #487). Returns `false`,
-/// having done nothing, for every other target.
+/// Only generated adapter records authorize borrowing a mapped parent's
+/// bridge. A registered Rust outer record has host roots but no generated
+/// caller publication, even if an older mapped CAPTURE is still live.
+///
+/// # Safety
+/// `record` is a live mapped adapter record, as for checked_call_published.
+pub(super) unsafe fn generated_mapped_ingress(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) -> bool {
+    !unsafe { super::native_callable::outer::owns_record(record) }
+}
+
+/// A named call whose warm target has an eligible ordinary T1/T2 entry
+/// enters its native bridge only with generated mapped provenance; a Rust
+/// outer call retains the valid lean root ingress. The selector owns canonical
+/// T1 invocation credit and declines at its promotion boundary. Returns false,
+/// having done nothing, for other targets.
 ///
 /// # Safety
 /// As for `checked_call_published`, whose publication must be live.
@@ -827,7 +847,8 @@ unsafe fn call_lean_target(
     }
     #[cfg(test)]
     LEAN_TARGET_CALLS.with(|count| count.set(count.get() + 1));
-    // The caller's published, scanned activation owns these argument words.
+    // Generated callers publish their scanned activation; registered Rust
+    // outer callers instead retain explicit host roots for these words.
     let args = if invocation.nargs == 0 {
         &[]
     } else {
@@ -842,8 +863,17 @@ unsafe fn call_lean_target(
             symbol
         };
         egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(instance));
-        if let Some(result) =
-            unsafe { mapped_ordinary::call(&code, offset, function, args, &mut *env, cell) }
+        if unsafe { generated_mapped_ingress(record) }
+            && let Some(result) = unsafe {
+                mapped_ordinary::call(
+                    &code,
+                    offset,
+                    function,
+                    args,
+                    &mut *env,
+                    code.is_t2.then_some(cell),
+                )
+            }
         {
             result
         } else {
@@ -1303,6 +1333,7 @@ impl TransferCode {
     }
 
     pub(super) fn retire_private_entries(&self) {
+        self.bridge_pool.retire();
         // The template pairs this code claimed stop naming it first.
         let claims = std::mem::take(&mut *self.template_claims.borrow_mut());
         for claim in &claims {
@@ -5462,6 +5493,7 @@ struct CaptureContext {
     generated: *mut egcl_compiler::t2::native_transfer::GeneratedActivation,
     generated_owner: Option<Box<mapped_generated::Prepared>>,
     ordinary_bridge: bool,
+    bridge_clean_return: *mut bool,
     mapped_ordinary: *mut mapped_ordinary::Lanes,
     osr: Option<(Rc<NativeCode>, usize)>,
     ready_osr: *mut Option<Box<ActivationState>>,

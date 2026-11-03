@@ -11,83 +11,202 @@
 use super::*;
 use egcl_rt::gc::TraceHostRoots;
 
-pub(super) type Lanes = Vec<std::pin::Pin<Box<Bridge>>>;
+pub(super) type Lanes = Vec<Lease>;
 
-/// This box belongs to one live mapped activation, not to a global cache or a
-/// code pool. Its self-referential context points only into separately boxed
-/// state/children, which never move while the parent is rooted.
-pub(super) struct Bridge {
+/// Only the live parent owns code and Lisp roots. Idle storage has neither a
+/// strong code edge nor an ActiveBytecodeRoot, avoiding a code/pool cycle.
+pub(super) struct Lease {
     pub(super) code: Rc<TransferCode>,
-    pub(super) body: super::super::ActiveBytecodeRoot,
+    body: super::super::ActiveBytecodeRoot,
+    storage: Option<std::pin::Pin<Box<Bridge>>>,
+}
+
+/// Execution-local through its TransferCode owner. Only pristine, code-free
+/// storage is retained, bounded independently of the number of parent calls.
+#[derive(Default)]
+pub(super) struct Pool {
+    idle: RefCell<Vec<std::pin::Pin<Box<Bridge>>>>,
+    retired: Cell<bool>,
+}
+impl Pool {
+    pub(super) fn retire(&self) {
+        self.retired.set(true);
+        self.idle.borrow_mut().clear();
+    }
+}
+
+/// Keep the context allocation, but no initialized context or stale execution
+/// pointers while idle. Every lease rebuilds it from the current Env/frame.
+pub(super) struct ContextHome {
+    slot: Box<std::mem::MaybeUninit<CaptureContext>>,
+    live: bool,
+}
+impl ContextHome {
+    fn new() -> Self {
+        Self {
+            slot: Box::new(std::mem::MaybeUninit::uninit()),
+            live: false,
+        }
+    }
+    fn initialize(&mut self, context: CaptureContext) {
+        self.clear();
+        self.slot.write(context);
+        self.live = true;
+    }
+    pub(super) fn get_mut(&mut self) -> &mut CaptureContext {
+        assert!(self.live);
+        unsafe { self.slot.assume_init_mut() }
+    }
+    fn clear(&mut self) {
+        if self.live {
+            self.live = false;
+            // No native frame or generated publication can retain this home.
+            unsafe { self.slot.assume_init_drop() };
+        }
+    }
+}
+impl std::ops::Deref for ContextHome {
+    type Target = CaptureContext;
+    fn deref(&self) -> &CaptureContext {
+        assert!(self.live);
+        unsafe { self.slot.assume_init_ref() }
+    }
+}
+impl std::ops::DerefMut for ContextHome {
+    fn deref_mut(&mut self) -> &mut CaptureContext {
+        assert!(self.live);
+        unsafe { self.slot.assume_init_mut() }
+    }
+}
+impl Drop for ContextHome {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// Pinned code-free backing; all generated pointers refer into this storage,
+/// never into a movable Lease. It owns no Lisp roots once detached.
+pub(super) struct Bridge {
     pub(super) state: Option<Box<ActivationState>>,
     pub(super) children: Box<SegmentActivations>,
-    pub(super) context: Box<CaptureContext>,
+    pub(super) context: ContextHome,
     pub(super) function: EgclVal,
     pub(super) args: EntryArgs,
     pub(super) instance: u32,
     pub(super) busy: bool,
     pub(super) generated: Option<egcl_compiler::t2::native_transfer::GeneratedLane>,
     pub(super) dispatch_function: EgclVal,
+    clean_return: bool,
 }
 
-impl TraceHostRoots for Bridge {
+impl TraceHostRoots for Lease {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         self.body.trace_host_roots(visit);
-        if let Some(state) = &mut self.state {
+        let bridge = self.storage.as_mut().unwrap().as_mut().get_mut();
+        if let Some(state) = &mut bridge.state {
             state.trace_host_roots(visit);
         }
-        self.children.trace_host_roots(visit);
-        visit(&mut self.function);
-        visit(&mut self.dispatch_function);
-        self.args.trace_host_roots(visit);
-        if self.busy {
-            super::super::ActiveCallableRoot(self.instance).trace_host_roots(visit);
+        bridge.children.trace_host_roots(visit);
+        visit(&mut bridge.function);
+        visit(&mut bridge.dispatch_function);
+        bridge.args.trace_host_roots(visit);
+        if bridge.busy {
+            super::super::ActiveCallableRoot(bridge.instance).trace_host_roots(visit);
         }
     }
 }
 
-impl Bridge {
-    fn new(
-        code: Rc<TransferCode>,
-        env: &mut Env,
-        frame: *mut Frame,
-    ) -> Result<Box<Self>, EgclError> {
-        // Rust-only reservations, on the mapped caller's published side.
-        let mut state = ActivationState::native_child(env);
-        let mut children = Box::<SegmentActivations>::default();
-        let mut context =
-            Box::new(state.context(&code, frame, &mut *children, std::ptr::null_mut()));
-        context.ordinary_bridge = true;
-        // Borrow the REAL mapped parent frame only as the logical/debug
-        // attachment. No managed callee frame is created or enriched; the
-        // explicit bridge marker always selects native-child reconstruction.
-        context.activation = std::ptr::null_mut();
-        let body = super::super::ActiveBytecodeRoot::new(&code.body);
+fn pooling_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EGCL_MAPPED_BRIDGE_POOL").as_deref() != Some("0".as_ref()))
+}
+impl Lease {
+    fn new(code: Rc<TransferCode>, env: &mut Env, frame: *mut Frame) -> Self {
         #[cfg(test)]
         PREPARES.with(|count| count.set(count.get() + 1));
-        Ok(Box::new(Self {
+        let cached = if pooling_enabled() && !code.bridge_pool.retired.get() {
+            code.bridge_pool.idle.borrow_mut().pop()
+        } else {
+            None
+        };
+        let mut storage = cached.unwrap_or_else(|| {
+            #[cfg(test)]
+            STORAGE_BIRTHS.with(|count| count.set(count.get() + 1));
+            Box::pin(Bridge {
+                state: Some(ActivationState::native_child(env)),
+                children: Box::default(),
+                context: ContextHome::new(),
+                function: NIL,
+                args: EntryArgs::new(&[]),
+                instance: u32::MAX,
+                busy: false,
+                generated: None,
+                dispatch_function: NIL,
+                clean_return: false,
+            })
+        });
+        let bridge = storage.as_mut().get_mut();
+        let state = bridge.state.as_mut().unwrap();
+        state.catch_base = env.catch_stack.len();
+        let mut context = state.context(&code, frame, &mut *bridge.children, std::ptr::null_mut());
+        context.ordinary_bridge = true;
+        context.activation = std::ptr::null_mut();
+        context.bridge_clean_return = &mut bridge.clean_return;
+        bridge.context.initialize(context);
+        let body = super::super::ActiveBytecodeRoot::new(&code.body);
+        Self {
             code,
             body,
-            state: Some(state),
-            children,
-            context,
-            function: NIL,
-            args: EntryArgs::new(&[]),
-            instance: u32::MAX,
-            busy: false,
-            generated: None,
-            dispatch_function: NIL,
-        }))
+            storage: Some(storage),
+        }
+    }
+    pub(super) fn bridge(&self) -> &Bridge {
+        self.storage.as_ref().unwrap().as_ref().get_ref()
+    }
+    fn bridge_mut(&mut self) -> &mut Bridge {
+        self.storage.as_mut().unwrap().as_mut().get_mut()
     }
 }
-
-impl Drop for Bridge {
+impl Drop for Lease {
     fn drop(&mut self) {
-        // The parent has retired the lane; no context can still reference its
-        // ledgers. Return only quiescent buffers to the existing code pool.
-        if let Some(state) = self.state.take() {
-            state.recycle(&self.code);
+        let mut storage = self.storage.take().unwrap();
+        let bridge = storage.as_mut().get_mut();
+        let context = &*bridge.context;
+        let clean = !std::thread::panicking()
+            && bridge.clean_return
+            && !bridge.busy
+            && bridge.children.is_empty()
+            && bridge.state.as_ref().unwrap().is_pristine_native_child()
+            && context.selected.is_none()
+            && context.failure.is_none()
+            && context.osr.is_none()
+            && context.recursive.is_null()
+            && !context.recursive_escape
+            && !context.completed_deopt
+            && context.completed_cleanup.is_none();
+        if !clean {
+            // Preserve the old dirty destruction order: state (including
+            // outstanding specials), children, then the still-live context.
+            // The live lease keeps code/body valid until all three drop.
+            return;
         }
+        // Parent generated bindings have already retired before lane storage.
+        // Drop controls/publication before exposing the backing to another lease.
+        bridge.generated = None;
+        bridge.context.clear();
+        bridge.function = NIL;
+        bridge.dispatch_function = NIL;
+        bridge.args = EntryArgs::new(&[]);
+        bridge.instance = u32::MAX;
+        bridge.clean_return = false;
+        bridge.state.as_mut().unwrap().catch_base = 0;
+        if pooling_enabled() && !self.code.bridge_pool.retired.get() {
+            let mut pool = self.code.bridge_pool.idle.borrow_mut();
+            if pool.len() < 4 {
+                pool.push(storage);
+            }
+        }
+        // Native-child backing never enters the general managed-state pool.
     }
 }
 
@@ -97,6 +216,27 @@ static ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
 #[cfg(test)]
 static PREPARES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+// PREPARES counts live lane/context initializations, including pool hits.
+// STORAGE_BIRTHS counts the four backing allocations only, never context reset.
+#[cfg(test)]
+static STORAGE_BIRTHS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_storage_births_for_test() -> usize {
+    STORAGE_BIRTHS.with(|count| count.replace(0))
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn idle_storage_for_test(code: &TransferCode) -> (usize, usize) {
+    let pool = code.bridge_pool.idle.borrow();
+    (
+        pool.len(),
+        pool.first().map_or(0, |bridge| {
+            bridge.as_ref().get_ref() as *const Bridge as usize
+        }),
+    )
+}
+
 pub(super) fn entry_counter() -> *mut usize {
     #[cfg(test)]
     {
@@ -148,7 +288,7 @@ pub(super) unsafe fn call(
     function: EgclVal,
     args: &[EgclVal],
     env: &mut Env,
-    cell: u64,
+    cell: Option<u64>,
 ) -> Option<Result<EgclVal, EgclError>> {
     let parent = CAPTURE.with(Cell::get);
     if parent.is_null() || !current_poll_idle() || native_error_pending() {
@@ -178,7 +318,7 @@ pub(super) unsafe fn call(
     };
     let index = match cached {
         Some(index) => {
-            if unsafe { (&*slot)[index].busy } {
+            if unsafe { (&*slot)[index].bridge().busy } {
                 return None;
             }
             index
@@ -188,26 +328,29 @@ pub(super) unsafe fn call(
                 return None;
             }
             let frame = unsafe { (*parent).frame };
-            let bridge = match Bridge::new(Rc::clone(code), env, frame) {
-                Ok(bridge) => bridge,
-                Err(error) => return Some(Err(error)),
-            };
+            let bridge = Lease::new(Rc::clone(code), env, frame);
             let index = unsafe { (&*slot).len() };
-            unsafe { (&mut *slot).push(Box::into_pin(bridge)) };
+            unsafe { (&mut *slot).push(bridge) };
             index
         }
     };
-    let bridge = unsafe { (&mut *slot)[index].as_mut().get_mut() as *mut Bridge };
+    let bridge = unsafe { (&mut *slot)[index].bridge_mut() as *mut Bridge };
     // OSR may replace/grow the parent managed extent between calls.
-    unsafe { (*bridge).context.frame = (*parent).frame };
-    let result = unsafe { run(bridge, offset, function, args, env, execution) };
-    if result.is_ok() {
-        unsafe { mapped_generated::bind(parent, bridge, cell, offset) };
+    unsafe { (*bridge).context.get_mut().frame = (*parent).frame };
+    let result = unsafe { run(code, bridge, offset, function, args, env, execution) };
+    // Only callers that authorize generated reuse supply a named cell. T1
+    // keeps selecting/counting heat in Rust. A function-object call has no
+    // named descriptor cell: FUNCALL must not be bound as its target callee.
+    if result.is_ok()
+        && let Some(cell) = cell
+    {
+        unsafe { mapped_generated::bind(parent, bridge, code, cell, offset) };
     }
     Some(result)
 }
 
 unsafe fn run(
+    code: &Rc<TransferCode>,
     bridge: *mut Bridge,
     offset: usize,
     function: EgclVal,
@@ -216,7 +359,7 @@ unsafe fn run(
     execution: *const egcl_rt::exec_context::LispExecutionContext,
 ) -> Result<EgclVal, EgclError> {
     // Keep an immutable code lease independently of the GC-scanned bridge.
-    let code = unsafe { Rc::clone(&(*bridge).code) };
+    let code = Rc::clone(code);
     // Caller publication owns input words; copy while no Lisp can allocate.
     unsafe {
         (*bridge).function = function;
@@ -230,7 +373,8 @@ unsafe fn run(
             code.installed_symbol.unwrap_or(u32::MAX)
         };
         (*bridge).busy = true;
-        (*bridge).context.recursive_escape = false;
+        (*bridge).clean_return = false;
+        (*bridge).context.get_mut().recursive_escape = false;
         (*bridge).state.as_mut().unwrap().env_frame = if code.native_callable_slot.is_some() {
             closure_captured_env(function)
         } else {
@@ -238,7 +382,7 @@ unsafe fn run(
         };
     }
     let capture_slot = CAPTURE.with(std::ptr::from_ref);
-    let context = unsafe { std::ptr::from_mut(&mut *(*bridge).context) };
+    let context = unsafe { std::ptr::from_mut(&mut *(*bridge).context.get_mut()) };
     let previous = unsafe { (*capture_slot).replace(context) };
     let depth = NATIVE_DEPTH.with(Cell::as_ptr);
     let old_depth = unsafe { *depth };
@@ -346,7 +490,12 @@ unsafe fn run(
         && error.is_none()
         && unsafe { (*bridge).state.as_ref().unwrap().is_quiescent() }
     {
+        unsafe { (*bridge).clean_return = true };
         return Ok(outcome.value);
     }
     error.ok_or_else(invalid_capture).and_then(Err)
 }
+
+#[cfg(test)]
+#[path = "mapped_ordinary_pool_tests.rs"]
+mod pool_tests;

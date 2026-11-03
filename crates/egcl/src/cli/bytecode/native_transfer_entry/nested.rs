@@ -13,6 +13,11 @@ pub(super) struct SegmentActivations {
     active: Vec<Box<ChildActivation>>,
     pending_arguments: Vec<PendingArguments>,
 }
+impl SegmentActivations {
+    pub(super) fn is_empty(&self) -> bool {
+        self.active.is_empty() && self.pending_arguments.is_empty()
+    }
+}
 impl TraceHostRoots for SegmentActivations {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         for child in &mut self.active {

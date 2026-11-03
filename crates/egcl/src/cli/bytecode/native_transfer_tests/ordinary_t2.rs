@@ -86,7 +86,7 @@ pub(in crate::cli::bytecode) fn expect_entry(code: &NativeCode) {
     OBSERVED_ENTRY.with(|observed| observed.set(false));
 }
 
-pub(super) fn observed_entry() -> bool {
+pub(in crate::cli::bytecode) fn observed_entry() -> bool {
     OBSERVED_ENTRY.with(Cell::get)
 }
 
@@ -2898,9 +2898,24 @@ fn ordinary_register_abi_installs_and_warms_a_four_argument_call() {
         unsafe { &*(descriptor as *const egcl_rt::call_table::OrdinaryEntryDescriptor) };
     assert_eq!(descriptor.arity, 4);
     assert!(descriptor.is_compatible());
+    let callee_native = NATIVE_REGISTRY
+        .with(|registry| {
+            registry
+                .borrow()
+                .get(&egcl_rt::symbols::find_index("ORDINARY-REGISTER-FOUR").unwrap())
+                .cloned()
+        })
+        .unwrap();
+    let NativeCodeStorage::Mapped(callee_owner) = &callee_native._storage else {
+        panic!("dual-entry callee owner");
+    };
     assert!(
-        unsafe { call_table::mapped_callee(Arc::as_ptr(&cell) as u64) }.is_some(),
-        "dual-entry leaves retain their managed-slot adapter"
+        callee_owner.mapped_entry().is_some(),
+        "compiled managed entry capability remains present"
+    );
+    assert!(
+        unsafe { call_table::mapped_callee(Arc::as_ptr(&cell) as u64) }.is_none(),
+        "dual-entry leaves prefer ordinary execution over managed preparation"
     );
 }
 

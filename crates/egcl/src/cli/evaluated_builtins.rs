@@ -6966,6 +6966,7 @@ fn resolve(name: &str) -> Option<Handler> {
                 .unwrap_or(1000);
             sprof::start(hz);
             builtin_census::reset();
+            activation_census::reset();
             Ok(T)
         }),
 
