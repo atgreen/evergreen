@@ -190,6 +190,13 @@ unsafe extern "C" fn ordinary_interpreted(
 ) {
     use native_transfer_entry::{ordinary_calls, root_publication};
     let request = request.cast::<egcl_compiler::t2::native_transfer::OrdinaryEntryRequest>();
+    let _census_ingress = crate::cli::activation_census::scope(|| {
+        (
+            crate::cli::activation_census::Ingress::OrdinaryCallable,
+            None,
+            Some(unsafe { (*request).closure }),
+        )
+    });
     outer::observe_ordinary_entry();
     #[cfg(test)]
     {

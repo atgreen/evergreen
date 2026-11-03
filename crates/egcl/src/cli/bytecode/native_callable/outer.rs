@@ -84,6 +84,13 @@ pub(super) fn invoke(
     args: &[EgclVal],
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
+    let _census_ingress = crate::cli::activation_census::scope(|| {
+        (
+            crate::cli::activation_census::Ingress::RustOuter,
+            None,
+            Some(function),
+        )
+    });
     // A function object whose installed native code is already selected runs
     // directly: that code's entry polls and owns a segment of its own, as it
     // does when the adapter below reaches it through `apply_function_impl`

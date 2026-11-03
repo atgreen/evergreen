@@ -91,7 +91,13 @@ impl TransferCode {
             env,
         };
         // Preparation reserves Rust storage only; it cannot collect.
-        let mut state = PooledActivation::new(self, ActivationState::prepare_reusing(self, env)?);
+        let mut state = PooledActivation::new(
+            self,
+            crate::cli::activation_census::at_preparation(
+                crate::cli::activation_census::PrepareSite::LeanRoot,
+                || ActivationState::prepare_reusing(self, env),
+            )?,
+        );
         let mut children = SegmentActivations::default();
         let depth = NATIVE_DEPTH.with(Cell::as_ptr);
         egcl_rt::rooted!(

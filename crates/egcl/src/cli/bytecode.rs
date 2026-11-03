@@ -23062,6 +23062,15 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                             .unwrap_or_else(|| EgclVal::from_symbol_index(sym))
                     }
                 );
+                // This tag belongs to the executing T0 instruction, never a
+                // guess from warm_slice or an inherited native CAPTURE.
+                let _census_ingress = crate::cli::activation_census::scope(|| {
+                    (
+                        crate::cli::activation_census::Ingress::BytecodeNamed,
+                        (acts[top_idx].sym != u32::MAX).then_some(acts[top_idx].sym),
+                        Some(*function),
+                    )
+                });
                 let registered_callee = bytecode_for_callable(sym, *function);
 
                 // Profile every call site's execution frequency.  Type details

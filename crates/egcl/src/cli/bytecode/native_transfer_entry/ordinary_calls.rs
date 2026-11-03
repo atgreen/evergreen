@@ -315,6 +315,13 @@ pub(in crate::cli::bytecode) unsafe extern "C" fn named_entry(
     image: *mut SysvTransferCapture,
 ) {
     let request = request.cast::<OrdinaryArityRequest>();
+    let _census_ingress = crate::cli::activation_census::scope(|| {
+        (
+            crate::cli::activation_census::Ingress::OrdinaryNamed,
+            None,
+            None,
+        )
+    });
     // The adapter's entry data is its call cell (call_table_adapter::ensure).
     let cell = unsafe { (*request).entry_data } as u64;
     // Lexical adapter actuals all fit the captured register array. A hit

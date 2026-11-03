@@ -173,6 +173,7 @@ impl Lease {
         } else {
             None
         };
+        let storage_reused = cached.is_some();
         let mut storage = cached.unwrap_or_else(|| {
             #[cfg(test)]
             STORAGE_BIRTHS.with(|count| count.set(count.get() + 1));
@@ -198,6 +199,17 @@ impl Lease {
         context.bridge_clean_return = &mut bridge.clean_return;
         bridge.context.initialize(context);
         let body = super::super::ActiveBytecodeRoot::new(&code.body);
+        crate::cli::activation_census::bridge_lease(storage_reused, || {
+            crate::cli::activation_census::Shape {
+                owner: code.installed_symbol,
+                t2: code.is_t2,
+                ordinary: code.ordinary_entry.is_some(),
+                captured: code.body.has_env,
+                self_calls: !code.body.self_call_sites.is_empty(),
+                osr: !code.osr_entries.is_empty(),
+                variadic: code.body.variadic,
+            }
+        });
         Self {
             code,
             body,
@@ -390,7 +402,9 @@ pub(super) unsafe fn call(
                     // execution and cold recovery. run's Restore retires the
                     // active context before the lease can detach/pool storage.
                     egcl_rt::rooted!(
-                        lease = Lease::new(Rc::clone(code), env, unsafe { (*parent).frame })
+                        lease = crate::cli::activation_census::uncached_bridge_lease(|| {
+                            Lease::new(Rc::clone(code), env, unsafe { (*parent).frame })
+                        })
                     );
                     let bridge = lease.bridge_mut() as *mut Bridge;
                     #[cfg(test)]
