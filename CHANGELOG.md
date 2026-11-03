@@ -686,6 +686,10 @@
 
 ### Performance
 
+- Route eligible mapped T1/T2 calls and T2 `FUNCALL` targets through existing
+  ordinary native entries, avoiding repeated managed child activation setup
+  ([#989](https://github.com/atgreen/evergreen/pull/989)).
+
 - Add experimental lazy native-frame publication, broader T1 loop entries
   and batched polling, native closure string access, and wider generic-call
   caches ([#980](https://github.com/atgreen/evergreen/pull/980)).
