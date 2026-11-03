@@ -4,9 +4,9 @@
 //! Optional census of managed native activation preparations and retirements.
 //! EGCL_ACTIVATION_CENSUS names the output file; SPROF-START resets the table,
 //! and SPROF-STOP writes <path>.window. Counts describe lifecycle events, not
-//! CPU time. Retiring a reusable bridge is counted once when its parent ends.
-//! Direct `prepare` (including OSR reservations) and native-child bridge
-//! creation are not preparation entries here. Shape fields describe code
+//! CPU time. Counts cover `prepare_reusing` entries and general state recycle
+//! attempts, not direct `prepare` (including OSR reservations) or native-child
+//! bridge construction and retirement. Shape fields describe code
 //! capabilities, not the entry path taken. Keys contain scalar metadata only;
 //! no Lisp objects are retained.
 
