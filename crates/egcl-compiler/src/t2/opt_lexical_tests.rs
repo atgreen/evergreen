@@ -194,11 +194,40 @@ fn lexical_forwarding_calls_polls_and_scope_effects_are_barriers() {
         store(&mut f, b, 0, first);
         let mut barrier = data(opcode);
         barrier.flags.effectful = true;
-        f.push_inst(b, barrier, &[]);
-        let answer = load(&mut f, b, 0);
-        finish(&mut f, b, answer);
+        let continuation = if opcode == Opcode::Invoke {
+            let normal = f.make_block();
+            let exceptional = f.make_block();
+            barrier.aux = AuxData::CallTarget(0);
+            barrier.flags.call = true;
+            barrier.flags.safepoint = true;
+            barrier.frame_state = Some(state(&mut f, &[first]));
+            barrier.targets = vec![
+                BlockCall {
+                    block: normal,
+                    args: vec![],
+                },
+                BlockCall {
+                    block: exceptional,
+                    args: vec![],
+                },
+            ];
+            f.set_terminator(b, barrier);
+            finish(&mut f, exceptional, first);
+            normal
+        } else {
+            f.push_inst(b, barrier, &[]);
+            b
+        };
+        let answer = load(&mut f, continuation, 0);
+        finish(&mut f, continuation, answer);
+        let before = format!("{f:?}");
         assert_eq!(forward(&mut f), 0, "{opcode:?}");
         assert_eq!(count(&f, Opcode::EnvironmentValue), 2);
+        assert_eq!(format!("{f:?}"), before, "barrier and both reads retained");
+        assert_ne!(answer, first);
+        if opcode == Opcode::Invoke {
+            assert_eq!(count(&f, Opcode::Invoke), 1);
+        }
     }
 }
 
@@ -291,14 +320,37 @@ fn lexical_forwarding_actual_special_binding_identity_is_a_barrier() {
     for enter in [false, true] {
         let mut f = Function::new("special-scope");
         let b = f.entry();
-        let _first = load(&mut f, b, 0);
+        let first = load(&mut f, b, 0);
         let mut special = data(Opcode::Invoke);
         special.aux = AuxData::SpecialBinding { bcp: 0, enter };
-        // Even malformed missing flags cannot turn a binder into a pure op.
-        f.push_inst(b, special, &[]);
-        let answer = load(&mut f, b, 0);
-        finish(&mut f, b, answer);
+        // Even malformed missing effect/call flags cannot make a binder pure.
+        // Invoke still owns real normal/exceptional edges as a terminator.
+        let normal = f.make_block();
+        let exceptional = f.make_block();
+        special.frame_state = Some(state(&mut f, &[first]));
+        special.targets = vec![
+            BlockCall {
+                block: normal,
+                args: vec![],
+            },
+            BlockCall {
+                block: exceptional,
+                args: vec![],
+            },
+        ];
+        f.set_terminator(b, special);
+        finish(&mut f, exceptional, first);
+        let answer = load(&mut f, normal, 0);
+        finish(&mut f, normal, answer);
+        let before = format!("{f:?}");
         assert_eq!(forward(&mut f), 0);
+        assert_eq!(count(&f, Opcode::Invoke), 1);
+        assert_eq!(count(&f, Opcode::EnvironmentValue), 2);
+        assert_eq!(
+            format!("{f:?}"),
+            before,
+            "binding identity and reads retained"
+        );
     }
 }
 
