@@ -151,6 +151,7 @@ impl EmittedTransfer {
             private_probe_published: Cell::new(false),
             template_claims: Default::default(),
             state_pool: RefCell::new(Vec::new()),
+            bridge_pool: mapped_ordinary::Pool::default(),
             callable_cache: Rc::new(CallableIdentityCache::default()),
             leaf_names: std::cell::OnceCell::new(),
             #[cfg(test)]

@@ -86,7 +86,7 @@ pub(in crate::cli::bytecode) fn expect_entry(code: &NativeCode) {
     OBSERVED_ENTRY.with(|observed| observed.set(false));
 }
 
-pub(super) fn observed_entry() -> bool {
+pub(in crate::cli::bytecode) fn observed_entry() -> bool {
     OBSERVED_ENTRY.with(Cell::get)
 }
 

@@ -130,8 +130,8 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
     );
     assert_eq!(
         native_transfer_entry::take_activation_counts_for_test(),
-        (0, 1),
-        "no leaf managed preparation; one cached bridge retirement at caller exit"
+        (0, 0),
+        "no leaf managed preparation or general bridge recycling at caller exit"
     );
     assert_ne!(
         arguments[3].to_raw(),
@@ -165,7 +165,7 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
     assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
     assert_eq!(
         native_transfer_entry::take_activation_counts_for_test(),
-        (0, 1)
+        (0, 0)
     );
     assert_eq!(
         take_nested_entries(),

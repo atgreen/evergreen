@@ -176,6 +176,7 @@ fn object_fiber() -> EgclVal {
     );
     assert!(owner(&outer).ordinary_entry.is_none());
     let warm = [11, 22, 33, 44].map(EgclVal::from_fixnum);
+    mapped_ordinary::take_storage_births_for_test();
     for _ in 0..2 {
         assert_eq!(
             run_mapped(
@@ -188,6 +189,13 @@ fn object_fiber() -> EgclVal {
             warm[1]
         );
     }
+    assert_eq!(
+        mapped_ordinary::take_storage_births_for_test(),
+        1,
+        "two separate warm parents reuse the same execution-owned backing"
+    );
+    let storage = mapped_ordinary::idle_storage_for_test(owner(&middle));
+    assert_eq!(storage.0, 1);
     // The exact callable stays rooted; the active segment/directory also owns
     // the native physical version across suspension and external collection.
     drop(middle);
@@ -253,9 +261,16 @@ fn object_fiber() -> EgclVal {
     );
     assert_eq!(take_lean_root_entries_for_test(), 0);
     assert_eq!(
+        mapped_ordinary::take_storage_births_for_test(),
+        0,
+        "the migrating parent leases backing from an earlier retired parent"
+    );
+    let (_, current, _, _) = funcall_fast::native_target(*function, 4).unwrap();
+    assert_eq!(mapped_ordinary::idle_storage_for_test(&current), storage);
+    assert_eq!(
         take_activation_counts_for_test(),
-        (0, 1),
-        "execution-local callee counter migrates; only its one lane retires"
+        (0, 0),
+        "execution-local callee counter migrates; typed backing bypasses general recycle"
     );
     assert!(
         probe.observed,

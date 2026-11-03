@@ -142,8 +142,8 @@ fn mapped_t1_repeated_child_calls_preserve_heat_without_per_call_activations() {
         assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
         assert_eq!(
             native_transfer_entry::take_activation_counts_for_test(),
-            (0, 1),
-            "no per-call managed preparation; one bridge retirement when parent finishes"
+            (0, 0),
+            "no managed preparation or general native-child recycling, including parent teardown"
         );
     } else {
         assert_eq!(
@@ -488,7 +488,7 @@ fn mapped_t2_dual_entry_child_avoids_managed_preparation_and_does_not_count_t1_h
     assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
     assert_eq!(
         native_transfer_entry::take_activation_counts_for_test(),
-        (0, 1)
+        (0, 0)
     );
     assert!(egcl_rt::native_transfer::current_segment().is_null());
 }

@@ -3,7 +3,7 @@
 use super::*;
 use std::cell::{Cell, RefCell};
 
-pub(super) fn template(forms: &str, env: &Env) -> Arc<BytecodeFunction> {
+pub(in crate::cli::bytecode) fn template(forms: &str, env: &Env) -> Arc<BytecodeFunction> {
     egcl_rt::rooted!(params = reader::read_from_string("(next)").unwrap().0);
     egcl_rt::rooted!(forms = reader::read_from_string(forms).unwrap().0);
     let name = crate::cli::sym_name(resolve_sym("ORDINARY-NATIVE-CELL").unwrap());
@@ -28,7 +28,11 @@ pub(super) fn template(forms: &str, env: &Env) -> Arc<BytecodeFunction> {
     )
 }
 
-pub(super) fn closure(body: &Arc<BytecodeFunction>, value: EgclVal, env: &mut Env) -> EgclVal {
+pub(in crate::cli::bytecode) fn closure(
+    body: &Arc<BytecodeFunction>,
+    value: EgclVal,
+    env: &mut Env,
+) -> EgclVal {
     let mut construction = env.child();
     construction.frame = FrameCell::new_arc(EnvFrame {
         vars: crate::cli::VecMap::default(),
@@ -52,7 +56,7 @@ fn install(function: EgclVal) -> Rc<NativeCode> {
     native_transfer_entry::with_forced_captured_entry_for_test(|| install_automatic(function))
 }
 
-pub(super) fn install_automatic(function: EgclVal) -> Rc<NativeCode> {
+pub(in crate::cli::bytecode) fn install_automatic(function: EgclVal) -> Rc<NativeCode> {
     let symbol = egcl_rt::function::definition_index(function);
     closure_compilation_owner(symbol, 1);
     let input = snapshot_t2_input(symbol, 0).expect("captured T2 snapshot");

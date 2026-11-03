@@ -136,11 +136,11 @@ fn published_mapped_funcall_reuses_one_bridge_without_per_call_activations() {
     assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
     assert_eq!(native_transfer_entry::take_nested_entries(), 0);
     assert_eq!(funcall_fast::take_fast_calls_for_test().0, calls as usize);
-    // The one native-child state is retired once with its live parent's lane;
-    // no per-call prepare or recycle was hidden in that final teardown.
+    // Detached native-child storage bypasses the general activation recycler
+    // during both the calls and final parent teardown.
     assert_eq!(
         native_transfer_entry::take_activation_counts_for_test(),
-        (0, 1)
+        (0, 0)
     );
 }
 
@@ -304,7 +304,7 @@ fn published_mapped_funcall_bridge_keeps_two_captured_instances_distinct() {
     assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
     assert_eq!(
         native_transfer_entry::take_activation_counts_for_test(),
-        (0, 1)
+        (0, 0)
     );
 }
 

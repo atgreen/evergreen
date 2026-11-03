@@ -79,7 +79,7 @@ impl Drop for PooledActivation<'_> {
 impl egcl_rt::gc::TraceHostRoots for ActivationState {
     fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
         for bridge in &mut self.mapped_ordinary {
-            bridge.as_mut().get_mut().trace_host_roots(visit);
+            bridge.trace_host_roots(visit);
         }
         if let Some(ready) = &mut self.ready_osr {
             ready.trace_host_roots(visit);
@@ -240,7 +240,7 @@ impl ActivationState {
         #[cfg(test)]
         count_activation_for_test(code, true);
         Self::census(code, true);
-        // A bridge is an activation lease, never an idle code-pool root.
+        // Drop live lane leases; only detached code-free storage may be pooled.
         self.mapped_ordinary.clear();
         let guard_idle = self.guard_resume.as_ref().is_none_or(|guard| {
             guard.debug_call.is_none()
@@ -398,6 +398,19 @@ impl ActivationState {
         })
     }
 
+    /// Stronger than control quiescence: idle native-child storage has no
+    /// managed snapshot, nested lane, retained EnvFrame or Lisp root at all.
+    pub(super) fn is_pristine_native_child(&self) -> bool {
+        self.is_quiescent()
+            && self.mapped_ordinary.is_empty()
+            && self.ready_osr.is_none()
+            && self.guard_resume.is_none()
+            && self.snapshots.is_empty()
+            && self.restart_templates.0.is_empty()
+            && self.cluster_frames.is_empty()
+            && self.env_frame.is_none()
+    }
+
     pub(super) fn is_quiescent(&self) -> bool {
         self.catches.is_empty()
             && self.cleanups.is_empty()
@@ -456,6 +469,7 @@ impl ActivationState {
             generated: std::ptr::null_mut(),
             generated_owner: None,
             ordinary_bridge: false,
+            bridge_clean_return: std::ptr::null_mut(),
             mapped_ordinary: &mut self.mapped_ordinary,
             osr: None,
             ready_osr: &mut self.ready_osr,

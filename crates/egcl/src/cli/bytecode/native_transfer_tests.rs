@@ -23,7 +23,7 @@ mod live_signaling;
 mod mapped_funcall_activation;
 mod named_closure_entry;
 mod nested;
-mod ordinary_captured_context;
+pub(super) mod ordinary_captured_context;
 pub(super) mod ordinary_catch_osr;
 pub(super) mod ordinary_cleanup_osr;
 pub(super) mod ordinary_condition_osr;

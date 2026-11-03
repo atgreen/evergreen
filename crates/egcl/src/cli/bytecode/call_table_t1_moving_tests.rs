@@ -186,7 +186,7 @@ fn mapped_t1_child_relocates_nursery_argument_at_its_exact_native_publication() 
     assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
     assert_eq!(
         native_transfer_entry::take_activation_counts_for_test(),
-        (0, 1)
+        (0, 0)
     );
     assert!(egcl_rt::native_transfer::current_segment().is_null());
 }

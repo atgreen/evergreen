@@ -37,6 +37,7 @@ pub(in crate::cli::bytecode) fn fast_entries_for_test() -> usize {
 pub(super) unsafe fn bind(
     parent: *mut CaptureContext,
     bridge: *mut mapped_ordinary::Bridge,
+    code: &Rc<TransferCode>,
     cell: u64,
     offset: usize,
 ) {
@@ -46,7 +47,6 @@ pub(super) unsafe fn bind(
         return;
     }
     let descriptor = unsafe { &*(pointer as *const egcl_rt::call_table::OrdinaryEntryDescriptor) };
-    let code = unsafe { &(*bridge).code };
     let revision = unsafe { &*cell_ref.revision_address() }.load(Ordering::Acquire);
     if !descriptor.is_compatible()
         || descriptor.owner != Rc::as_ptr(code) as usize
@@ -60,6 +60,7 @@ pub(super) unsafe fn bind(
     let control = unsafe {
         (*bridge)
             .context
+            .get_mut()
             .native_recursive
             .as_mut()
             .map(std::ptr::from_mut)
@@ -117,7 +118,7 @@ pub(super) unsafe fn bind(
         revision,
         recompile: code.recompile.as_ptr(),
         function,
-        context: unsafe { std::ptr::from_mut(&mut *(*bridge).context).cast() },
+        context: unsafe { std::ptr::from_mut(&mut *(*bridge).context.get_mut()).cast() },
         control,
         busy: unsafe { std::ptr::from_mut(&mut (*bridge).busy) },
         entry: descriptor.entry as *const u8,
@@ -130,7 +131,7 @@ pub(super) unsafe fn bind(
     let binding = std::ptr::from_mut(&mut prepared.binding);
     let bridges = unsafe { &*(*parent).mapped_ordinary };
     for (index, cached) in bridges.iter().enumerate() {
-        if std::ptr::eq(cached.as_ref().get_ref(), bridge) {
+        if std::ptr::eq(cached.bridge(), bridge) {
             prepared.binding.lanes[index] = lane;
             break;
         }
@@ -175,6 +176,10 @@ unsafe extern "C" fn enter(record: *mut MappedCallRecord) {
             binding.runtime.stack,
         );
         *(*hot.lane).busy = true;
+        let context = &mut *(*hot.lane).context.cast::<CaptureContext>();
+        if !context.bridge_clean_return.is_null() {
+            *context.bridge_clean_return = false;
+        }
     }
     #[cfg(test)]
     unsafe {
@@ -204,6 +209,7 @@ unsafe fn restore_float_environment(record: *mut MappedCallRecord) {
 /// Idle returns only retire opaque lexical guards. A real pending return takes
 /// the old rooted ordinary finish path; its result is rooted before any poll.
 unsafe extern "C" fn leave(record: *mut MappedCallRecord) {
+    let entered = unsafe { (*record).generated.entered != 0 };
     unsafe { restore_float_environment(record) };
     let binding = unsafe { &*(*record).generated.activation };
     if unsafe {
@@ -237,6 +243,16 @@ unsafe extern "C" fn leave(record: *mut MappedCallRecord) {
                     .cast::<ScopeGuards>(),
             );
             (*record).generated.entered = 0;
+        }
+        // A selector miss/early failure need not have a valid lane. Only a
+        // completed enter owns this context and may grant clean retirement.
+        let lane = (*record).generated.lane;
+        if entered && !lane.is_null() {
+            let context = &mut *(*lane).context.cast::<CaptureContext>();
+            if !context.bridge_clean_return.is_null() {
+                *context.bridge_clean_return =
+                    (*record).outcome.exit == NativeExit::Returned && !native_error_pending();
+            }
         }
         // A pending-return callback can change controls after the initial
         // restore. No more Lisp runs after this final restore.

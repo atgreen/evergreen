@@ -431,6 +431,7 @@ pub(super) struct TransferCode {
     /// whole struct (bliss-nkzx6).
     #[allow(clippy::vec_box)]
     state_pool: std::cell::RefCell<Vec<Box<ActivationState>>>,
+    bridge_pool: mapped_ordinary::Pool,
     /// Cache state has no strong code edge. Dirty weak tokens cover current,
     /// retired and externally retained code without a registry ownership cycle.
     callable_cache: Rc<CallableIdentityCache>,
@@ -1332,6 +1333,7 @@ impl TransferCode {
     }
 
     pub(super) fn retire_private_entries(&self) {
+        self.bridge_pool.retire();
         // The template pairs this code claimed stop naming it first.
         let claims = std::mem::take(&mut *self.template_claims.borrow_mut());
         for claim in &claims {
@@ -5491,6 +5493,7 @@ struct CaptureContext {
     generated: *mut egcl_compiler::t2::native_transfer::GeneratedActivation,
     generated_owner: Option<Box<mapped_generated::Prepared>>,
     ordinary_bridge: bool,
+    bridge_clean_return: *mut bool,
     mapped_ordinary: *mut mapped_ordinary::Lanes,
     osr: Option<(Rc<NativeCode>, usize)>,
     ready_osr: *mut Option<Box<ActivationState>>,

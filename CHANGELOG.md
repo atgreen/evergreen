@@ -687,7 +687,9 @@
 ### Performance
 
 - Route eligible mapped T1/T2 calls and T2 `FUNCALL` targets through existing
-  ordinary native entries, avoiding repeated managed child activation setup
+  ordinary native entries, avoiding repeated managed child activation setup.
+  Reuse clean native bridge storage across parent calls while refreshing each
+  call's execution context
   ([#989](https://github.com/atgreen/evergreen/pull/989)).
 
 - Add experimental lazy native-frame publication, broader T1 loop entries
