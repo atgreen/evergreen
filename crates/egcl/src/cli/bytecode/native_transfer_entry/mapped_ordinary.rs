@@ -102,6 +102,8 @@ pub(super) struct Bridge {
     pub(super) generated: Option<egcl_compiler::t2::native_transfer::GeneratedLane>,
     pub(super) dispatch_function: EgclVal,
     clean_return: bool,
+    #[cfg(test)]
+    origin: Origin,
 }
 
 impl TraceHostRoots for Lease {
@@ -182,8 +184,25 @@ mod context_reuse;
 
 impl Lease {
     fn new(code: Rc<TransferCode>, env: &mut Env, frame: *mut Frame) -> Self {
+        Self::new_for_origin(code, env, frame, Origin::Mapped)
+    }
+
+    pub(super) fn new_rust_owned(code: Rc<TransferCode>, env: &mut Env, frame: *mut Frame) -> Self {
+        crate::cli::activation_census::rust_owned_bridge_lease(|| {
+            Self::new_for_origin(code, env, frame, Origin::RustOwned)
+        })
+    }
+
+    fn new_for_origin(
+        code: Rc<TransferCode>,
+        env: &mut Env,
+        frame: *mut Frame,
+        _origin: Origin,
+    ) -> Self {
         #[cfg(test)]
-        PREPARES.with(|count| count.set(count.get() + 1));
+        if matches!(_origin, Origin::Mapped) {
+            PREPARES.with(|count| count.set(count.get() + 1));
+        }
         let cached = if pooling_enabled() && !code.bridge_pool.retired.get() {
             code.bridge_pool.idle.borrow_mut().pop()
         } else {
@@ -204,9 +223,15 @@ impl Lease {
                 generated: None,
                 dispatch_function: NIL,
                 clean_return: false,
+                #[cfg(test)]
+                origin: _origin,
             })
         });
         let bridge = storage.as_mut().get_mut();
+        #[cfg(test)]
+        {
+            bridge.origin = _origin;
+        }
         let state = bridge.state.as_mut().unwrap();
         state.catch_base = env.catch_stack.len();
         let constructed = !bridge.context.live;
@@ -250,7 +275,7 @@ impl Lease {
     pub(super) fn bridge(&self) -> &Bridge {
         self.storage.as_ref().unwrap().as_ref().get_ref()
     }
-    fn bridge_mut(&mut self) -> &mut Bridge {
+    pub(super) fn bridge_mut(&mut self) -> &mut Bridge {
         self.storage.as_mut().unwrap().as_mut().get_mut()
     }
 }
@@ -534,7 +559,17 @@ pub(super) unsafe fn call(
     Some(result)
 }
 
-unsafe fn run(
+/// The executor consumes an independently rooted lease. The origin controls
+/// test attribution only; it never authorizes entry or borrows caller state.
+#[derive(Clone, Copy)]
+enum Origin {
+    Mapped,
+    RustOwned,
+}
+
+/// Caller roots the lease, current Env, callable and arguments; bridge points
+/// into that live pinned lease. Both ingresses own their own segment/control.
+pub(super) unsafe fn run(
     code: &Rc<TransferCode>,
     bridge: *mut Bridge,
     offset: usize,
@@ -649,7 +684,10 @@ unsafe fn run(
             || {
                 #[cfg(test)]
                 {
-                    ENTRIES.with(|count| count.set(count.get() + 1));
+                    match (*bridge).origin {
+                        Origin::Mapped => ENTRIES.with(|count| count.set(count.get() + 1)),
+                        Origin::RustOwned => super::rust_ordinary_root::note_entry_for_test(),
+                    }
                     if let Some(observe) = ORDINARY_ENTRY_HOOK.with(|hook| hook.take()) {
                         observe();
                     }

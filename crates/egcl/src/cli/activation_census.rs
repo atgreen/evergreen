@@ -23,7 +23,7 @@
 //! active_ingresses is a bitset of explicitly entered scopes (Ingress repr).
 //! A nearest helper may sit inside a Rust outer or T0 scope; keep those bits.
 //! <path>.bridge-leases[.window] counts successful native bridge context
-//! construction separately (ParentCached vs UncachedOverflow). Checkout of an
+//! construction separately (ParentCached, UncachedOverflow or RustOwned). Checkout of an
 //! initialized context adds no event; storage_reused describes backing reuse
 //! only when a context is constructed.
 //! These events are NOT added to managed totals, and do not count every call
@@ -370,6 +370,7 @@ pub(crate) enum BridgeLeaseKind {
     #[default]
     ParentCached,
     UncachedOverflow,
+    RustOwned,
 }
 static BRIDGE_KIND: egcl_rt::execution_local::ExecutionLocal<std::cell::Cell<BridgeLeaseKind>> = unsafe {
     egcl_rt::execution_local::ExecutionLocal::new(|| {
@@ -476,14 +477,22 @@ pub(crate) fn at_preparation<T>(site: PrepareSite, run: impl FnOnce() -> T) -> T
 
 /// Override only while constructing an actual uncached overflow lease.
 pub(crate) fn uncached_bridge_lease<T>(run: impl FnOnce() -> T) -> T {
+    with_bridge_lease_kind(BridgeLeaseKind::UncachedOverflow, run)
+}
+
+/// Independently rooted Rust ingress, not a cached mapped parent lane.
+pub(crate) fn rust_owned_bridge_lease<T>(run: impl FnOnce() -> T) -> T {
+    with_bridge_lease_kind(BridgeLeaseKind::RustOwned, run)
+}
+
+fn with_bridge_lease_kind<T>(kind: BridgeLeaseKind, run: impl FnOnce() -> T) -> T {
     struct Restore(BridgeLeaseKind);
     impl Drop for Restore {
         fn drop(&mut self) {
             BRIDGE_KIND.with(|slot| slot.set(self.0));
         }
     }
-    let _scope = origins_enabled()
-        .then(|| Restore(BRIDGE_KIND.with(|slot| slot.replace(BridgeLeaseKind::UncachedOverflow))));
+    let _scope = origins_enabled().then(|| Restore(BRIDGE_KIND.with(|slot| slot.replace(kind))));
     run()
 }
 
@@ -960,6 +969,7 @@ pub(crate) fn bridge_lease_counts_for_test(owners: &[u32]) -> [u64; 4] {
             let base = match key.kind {
                 BridgeLeaseKind::ParentCached => 0,
                 BridgeLeaseKind::UncachedOverflow => 2,
+                BridgeLeaseKind::RustOwned => continue, // accessor retains mapped-only schema
             };
             result[base + usize::from(key.storage_reused)] += count;
         }

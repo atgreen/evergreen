@@ -298,6 +298,23 @@ fn invoke_named_outer_probe(symbol: u32, args: &[EgclVal]) -> Returned {
     probe.returned
 }
 
+thread_local! {
+    static OWNED_CHILD_ANCHOR: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    static OWNED_CHILD_BODY: Cell<bool> = const { Cell::new(false) };
+}
+fn observe_owned_child_body() {
+    let stack = egcl_rt::current_stack();
+    // The marker itself is a T0 helper and owns one legitimate helper frame.
+    // Inspect its immediate predecessor, the native child's real VM anchor.
+    let expected = OWNED_CHILD_ANCHOR.with(Cell::get);
+    if expected.0 == 0 {
+        return;
+    }
+    native_transfer_entry::rust_ordinary_root::assert_anchor_for_test(expected.0);
+    assert_ne!(stack.fp() as usize, 0);
+    OWNED_CHILD_BODY.with(|slot| slot.set(true));
+}
+
 fn exercise_owned_records_below_mapped_parent(prior_entries: usize) {
     use crate::cli::bytecode::native_transfer_entry::{self as native, mapped_ordinary};
     let child = crate::cli::bytecode::symbol_index_of("OWNED-RECORD-CHILD").unwrap();
@@ -317,18 +334,33 @@ fn exercise_owned_records_below_mapped_parent(prior_entries: usize) {
         );
         native::start_activation_counts_for_test(child);
         native::take_lean_root_entries_for_test();
+        let stack = egcl_rt::current_stack();
+        let before = (stack.fp() as usize, stack.sp() as usize);
+        OWNED_CHILD_ANCHOR.with(|slot| slot.set(before));
+        OWNED_CHILD_BODY.with(|slot| slot.set(false));
+        native::rust_ordinary_root::take_entries_for_test();
         let returned = invoke_named_outer_probe(symbol, &args);
+        assert!(
+            OWNED_CHILD_BODY.with(Cell::get),
+            "actual owner-checked child body executes"
+        );
+        assert_eq!((stack.fp() as usize, stack.sp() as usize), before);
+        let enabled = native::rust_ordinary_root::enabled_for_test();
+        assert_eq!(
+            native::rust_ordinary_root::take_entries_for_test(),
+            usize::from(enabled)
+        );
         assert_eq!(returned.primary, EgclVal::from_fixnum(42).to_raw());
         assert_eq!(returned.carry, 0);
         assert_eq!(
             native::take_lean_root_entries_for_test(),
-            1,
-            "the owned record uses lean root ingress, not a managed mapped child"
+            usize::from(!enabled),
+            "the independent Rust root replaces the old lean managed root only when enabled"
         );
         assert_eq!(
             native::take_activation_counts_for_test(),
-            (1, 1),
-            "registered Rust outer record must use its valid root entry for named and FUNCALL targets"
+            if enabled { (0, 0) } else { (1, 1) },
+            "Rust-owned entry avoids callee preparation without borrowing a mapped lane"
         );
         assert_eq!(
             mapped_ordinary::take_entries_for_test(),
@@ -336,6 +368,7 @@ fn exercise_owned_records_below_mapped_parent(prior_entries: usize) {
             "an older CAPTURE never grants this outer record generated ingress"
         );
     }
+    OWNED_CHILD_ANCHOR.with(|slot| slot.set((0, 0)));
     OWNED_RECORD_PROBE_RAN.with(|slot| slot.set(true));
 }
 
@@ -379,13 +412,20 @@ fn owned_outer_records_cannot_borrow_an_older_published_mapped_parent_lane() {
     let mut env = Env::new(false);
     egcl_rt::rooted_ref!(_env = &mut env);
     read_eval_all_env(
-        "(defun owned-record-child (x) (+ x 1))
+        "(defun owned-child-observe () (%ordinary-t2-entry-for-test))
+         (defun owned-record-child (x) (owned-child-observe) (+ x 1))
          (defun owned-record-parent (f &key (seed (1+ 0)) &aux (unused 0))
            (funcall f 1) (funcall f 2))",
         &mut env,
     )
     .unwrap();
-    let (child, _) = ordinary_t2::install("OWNED-RECORD-CHILD", "(x)", "((+ x 1))", &mut env);
+    let (child, child_code) = ordinary_t2::install(
+        "OWNED-RECORD-CHILD",
+        "(x)",
+        "((owned-child-observe) (+ x 1))",
+        &mut env,
+    );
+
     let (parent, code) = ordinary_t2::install(
         "OWNED-RECORD-PARENT",
         "(f &key (seed (1+ 0)) &aux (unused 0))",
@@ -397,6 +437,7 @@ fn owned_outer_records_cannot_borrow_an_older_published_mapped_parent_lane() {
     };
     assert!(mapped.ordinary_entry.is_none());
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(child).unwrap());
+    ordinary_t2::expect_entry(&child_code);
     // Warm both named slots before installing the observation hook.
     struct RestoreEnv(*mut Env);
     impl Drop for RestoreEnv {
@@ -413,6 +454,12 @@ fn owned_outer_records_cannot_borrow_an_older_published_mapped_parent_lane() {
     .unwrap();
     drop(saved);
     native_transfer_entry::mapped_ordinary::take_entries_for_test();
+    let _pins = ordinary_t2::RecursiveFixturePins::new(&["OWNED-CHILD-OBSERVE"]);
+    ordinary_t2::expect_entry(&child_code);
+    let _body_observer = RestoreBodyObserver(
+        ordinary_t2::RECURSIVE_LEAF_OBSERVER
+            .with(|slot| slot.replace(Some(observe_owned_child_body))),
+    );
     OWNED_RECORD_PROBE_RAN.with(|slot| slot.set(false));
     OWNED_RECORD_PARENT.with(|slot| slot.set(Rc::as_ptr(mapped) as usize));
     struct ResetCounts;

@@ -717,6 +717,13 @@ fn run(
             egcl_rt::rooted!(
                 _active_callable_root = super::super::ActiveCallableRoot(actual_instance)
             );
+            // A Rust entry owns a fresh context/segment, independently of any
+            // generated caller still suspended below its host frames.
+            if matches!(ingress, Ingress::Root)
+                && let Some(result) = super::rust_ordinary_root::try_run(&code, function, args, env)
+            {
+                return Some(result);
+            }
             // Reuse the existing native ABI only below the explicit mapped
             // publication. Preserve run_callable's declaration-scope handling
             // by declining when the caller has local SPECIAL declarations.

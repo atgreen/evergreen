@@ -153,6 +153,7 @@ impl EmittedTransfer {
             state_pool: RefCell::new(Vec::new()),
             bridge_pool: mapped_ordinary::Pool::default(),
             callable_cache: Rc::new(CallableIdentityCache::default()),
+            rust_root_entry: std::cell::OnceCell::new(),
             leaf_names: std::cell::OnceCell::new(),
             #[cfg(test)]
             unavailable_catch: None,
