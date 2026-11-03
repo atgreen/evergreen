@@ -325,7 +325,7 @@ fn memory_fence_call_persists_without_source_fallback() {
         "must not embed legacy source"
     );
     let bbu = bfasl_section(&bytes, 12).expect("compiled bytecode unit");
-    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0303);
+    assert_eq!(u16::from_le_bytes(bbu[4..6].try_into().unwrap()), 0x0305);
     let start = bbu_action_start(bbu);
     let (_, _, count) = bbu_counts(&bytes);
     for action in bbu[start..start + count as usize * 14].chunks_exact(14) {
@@ -3873,8 +3873,26 @@ fn incompatible_bytecode_versions_are_rejected_before_load_effects() {
     );
     let bytes = fs::read(&good).unwrap();
     let image = egcl_rt::bfasl::load(&bytes).unwrap();
+    let unit = image
+        .section(egcl_rt::bfasl::section::BYTECODE_UNIT)
+        .unwrap();
+    let emitted = u16::from_le_bytes(unit[4..6].try_into().unwrap());
+    // The loader accepts older minor versions within the current major.
+    // Derive unsupported future versions from the actual writer, rather than
+    // marking a supported older minor as incompatible after a format bump.
+    let future_minor = emitted.checked_add(1).expect("bytecode version space");
+    let future_major = (emitted & 0xff00)
+        .checked_add(0x0100)
+        .expect("bytecode major version space");
     for version in [
-        0x0100u16, 0x010e, 0x010f, 0x0200, 0x0206, 0x0207, 0x0304, 0x0400,
+        0x0100u16,
+        0x010e,
+        0x010f,
+        0x0200,
+        0x0206,
+        0x0207,
+        future_minor,
+        future_major,
     ] {
         let bad = dir.join(format!("version-{version:04x}.bfasl"));
         let mut builder = egcl_rt::bfasl::BfaslBuilder::new();
