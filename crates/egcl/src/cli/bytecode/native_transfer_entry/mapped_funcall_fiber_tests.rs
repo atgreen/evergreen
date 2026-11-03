@@ -493,11 +493,11 @@ fn native_arguments(rows: &[LogicalFrame]) -> Vec<EgclVal> {
         .arguments
         .as_ref()
         .expect("ordinary child argument homes");
-    assert_eq!(
-        arguments.len(),
-        4,
-        "fourth actual exercises the overflow ABI home"
-    );
+    match arguments.as_slice() {
+        [_, _, _, _] => {}
+        [_, _, _, _, scalar] if *scalar == EgclVal::from_fixnum(1) => {}
+        _ => panic!("four payload homes, optionally followed by checked fixnum 1: {arguments:?}"),
+    }
     assert!(
         rows.iter().any(|row| row
             .function
@@ -506,8 +506,11 @@ fn native_arguments(rows: &[LogicalFrame]) -> Vec<EgclVal> {
         "{rows:?}"
     );
     // The variadic mapped OUTER may not expose original actuals.
-    arguments.clone()
+    arguments[..4].to_vec()
 }
+
+#[path = "typed_mapped_migration_tests.rs"]
+mod typed_mapped;
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed-arity native calls with declared argument types can reuse checking
+  native entries from mapped callers while preserving type-error handling
+  ([#1000](https://github.com/atgreen/evergreen/pull/1000)).
+
 - Activation census diagnostics can report exact native-call admission reasons
   and installed argument metadata, keeping eligibility events separate from
   managed preparation counts
