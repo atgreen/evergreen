@@ -23,8 +23,9 @@
 //! active_ingresses is a bitset of explicitly entered scopes (Ingress repr).
 //! A nearest helper may sit inside a Rust outer or T0 scope; keep those bits.
 //! <path>.bridge-leases[.window] counts successful native bridge context
-//! construction separately (ParentCached vs UncachedOverflow). A storage pool
-//! hit still constructs a context; storage_reused distinguishes backing reuse.
+//! construction separately (ParentCached vs UncachedOverflow). Checkout of an
+//! initialized context adds no event; storage_reused describes backing reuse
+//! only when a context is constructed.
 //! These events are NOT added to managed totals, and do not count every call
 //! through a reused context or claim that all per-call setup was eliminated.
 //! Missing caller identity means unknown, never infer it from CAPTURE. Names
@@ -247,7 +248,8 @@ pub(crate) fn uncached_bridge_lease<T>(run: impl FnOnce() -> T) -> T {
     run()
 }
 
-/// A pool hit still rebuilds CaptureContext, so each successful Lease counts.
+/// Count actual context construction, excluding retained-context checkout.
+/// Active lease and body-root acquisition can still occur without this event.
 pub(crate) fn bridge_lease(storage_reused: bool, shape: impl FnOnce() -> Shape) {
     if !origins_enabled() {
         return;

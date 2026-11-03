@@ -12,7 +12,20 @@ fn idle_address(code: &TransferCode) -> usize {
     let pool = code.bridge_pool.idle.borrow();
     assert_eq!(pool.len(), 1);
     let bridge = pool[0].as_ref().get_ref();
-    assert!(!bridge.context.live, "idle context has been dropped");
+    assert_eq!(bridge.context.live, context_reuse_enabled());
+    if bridge.context.live {
+        let context = &*bridge.context;
+        assert!(context.frame.is_null() && context.nested.is_null());
+        assert!(context.activation.is_null());
+        assert!(context.generated.is_null() && context.generated_owner.is_none());
+        assert!(context.native_recursive.is_none() && context.native_poll.is_none());
+        assert!(context.landing.stack_pointer.is_null() && context.landing.entry.is_null());
+        assert!(context.dispatch.entry.is_null() && context.dispatch.request.is_null());
+        assert!(context.selected.is_none() && context.failure.is_none() && context.osr.is_none());
+        assert!(context.recursive.is_null() && !context.recursive_escape);
+        assert_eq!(context.catch_base, 0);
+        assert_eq!(context.native_bindings, 0);
+    }
     assert!(!bridge.busy && !bridge.clean_return && bridge.generated.is_none());
     assert_eq!(bridge.function, NIL);
     assert_eq!(bridge.dispatch_function, NIL);
@@ -182,7 +195,7 @@ fn hundred_separate_parents_reuse_one_native_storage_without_general_child_recyc
     assert_eq!(
         take_prepares_for_test(),
         100,
-        "one necessary context reset per parent"
+        "one active Lease checkout per parent; context construction is counted separately"
     );
     assert_eq!(
         take_storage_births_for_test(),
