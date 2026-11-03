@@ -720,7 +720,7 @@ fn committed_t1_object_fifth_lane_credits_once_with_overflow_or_explicit_root_co
         } else {
             4
         },
-        "four cached lanes plus the admitted uncached call, or explicit OFF root control"
+        "four generated-capable lanes plus an admitted spill call, or explicit OFF root control"
     );
     assert_eq!(
         super::super::take_lean_root_entries_for_test(),

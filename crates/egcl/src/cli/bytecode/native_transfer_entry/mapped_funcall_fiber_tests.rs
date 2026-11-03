@@ -166,18 +166,24 @@ fn wait_until(mut ready: impl FnMut() -> bool, message: &str) {
 }
 
 fn object_fiber() -> EgclVal {
-    object_fiber_for_tier(2, false)
+    object_fiber_for_tier(2, 0)
 }
 fn object_t1_fiber() -> EgclVal {
-    object_fiber_for_tier(1, false)
+    object_fiber_for_tier(1, 0)
 }
 fn object_overflow_fiber() -> EgclVal {
-    object_fiber_for_tier(2, true)
+    object_fiber_for_tier(2, 16)
 }
 fn object_t1_overflow_fiber() -> EgclVal {
-    object_fiber_for_tier(1, true)
+    object_fiber_for_tier(1, 16)
 }
-fn object_fiber_for_tier(tier: u8, overflow: bool) -> EgclVal {
+fn object_spill_fiber() -> EgclVal {
+    object_fiber_for_tier(2, 4)
+}
+fn object_t1_spill_fiber() -> EgclVal {
+    object_fiber_for_tier(1, 4)
+}
+fn object_fiber_for_tier(tier: u8, fillers: usize) -> EgclVal {
     let mut env = Env::new_impl(false, false, false);
     egcl_rt::rooted_ref!(_env = &mut env);
     let (middle_symbol, mut middle) = install(
@@ -206,21 +212,31 @@ fn object_fiber_for_tier(tier: u8, overflow: bool) -> EgclVal {
     assert!(owner(&middle).lean_root_entry().is_some());
     let middle_owner = Rc::as_ptr(owner(&middle)) as usize;
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(middle_symbol).unwrap());
-    let prefix = if overflow {
+    if fillers != 0 {
         assert!(mapped_ordinary::overflow_enabled());
-        for index in 0..4 {
-            // The ordinary install helper compiles bytecode only. Define the
-            // source callable too, as startup does for MIDDLE: opportunistic
-            // parent lowering and exact-object dispatch require that binding.
-            install_mapped(&mut env, &format!("MF-OVERFLOW-FILL-{index}"), "(x)", "x");
-        }
-        "(mf-overflow-fill-0 0) (mf-overflow-fill-1 1) (mf-overflow-fill-2 2) (mf-overflow-fill-3 3)"
+    }
+    for index in 0..fillers {
+        // Publish source callable identity as well as native filler code.
+        install_mapped(&mut env, &format!("MF-OVERFLOW-FILL-{index}"), "(x)", "x");
+    }
+    let prefix = (0..fillers)
+        .map(|i| format!("(mf-overflow-fill-{i} {i})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let declarations = if fillers == 0 {
+        String::new()
     } else {
-        ""
+        let names = (0..fillers)
+            .map(|i| format!("mf-overflow-fill-{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("(declare (notinline {names}))")
     };
-    let forms = format!("(locally (declare (notinline mf-overflow-fill-0 mf-overflow-fill-1 mf-overflow-fill-2 mf-overflow-fill-3))
+    let forms = format!(
+        "(locally {declarations}
         (progn {prefix} (funcall f 1 2 3 4)
-          (multiple-value-prog1 (funcall f d c b a) (funcall f 5 6 7 8))))");
+          (multiple-value-prog1 (funcall f d c b a) (funcall f 5 6 7 8))))"
+    );
     let (symbol, outer) = install_mapped(
         &mut env,
         "MF-OBJECT-FIBER-OUTER",
@@ -255,8 +271,8 @@ fn object_fiber_for_tier(tier: u8, overflow: bool) -> EgclVal {
     }
     assert_eq!(
         mapped_ordinary::take_storage_births_for_test(),
-        if overflow { 5 } else { 1 },
-        "two separate warm parents reuse backing without expanding the four cached lanes"
+        fillers + 1,
+        "two separate warm parents reuse bounded Rust backing"
     );
     if tier == 1 {
         assert_eq!(
@@ -289,12 +305,13 @@ fn object_fiber_for_tier(tier: u8, overflow: bool) -> EgclVal {
     mapped_ordinary::take_prepares_for_test();
     take_lean_root_entries_for_test();
     mapped_ordinary::take_uncached_calls_for_test();
+    mapped_ordinary::take_cache_shape_for_test();
     start_activation_counts_for_test(middle_symbol);
     let heat_before_live = egcl_rt::function::invoke_count(*function);
     let mut probe = Probe {
         owner: middle_owner,
         tier,
-        third_entry: if overflow { 7 } else { 3 },
+        third_entry: fillers + 3,
         observed: false,
         observed_after_resume: false,
         control: 0,
@@ -327,19 +344,26 @@ fn object_fiber_for_tier(tier: u8, overflow: bool) -> EgclVal {
     );
     assert_eq!(
         mapped_ordinary::take_entries_for_test(),
-        if overflow { 7 } else { 3 },
-        "third object call starts after suspension, including any four cached filler calls"
+        fillers + 3,
+        "third object call starts after suspension, after all filler calls"
     );
     assert_eq!(
         mapped_ordinary::take_prepares_for_test(),
-        if overflow { 7 } else { 1 },
-        "uncached calls reset one local lease each; generated/cache capacity remains four"
+        if fillers >= 16 {
+            fillers + 3
+        } else {
+            fillers + 1
+        },
+        "spill leases prepare once; targets above sixteen prepare a local lease per call"
     );
+    let (cached, generated) = mapped_ordinary::take_cache_shape_for_test();
+    assert_eq!(cached, (fillers + 1).min(16));
+    assert!(generated <= 4);
     assert_eq!(take_lean_root_entries_for_test(), 0);
     assert_eq!(
         mapped_ordinary::take_uncached_calls_for_test(),
-        if overflow { (3, 4) } else { (0, 0) },
-        "the suspended and post-resume calls must both use the real uncached route"
+        if fillers >= 16 { (3, 16) } else { (0, 0) },
+        "only targets above sixteen use the real uncached route"
     );
     assert_eq!(
         mapped_ordinary::take_storage_births_for_test(),
@@ -471,6 +495,17 @@ fn uncached_t2_object_bridge_survives_migration_external_gc_and_post_resume_call
 #[ignore = "requires native migration and external moving collection"]
 fn uncached_t1_object_bridge_preserves_heat_through_migration_and_external_gc() {
     run_migration(object_t1_overflow_fiber, 1);
+}
+
+#[test]
+#[ignore = "requires native migration and external moving collection"]
+fn spill_t2_object_bridge_survives_migration_external_gc_and_post_resume_call() {
+    run_migration(object_spill_fiber, 2);
+}
+#[test]
+#[ignore = "requires native migration and external moving collection"]
+fn spill_t1_object_bridge_preserves_heat_through_migration_and_external_gc() {
+    run_migration(object_t1_spill_fiber, 1);
 }
 
 fn run_migration(entry: fn() -> EgclVal, tier: u8) {

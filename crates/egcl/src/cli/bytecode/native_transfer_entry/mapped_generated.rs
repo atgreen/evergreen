@@ -15,6 +15,7 @@ pub(super) struct Prepared {
 }
 
 const _: () = assert!(std::mem::offset_of!(CaptureContext, generated) == 0);
+pub(super) const MAX_GENERATED_LANES: usize = 4;
 static NO_CLOSURE: EgclVal = NIL;
 
 #[cfg(test)]
@@ -41,6 +42,17 @@ pub(super) unsafe fn bind(
     cell: u64,
     offset: usize,
 ) {
+    // Rust may retain more leases than the generated ABI can address. Refuse
+    // spill entries before initializing any Prepared or per-bridge binding.
+    let capacity = unsafe { (*parent).generated_owner.as_ref() }
+        .map_or(MAX_GENERATED_LANES, |prepared| prepared.binding.lanes.len());
+    let Some(index) = (unsafe { &*(*parent).mapped_ordinary })
+        .iter()
+        .take(capacity)
+        .position(|cached| std::ptr::eq(cached.bridge(), bridge))
+    else {
+        return;
+    };
     let cell_ref = unsafe { &*(cell as *const egcl_rt::call_table::CallCell) };
     let pointer = unsafe { &*cell_ref.ordinary_entry_address() }.load(Ordering::Acquire);
     if pointer == 0 {
@@ -79,7 +91,7 @@ pub(super) unsafe fn bind(
         let parent_code = unsafe { &*(*parent).owner };
         let prepared = Box::new(Prepared {
             binding: GeneratedActivation {
-                lanes: [std::ptr::null(); 4],
+                lanes: [std::ptr::null(); MAX_GENERATED_LANES],
                 execution,
                 env: NATIVE_ENV.with(Cell::get).cast(),
                 code_start: parent_code.code.as_ptr() as usize,
@@ -129,13 +141,7 @@ pub(super) unsafe fn bind(
     let lane = unsafe { (*bridge).generated.as_ref().unwrap() as *const GeneratedLane };
     let prepared = unsafe { (*parent).generated_owner.as_mut().unwrap() };
     let binding = std::ptr::from_mut(&mut prepared.binding);
-    let bridges = unsafe { &*(*parent).mapped_ordinary };
-    for (index, cached) in bridges.iter().enumerate() {
-        if std::ptr::eq(cached.bridge(), bridge) {
-            prepared.binding.lanes[index] = lane;
-            break;
-        }
-    }
+    prepared.binding.lanes[index] = lane;
     unsafe { (*parent).generated = binding };
 }
 
