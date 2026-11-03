@@ -289,16 +289,18 @@ fn fifth_named_and_object_targets_execute_native_without_general_activations() {
                     difference,
                     if targets == 5 {
                         [5, 0, 0, 0]
+                    } else if context_reuse_enabled() {
+                        [16, 0, 1, 0]
                     } else {
                         [16, 0, 1, 99]
                     },
-                    "real contexts rebuild once per cachedtarget or every uncachedcall; pool reuse is separate"
+                    "counts are actual context construction; retained-context checkouts do not construct"
                 );
             }
             assert_eq!(
                 take_prepares_for_test(),
                 if targets == 5 { 5 } else { 116 },
-                "the fifth lease is prepared once for 100 native calls"
+                "Lease checkouts remain5/116 independently of context construction"
             );
             assert_eq!(
                 take_storage_births_for_test(),

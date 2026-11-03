@@ -21,8 +21,8 @@ pub(super) struct Lease {
     storage: Option<std::pin::Pin<Box<Bridge>>>,
 }
 
-/// Execution-local through its TransferCode owner. Only pristine, code-free
-/// storage is retained, bounded independently of the number of parent calls.
+/// Execution-local through its TransferCode owner. Only pristine storage with
+/// no owning code edge or Lisp values is retained, at most four homes per code.
 #[derive(Default)]
 pub(super) struct Pool {
     idle: RefCell<Vec<std::pin::Pin<Box<Bridge>>>>,
@@ -35,8 +35,9 @@ impl Pool {
     }
 }
 
-/// Keep the context allocation, but no initialized context or stale execution
-/// pointers while idle. Every lease rebuilds it from the current Env/frame.
+/// Stable context home. A clean pooled home may remain initialized, with only
+/// nonowning pointers into its exact owning code and pinned backing. Parent,
+/// callable, execution-control and transient landing bindings are detached.
 pub(super) struct ContextHome {
     slot: Box<std::mem::MaybeUninit<CaptureContext>>,
     live: bool,
@@ -60,6 +61,10 @@ impl ContextHome {
     fn clear(&mut self) {
         if self.live {
             self.live = false;
+            #[cfg(test)]
+            // Registry teardown can drop code after execution-local counters
+            // have retired. Live-phase reads/resets remain strict.
+            let _ = CONTEXT_DROPS.try_with(|count| count.set(count.get() + 1));
             // No native frame or generated publication can retain this home.
             unsafe { self.slot.assume_init_drop() };
         }
@@ -164,6 +169,17 @@ fn record_cache_shape(lanes: &Lanes) {
     });
 }
 
+/// Reuse the complete scalar context, independently of backing allocation reuse.
+fn context_reuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("EGCL_MAPPED_BRIDGE_CONTEXT_REUSE").as_deref() != Some("0".as_ref())
+    })
+}
+
+#[path = "mapped_ordinary_context.rs"]
+mod context_reuse;
+
 impl Lease {
     fn new(code: Rc<TransferCode>, env: &mut Env, frame: *mut Frame) -> Self {
         #[cfg(test)]
@@ -193,23 +209,38 @@ impl Lease {
         let bridge = storage.as_mut().get_mut();
         let state = bridge.state.as_mut().unwrap();
         state.catch_base = env.catch_stack.len();
-        let mut context = state.context(&code, frame, &mut *bridge.children, std::ptr::null_mut());
-        context.ordinary_bridge = true;
-        context.activation = std::ptr::null_mut();
-        context.bridge_clean_return = &mut bridge.clean_return;
-        bridge.context.initialize(context);
+        let constructed = !bridge.context.live;
+        if constructed {
+            let mut context =
+                state.context(&code, frame, &mut *bridge.children, std::ptr::null_mut());
+            context.ordinary_bridge = true;
+            context.activation = std::ptr::null_mut();
+            context.bridge_clean_return = &mut bridge.clean_return;
+            bridge.context.initialize(context);
+        } else {
+            debug_assert!(context_reuse_enabled());
+            bridge.context.attach(&code, env, frame);
+        }
+        // Body-root acquisition remains per active checkout. The idle core
+        // owns neither this token nor an Rc<TransferCode> (no pool cycle).
         let body = super::super::ActiveBytecodeRoot::new(&code.body);
-        crate::cli::activation_census::bridge_lease(storage_reused, || {
-            crate::cli::activation_census::Shape {
-                owner: code.installed_symbol,
-                t2: code.is_t2,
-                ordinary: code.ordinary_entry.is_some(),
-                captured: code.body.has_env,
-                self_calls: !code.body.self_call_sites.is_empty(),
-                osr: !code.osr_entries.is_empty(),
-                variadic: code.body.variadic,
-            }
-        });
+        if constructed {
+            #[cfg(test)]
+            CONTEXT_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+            // This diagnostic counts construction, not checkout of a retained
+            // context. Backing reuse is a separate property of a construction.
+            crate::cli::activation_census::bridge_lease(storage_reused, || {
+                crate::cli::activation_census::Shape {
+                    owner: code.installed_symbol,
+                    t2: code.is_t2,
+                    ordinary: code.ordinary_entry.is_some(),
+                    captured: code.body.has_env,
+                    self_calls: !code.body.self_call_sites.is_empty(),
+                    osr: !code.osr_entries.is_empty(),
+                    variadic: code.body.variadic,
+                }
+            });
+        }
         Self {
             code,
             body,
@@ -249,7 +280,11 @@ impl Drop for Lease {
         // Parent generated bindings have already retired before lane storage.
         // Drop controls/publication before exposing the backing to another lease.
         bridge.generated = None;
-        bridge.context.clear();
+        if context_reuse_enabled() {
+            bridge.context.park();
+        } else {
+            bridge.context.clear();
+        }
         bridge.function = NIL;
         bridge.dispatch_function = NIL;
         bridge.args = EntryArgs::new(&[]);
@@ -272,8 +307,22 @@ static ENTRIES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
 #[cfg(test)]
 static PREPARES: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
-// PREPARES counts live lane/context initializations, including pool hits.
+// PREPARES counts live lane checkouts, including retained-context hits.
 // STORAGE_BIRTHS counts the four backing allocations only, never context reset.
+#[cfg(test)]
+static CONTEXT_DROPS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+fn take_context_drops_for_test() -> usize {
+    CONTEXT_DROPS.with(|count| count.replace(0))
+}
+#[cfg(test)]
+static CONTEXT_CONSTRUCTIONS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
+#[cfg(test)]
+fn take_context_constructions_for_test() -> usize {
+    CONTEXT_CONSTRUCTIONS.with(|count| count.replace(0))
+}
 #[cfg(test)]
 static STORAGE_BIRTHS: egcl_rt::execution_local::ExecutionLocal<Cell<usize>> =
     unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new(0)) };
@@ -606,3 +655,7 @@ mod pool_tests;
 #[cfg(test)]
 #[path = "mapped_ordinary_overflow_tests.rs"]
 mod overflow_tests;
+
+#[cfg(test)]
+#[path = "mapped_ordinary_context_tests.rs"]
+mod context_tests;

@@ -686,6 +686,11 @@
 
 ### Performance
 
+- Reuse initialized native bridge contexts across parent calls on x86-64 Linux,
+  avoiding repeated context construction while refreshing execution controls
+  and preserving immediate code retirement
+  ([#992](https://github.com/atgreen/evergreen/pull/992)).
+
 - Reuse ordinary native bridges for eligible T1 function-object calls from
   mapped code. Retain eligible bridge contexts within each caller beyond
   its four generated bindings, avoiding repeated activation and context setup
