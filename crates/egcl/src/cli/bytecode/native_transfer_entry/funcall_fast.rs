@@ -378,11 +378,42 @@ struct T1Candidate {
     body: Arc<BytecodeFunction>,
     native: Rc<NativeCode>,
     actual_instance: u32,
+    ordinary_offset: usize,
 }
 
 fn t1_object_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("EGCL_MAPPED_T1_FUNCALL").as_deref() != Some("0".as_ref()))
+}
+
+/// Routing hint only: leave a possible ordinary T1 call to the published
+/// checked entry. It does not authorize execution. That entry must still take
+/// a fresh `t1_candidate`, including exact owner/body/generation, dynamic scope,
+/// profile, depth and promotion guards, after any intervening poll.
+///
+/// Borrow the installed code without cloning owners or synchronizing registries.
+/// False positives use the checked call's existing generic fallback.
+fn t1_preparation_hint(function: EgclVal, nargs: usize) -> bool {
+    if !t1_object_enabled() || !egcl_rt::function::is_interpreted_function(function) {
+        return false;
+    }
+    let Some(symbol) = egcl_rt::function::name(function).symbol_index() else {
+        return false;
+    };
+    NATIVE_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let Some(native) = registry.get(&symbol) else {
+            return false;
+        };
+        let NativeCodeStorage::Mapped(code) = &native._storage else {
+            return false;
+        };
+        !native.is_t2
+            && code.ordinary_entry.is_some()
+            && fixed_tagged_parameters(&code.body)
+            && code.body.self_call_sites.is_empty()
+            && arity_accepts(&code.body, nargs)
+    })
 }
 
 /// Pure unpublished preparation. No heat, completion poll, compiler request,
@@ -429,7 +460,9 @@ fn t1_candidate(function: EgclVal, nargs: usize) -> Option<T1Candidate> {
             return None;
         }
     } else {
-        let definition = named_definitions().borrow().get(&symbol).cloned()?;
+        let definitions = named_definitions();
+        let definitions = definitions.borrow();
+        let definition = definitions.get(&symbol)?;
         if definition.function != function
             || REGISTRY_GENERATION.with(|generation| generation.borrow().get(&symbol).copied())
                 != Some(definition.generation)
@@ -476,12 +509,53 @@ fn t1_candidate(function: EgclVal, nargs: usize) -> Option<T1Candidate> {
         } else {
             symbol
         };
+    // prefer_ordinary_child has just validated this exact offset through
+    // lean_root_entry; do not repeat its immutable body classification.
+    let ordinary_offset = code.ordinary_entry?;
     Some(T1Candidate {
         symbol,
         body,
         native,
         actual_instance,
+        ordinary_offset,
     })
+}
+
+struct T1InvocationRoots {
+    function: EgclVal,
+    args: EntryArgs,
+    active: super::super::ActiveCallableRoot,
+    body: super::super::ActiveBytecodeRoot,
+}
+impl egcl_rt::gc::TraceHostRoots for T1InvocationRoots {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.function);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.args, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.active, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.body, visit);
+    }
+}
+
+/// Polling may publish replacement code. Only the exact retained code owner
+/// can reuse its already validated immutable entry offset; a replacement
+/// must establish its own root-entry capability. Neither may bypass a newly
+/// requested recompile.
+fn t1_selected_offset(
+    prepared: &Rc<NativeCode>,
+    ordinary_offset: usize,
+    selected: &Rc<NativeCode>,
+) -> Option<usize> {
+    let NativeCodeStorage::Mapped(code) = &selected._storage else {
+        return None;
+    };
+    if code.needs_recompile() {
+        return None;
+    }
+    if Rc::ptr_eq(prepared, selected) {
+        Some(ordinary_offset)
+    } else {
+        code.lean_root_entry()
+    }
 }
 
 /// Once credited, this call is consumed even if the bridge declines. Reentering
@@ -494,59 +568,81 @@ fn run_t1(
     env: &mut Env,
 ) -> Result<EgclVal, EgclError> {
     let _call_depth = super::super::super::CallDepthGuard::enter()?;
-    egcl_rt::rooted!(function = function);
-    egcl_rt::rooted!(args = EntryArgs::new(args));
-    egcl_rt::rooted!(_active = super::super::ActiveCallableRoot(candidate.actual_instance));
-    egcl_rt::rooted!(_body = super::super::ActiveBytecodeRoot::new(&candidate.body));
-    // Retain the prepared code/helpers through the canonical poll. The
-    // explicit body root above traces constants independently of registries.
-    let _prepared_owner = candidate.native;
-    let resolved = record_callable_invocation_and_body(*function);
+    let T1Candidate {
+        symbol,
+        body,
+        native,
+        actual_instance,
+        ordinary_offset,
+    } = candidate;
+    // One registration retains exactly the same four traced components. Move
+    // the already-owned body lease instead of cloning another Arc for its root.
+    egcl_rt::rooted!(
+        roots = T1InvocationRoots {
+            function,
+            args: EntryArgs::new(args),
+            active: super::super::ActiveCallableRoot(actual_instance),
+            body: super::super::ActiveBytecodeRoot::from_owned(body),
+        }
+    );
+    // Declared after roots: code/helpers retire while body/argument roots
+    // remain linked, including on cold fallback and exceptional return.
+    let prepared_owner = native;
+    let resolved = record_callable_invocation_and_body(roots.function);
     // A concurrent definition setter may win after the pure snapshot. Once
     // counted, let canonical retained-object dispatch resolve that race, without
     // reentering apply_function_impl or crediting the invocation again.
-    let name = egcl_rt::function::name(*function).as_symbol_index();
-    if resolved.is_none_or(|(symbol, body)| {
-        symbol != candidate.symbol || !Arc::ptr_eq(&body, &candidate.body)
+    let name = egcl_rt::function::name(roots.function).as_symbol_index();
+    if resolved.is_none_or(|(resolved_symbol, body)| {
+        resolved_symbol != symbol || !Arc::ptr_eq(&body, &roots.body._function)
     }) {
-        return call_registered(name, args.as_slice(), *function, env).unwrap_or_else(|| {
-            run_with_sym(
-                Arc::clone(&candidate.body),
-                args.as_slice(),
-                *function,
-                candidate.symbol,
-                env,
-            )
-        });
+        return call_registered(name, roots.args.as_slice(), roots.function, env).unwrap_or_else(
+            || {
+                run_with_sym(
+                    Arc::clone(&roots.body._function),
+                    roots.args.as_slice(),
+                    roots.function,
+                    symbol,
+                    env,
+                )
+            },
+        );
     }
-    let count = dispatch_invoke_count(candidate.symbol, Some(*function));
-    let selected = native_for_dispatch(candidate.symbol, Some(*function), count, &candidate.body);
+    let count = dispatch_invoke_count(symbol, Some(roots.function));
+    let selected = native_for_dispatch(symbol, Some(roots.function), count, &roots.body._function);
     #[cfg(test)]
     FAST_CALLS.with(|counter| counter.set((counter.get().0 + 1, counter.get().1)));
     if let Some(native) = selected
         && native
             .body
             .as_ref()
-            .is_some_and(|body| Arc::ptr_eq(body, &candidate.body))
+            .is_some_and(|body| Arc::ptr_eq(body, &roots.body._function))
         && NATIVE_DEPTH.with(Cell::get) < native_depth_cap()
     {
         if let NativeCodeStorage::Mapped(code) = &native._storage
-            && fixed_tagged_parameters(&candidate.body)
-            && candidate.body.self_call_sites.is_empty()
-            && let Some(offset) = code.lean_root_entry()
+            && fixed_tagged_parameters(&roots.body._function)
+            && roots.body._function.self_call_sites.is_empty()
+            && let Some(offset) = t1_selected_offset(&prepared_owner, ordinary_offset, &native)
             && let Some(result) = unsafe {
-                mapped_ordinary::call(code, offset, *function, args.as_slice(), env, None)
+                mapped_ordinary::call(
+                    code,
+                    offset,
+                    roots.function,
+                    roots.args.as_slice(),
+                    env,
+                    None,
+                )
             }
         {
             return result;
         }
-        return run_native_callable(&native, candidate.symbol, *function, args.as_slice(), env);
+        return run_native_callable(&native, symbol, roots.function, roots.args.as_slice(), env);
     }
     run_with_sym(
-        candidate.body,
-        args.as_slice(),
-        *function,
-        candidate.symbol,
+        Arc::clone(&roots.body._function),
+        roots.args.as_slice(),
+        roots.function,
+        symbol,
         env,
     )
 }
@@ -716,7 +812,7 @@ pub(in crate::cli::bytecode) unsafe fn cached(record: *mut MappedCallRecord) -> 
     if let Some(target) = lookup_admissible(function, rest.len()) {
         return !enters_as_child(&target);
     }
-    t1_candidate(function, rest.len()).is_some()
+    t1_preparation_hint(function, rest.len())
 }
 
 /// [`cached`], filling the table first on a miss. The caller is published, and
@@ -732,9 +828,9 @@ pub(in crate::cli::bytecode) unsafe fn prepare(record: *mut MappedCallRecord) ->
     if let Some(target) = lookup_admissible(function, rest.len()) {
         return !enters_as_child(&target);
     }
-    // A positive T1 preparation remains pure and never attempts T2 fill.
+    // A positive T1 hint is only routing: checked call takes the full proof.
     // Existing nonadmissible entries retain lookup_or_fill's miss semantics.
-    t1_candidate(function, rest.len()).is_some()
+    t1_preparation_hint(function, rest.len())
         || lookup_or_fill(function, rest.len()).is_some_and(|target| !enters_as_child(&target))
 }
 

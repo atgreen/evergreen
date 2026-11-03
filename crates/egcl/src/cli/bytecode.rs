@@ -1434,9 +1434,14 @@ struct ActiveBytecodeRoot {
 
 impl ActiveBytecodeRoot {
     fn new(function: &Arc<BytecodeFunction>) -> Self {
+        Self::from_owned(Arc::clone(function))
+    }
+
+    /// Transfer an existing body lease into its precise root without cloning it.
+    fn from_owned(function: Arc<BytecodeFunction>) -> Self {
         install_bytecode_root_scanner();
         Self {
-            _function: Arc::clone(function),
+            _function: function,
         }
     }
 }
