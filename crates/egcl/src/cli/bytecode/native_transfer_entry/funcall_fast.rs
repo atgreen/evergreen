@@ -220,6 +220,12 @@ fn lookup(function: EgclVal) -> Option<Target> {
     })
 }
 
+/// Preserve existing admissible T2/builtin cache hits before attempting an
+/// uncached T1 query. Child hits still belong to their original preparation.
+fn lookup_admissible(function: EgclVal, nargs: usize) -> Option<Target> {
+    lookup(function).filter(|target| admissible(target, nargs))
+}
+
 /// Select the target the general route would run, and remember it.
 /// Selection reads Rust-side registries only and should never collect; if a
 /// collection does intervene, the selected target's callable may have moved,
@@ -273,6 +279,8 @@ pub(in crate::cli::bytecode) fn closure_carrier(mut function: EgclVal) -> Option
 }
 
 fn select(function: EgclVal, nargs: usize) -> Option<Target> {
+    #[cfg(test)]
+    record_dispatch_query_for_test(function, false);
     if profiling_disabled() {
         return None;
     }
@@ -382,6 +390,8 @@ fn t1_object_enabled() -> bool {
 /// uninterned objects have additional representative-owner aggregation; their
 /// original route remains authoritative, as do cons/reified source wrappers.
 fn t1_candidate(function: EgclVal, nargs: usize) -> Option<T1Candidate> {
+    #[cfg(test)]
+    record_dispatch_query_for_test(function, true);
     if !t1_object_enabled()
         || profiling_disabled()
         || !egcl_rt::function::is_interpreted_function(function)
@@ -491,12 +501,12 @@ fn run_t1(
     // Retain the prepared code/helpers through the canonical poll. The
     // explicit body root above traces constants independently of registries.
     let _prepared_owner = candidate.native;
-    record_callable_invocation(*function);
+    let resolved = record_callable_invocation_and_body(*function);
     // A concurrent definition setter may win after the pure snapshot. Once
     // counted, let canonical retained-object dispatch resolve that race, without
     // reentering apply_function_impl or crediting the invocation again.
     let name = egcl_rt::function::name(*function).as_symbol_index();
-    if bytecode_for_callable(name, *function).is_none_or(|(symbol, body)| {
+    if resolved.is_none_or(|(symbol, body)| {
         symbol != candidate.symbol || !Arc::ptr_eq(&body, &candidate.body)
     }) {
         return call_registered(name, args.as_slice(), *function, env).unwrap_or_else(|| {
@@ -703,9 +713,10 @@ pub(in crate::cli::bytecode) unsafe fn cached(record: *mut MappedCallRecord) -> 
     let Some((&function, rest)) = args.split_first() else {
         return false;
     };
-    lookup(function)
-        .is_some_and(|target| admissible(&target, rest.len()) && !enters_as_child(&target))
-        || t1_candidate(function, rest.len()).is_some()
+    if let Some(target) = lookup_admissible(function, rest.len()) {
+        return !enters_as_child(&target);
+    }
+    t1_candidate(function, rest.len()).is_some()
 }
 
 /// [`cached`], filling the table first on a miss. The caller is published, and
@@ -718,8 +729,11 @@ pub(in crate::cli::bytecode) unsafe fn prepare(record: *mut MappedCallRecord) ->
     let Some((&function, rest)) = args.split_first() else {
         return false;
     };
-    // A positive T1 preparation must remain pure; only the preexisting T2
-    // miss path may synchronize registries while this caller is published.
+    if let Some(target) = lookup_admissible(function, rest.len()) {
+        return !enters_as_child(&target);
+    }
+    // A positive T1 preparation remains pure and never attempts T2 fill.
+    // Existing nonadmissible entries retain lookup_or_fill's miss semantics.
     t1_candidate(function, rest.len()).is_some()
         || lookup_or_fill(function, rest.len()).is_some_and(|target| !enters_as_child(&target))
 }
@@ -736,7 +750,6 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
     let Some((&function, rest)) = args.split_first() else {
         return false;
     };
-    let target = lookup_or_fill(function, rest.len()).filter(|target| !enters_as_child(target));
     let env = NATIVE_ENV.with(Cell::get);
     if env.is_null() {
         return false;
@@ -748,10 +761,23 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
     } else {
         Ingress::Root
     };
-    let t1 = if target.is_none() && matches!(ingress, Ingress::PublishedMapped) {
+    let cached = lookup_admissible(function, rest.len());
+    if cached.as_ref().is_some_and(enters_as_child) {
+        return false;
+    }
+    let t1 = if cached.is_none() && matches!(ingress, Ingress::PublishedMapped) {
         t1_candidate(function, rest.len())
     } else {
         None
+    };
+    // Eligible T1 has no T2 table entry by design. Do not run the failing T2
+    // selector before its canonical dispatch; real T2 hits stayed first above.
+    let target = match cached {
+        Some(target) => Some(target),
+        None if t1.is_none() => {
+            lookup_or_fill(function, rest.len()).filter(|target| !enters_as_child(target))
+        }
+        None => None,
     };
     if target.is_none() && t1.is_none() {
         return false;
@@ -795,3 +821,27 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
 #[cfg(test)]
 #[path = "t1_object_tests.rs"]
 mod t1_object_tests;
+
+#[cfg(test)]
+static DISPATCH_QUERIES: egcl_rt::execution_local::ExecutionLocal<
+    Cell<(Option<u32>, usize, usize)>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((None, 0, 0))) };
+#[cfg(test)]
+fn record_dispatch_query_for_test(function: EgclVal, t1: bool) {
+    DISPATCH_QUERIES.with(|slot| {
+        let (owner, selects, candidates) = slot.get();
+        if owner.is_some()
+            && egcl_rt::function::is_interpreted_function(function)
+            && egcl_rt::function::name(function).symbol_index() == owner
+        {
+            slot.set((
+                owner,
+                selects + usize::from(!t1),
+                candidates + usize::from(t1),
+            ));
+        }
+    });
+}
+#[cfg(test)]
+#[path = "t1_dispatch_overhead_tests.rs"]
+mod t1_dispatch_overhead_tests;

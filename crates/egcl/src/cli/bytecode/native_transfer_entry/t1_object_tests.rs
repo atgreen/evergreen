@@ -676,7 +676,7 @@ fn rust_outer_t1_object_calls_keep_root_ingress_and_retained_definition_semantic
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
-fn committed_t1_object_fifth_lane_miss_credits_once_and_keeps_native_root_fallback() {
+fn committed_t1_object_fifth_lane_credits_once_with_overflow_or_explicit_root_control() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -715,19 +715,27 @@ fn committed_t1_object_fifth_lane_miss_credits_once_and_keeps_native_root_fallba
     );
     assert_eq!(
         mapped_ordinary::take_entries_for_test(),
-        4,
-        "four prepared code lanes exhaust the live-parent bound"
+        if mapped_ordinary::overflow_enabled() {
+            5
+        } else {
+            4
+        },
+        "four cached lanes plus the admitted uncached call, or explicit OFF root control"
     );
     assert_eq!(
         super::super::take_lean_root_entries_for_test(),
-        1,
-        "the committed fifth call really executes existing native root ingress"
+        usize::from(!mapped_ordinary::overflow_enabled()),
+        "only explicit overflow OFF uses the original counted root fallback"
     );
     assert_eq!(super::super::take_nested_entries(), 0);
     assert_eq!(
         super::super::take_activation_counts_for_test(),
-        (1, 1),
-        "only the original root fallback prepares/recycles, once"
+        if mapped_ordinary::overflow_enabled() {
+            (0, 0)
+        } else {
+            (1, 1)
+        },
+        "OFF retains the once-counted after-credit root fallback proof"
     );
     for function in functions.iter() {
         assert_eq!(

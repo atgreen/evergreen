@@ -22,6 +22,7 @@ fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<Nat
 struct Probe {
     owner: usize,
     tier: u8,
+    third_entry: usize,
     observed: bool,
     observed_after_resume: bool,
     control: u64,
@@ -62,7 +63,7 @@ fn observe_hot_middle() {
             // A third call begins only after the parked second call resumes.
             // Its entry poll may publish before refreshing stale snapshots;
             // require a later real publication with current consumed state.
-            if *mapped_ordinary::entry_counter() == 3
+            if *mapped_ordinary::entry_counter() == (*probe).third_entry
                 && PARKED_ORIGIN.load(Ordering::Acquire) != 0
                 && egcl_rt::current_thread_id().0 != PARKED_ORIGIN.load(Ordering::Acquire)
             {
@@ -165,12 +166,18 @@ fn wait_until(mut ready: impl FnMut() -> bool, message: &str) {
 }
 
 fn object_fiber() -> EgclVal {
-    object_fiber_for_tier(2)
+    object_fiber_for_tier(2, false)
 }
 fn object_t1_fiber() -> EgclVal {
-    object_fiber_for_tier(1)
+    object_fiber_for_tier(1, false)
 }
-fn object_fiber_for_tier(tier: u8) -> EgclVal {
+fn object_overflow_fiber() -> EgclVal {
+    object_fiber_for_tier(2, true)
+}
+fn object_t1_overflow_fiber() -> EgclVal {
+    object_fiber_for_tier(1, true)
+}
+fn object_fiber_for_tier(tier: u8, overflow: bool) -> EgclVal {
     let mut env = Env::new_impl(false, false, false);
     egcl_rt::rooted_ref!(_env = &mut env);
     let (middle_symbol, mut middle) = install(
@@ -199,12 +206,26 @@ fn object_fiber_for_tier(tier: u8) -> EgclVal {
     assert!(owner(&middle).lean_root_entry().is_some());
     let middle_owner = Rc::as_ptr(owner(&middle)) as usize;
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(middle_symbol).unwrap());
+    let prefix = if overflow {
+        assert!(mapped_ordinary::overflow_enabled());
+        for index in 0..4 {
+            // The ordinary install helper compiles bytecode only. Define the
+            // source callable too, as startup does for MIDDLE: opportunistic
+            // parent lowering and exact-object dispatch require that binding.
+            install_mapped(&mut env, &format!("MF-OVERFLOW-FILL-{index}"), "(x)", "x");
+        }
+        "(mf-overflow-fill-0 0) (mf-overflow-fill-1 1) (mf-overflow-fill-2 2) (mf-overflow-fill-3 3)"
+    } else {
+        ""
+    };
+    let forms = format!("(locally (declare (notinline mf-overflow-fill-0 mf-overflow-fill-1 mf-overflow-fill-2 mf-overflow-fill-3))
+        (progn {prefix} (funcall f 1 2 3 4)
+          (multiple-value-prog1 (funcall f d c b a) (funcall f 5 6 7 8))))");
     let (symbol, outer) = install_mapped(
         &mut env,
         "MF-OBJECT-FIBER-OUTER",
         "(f a b c d &key (seed (1+ 0)))",
-        "(progn (funcall f 1 2 3 4)
-           (multiple-value-prog1 (funcall f d c b a) (funcall f 5 6 7 8)))",
+        &forms,
     );
     assert!(owner(&outer).ordinary_entry.is_none());
     let heat_before_warm = egcl_rt::function::invoke_count(*function);
@@ -234,8 +255,8 @@ fn object_fiber_for_tier(tier: u8) -> EgclVal {
     }
     assert_eq!(
         mapped_ordinary::take_storage_births_for_test(),
-        1,
-        "two separate warm parents reuse the same execution-owned backing"
+        if overflow { 5 } else { 1 },
+        "two separate warm parents reuse backing without expanding the four cached lanes"
     );
     if tier == 1 {
         assert_eq!(
@@ -267,11 +288,13 @@ fn object_fiber_for_tier(tier: u8) -> EgclVal {
     mapped_ordinary::take_entries_for_test();
     mapped_ordinary::take_prepares_for_test();
     take_lean_root_entries_for_test();
+    mapped_ordinary::take_uncached_calls_for_test();
     start_activation_counts_for_test(middle_symbol);
     let heat_before_live = egcl_rt::function::invoke_count(*function);
     let mut probe = Probe {
         owner: middle_owner,
         tier,
+        third_entry: if overflow { 7 } else { 3 },
         observed: false,
         observed_after_resume: false,
         control: 0,
@@ -304,15 +327,20 @@ fn object_fiber_for_tier(tier: u8) -> EgclVal {
     );
     assert_eq!(
         mapped_ordinary::take_entries_for_test(),
-        3,
-        "third object call starts after suspension through the same native bridge"
+        if overflow { 7 } else { 3 },
+        "third object call starts after suspension, including any four cached filler calls"
     );
     assert_eq!(
         mapped_ordinary::take_prepares_for_test(),
-        1,
-        "one live mapped parent owns one bridge for all three object calls"
+        if overflow { 7 } else { 1 },
+        "uncached calls reset one local lease each; generated/cache capacity remains four"
     );
     assert_eq!(take_lean_root_entries_for_test(), 0);
+    assert_eq!(
+        mapped_ordinary::take_uncached_calls_for_test(),
+        if overflow { (3, 4) } else { (0, 0) },
+        "the suspended and post-resume calls must both use the real uncached route"
+    );
     assert_eq!(
         mapped_ordinary::take_storage_births_for_test(),
         0,
@@ -432,6 +460,17 @@ fn published_object_funcall_bridge_survives_actual_migration_and_external_gc() {
 #[ignore = "requires a platform-supported native segment transition"]
 fn published_t1_object_funcall_bridge_preserves_heat_across_actual_migration_and_external_gc() {
     run_migration(object_t1_fiber, 1);
+}
+
+#[test]
+#[ignore = "requires native migration and external moving collection"]
+fn uncached_t2_object_bridge_survives_migration_external_gc_and_post_resume_call() {
+    run_migration(object_overflow_fiber, 2);
+}
+#[test]
+#[ignore = "requires native migration and external moving collection"]
+fn uncached_t1_object_bridge_preserves_heat_through_migration_and_external_gc() {
+    run_migration(object_t1_overflow_fiber, 1);
 }
 
 fn run_migration(entry: fn() -> EgclVal, tier: u8) {

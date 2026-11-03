@@ -28342,16 +28342,29 @@ pub(super) fn installed_closure_tier(function: EgclVal) -> Option<u8> {
 /// its target to T0, so the same dispatches count every explicitly profiled call.
 /// Resolve the retained definition rather than trusting shared object tier bits.
 pub(super) fn record_callable_invocation(function: EgclVal) {
+    let _ = record_callable_invocation_and_body(function);
+}
+
+/// Credit the same invocation while returning the exact retained definition
+/// already resolved for that decision. Native object dispatch can reuse this
+/// snapshot without another registry synchronization or a different body.
+fn record_callable_invocation_and_body(function: EgclVal) -> Option<(u32, Arc<BytecodeFunction>)> {
     if profiling_disabled() {
-        return;
+        return None;
     }
     let name = egcl_rt::function::name(function);
-    let optimized = name.is_symbol()
-        && bytecode_for_callable(name.as_symbol_index(), function)
-            .is_some_and(|(symbol, body)| has_t2_body(symbol, &body));
+    let resolved = if name.is_symbol() {
+        bytecode_for_callable(name.as_symbol_index(), function)
+    } else {
+        None
+    };
+    let optimized = resolved
+        .as_ref()
+        .is_some_and(|(symbol, body)| has_t2_body(*symbol, body));
     if !optimized {
         egcl_rt::function::record_invocation(function);
     }
+    resolved
 }
 
 /// Return invocation heat. Named functions have already been counted by the

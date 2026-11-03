@@ -120,6 +120,22 @@ fn pooling_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("EGCL_MAPPED_BRIDGE_POOL").as_deref() != Some("0".as_ref()))
 }
+
+pub(in crate::cli::bytecode) fn overflow_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("EGCL_MAPPED_BRIDGE_OVERFLOW").as_deref() != Some("0".as_ref())
+    })
+}
+
+#[cfg(test)]
+static UNCACHED_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<(usize, usize)>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((0, 0))) };
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_uncached_calls_for_test() -> (usize, usize) {
+    UNCACHED_CALLS.with(|slot| slot.replace((0, 0)))
+}
 impl Lease {
     fn new(code: Rc<TransferCode>, env: &mut Env, frame: *mut Frame) -> Self {
         #[cfg(test)]
@@ -331,6 +347,26 @@ pub(super) unsafe fn call(
         }
         None => {
             if unsafe { (&*slot).len() } == LANES {
+                if overflow_enabled() {
+                    // This call owns an uncached lease, not a fifth generated
+                    // lane. Its precise host root replaces parent-lane tracing;
+                    // pinned backing and code/body ownership span all native
+                    // execution and cold recovery. run's Restore retires the
+                    // active context before the lease can detach/pool storage.
+                    egcl_rt::rooted!(
+                        lease = Lease::new(Rc::clone(code), env, unsafe { (*parent).frame })
+                    );
+                    let bridge = lease.bridge_mut() as *mut Bridge;
+                    #[cfg(test)]
+                    UNCACHED_CALLS.with(|counts| {
+                        let (calls, _) = counts.get();
+                        counts.set((calls + 1, unsafe { (&*slot).len() }));
+                    });
+                    // Never bind a generated pointer into this local lease.
+                    return Some(unsafe {
+                        run(code, bridge, offset, function, args, env, execution)
+                    });
+                }
                 crate::cli::activation_census::note_refusal(
                     crate::cli::activation_census::Refusal::Capacity,
                     unsafe { (*(*parent).owner).installed_symbol },
@@ -511,3 +547,7 @@ unsafe fn run(
 #[cfg(test)]
 #[path = "mapped_ordinary_pool_tests.rs"]
 mod pool_tests;
+
+#[cfg(test)]
+#[path = "mapped_ordinary_overflow_tests.rs"]
+mod overflow_tests;
