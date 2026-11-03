@@ -798,6 +798,19 @@ unsafe extern "C" fn checked_call_published(
     PUBLISHED_CHECKED_CALLS.with(|count| count.set(count.get() + 1));
     unsafe {
         root_publication::published_mapped(record, || {
+            let _census_ingress = crate::cli::activation_census::scope(|| {
+                use crate::cli::activation_census::Ingress;
+                if !generated_mapped_ingress(record) {
+                    return (Ingress::CheckedCompatibility, None, None);
+                }
+                if call_table::is_builtin_funcall(target) {
+                    let invocation = &*(*record).context;
+                    let receiver = (invocation.nargs != 0).then(|| *invocation.args);
+                    (Ingress::MappedFuncall, None, receiver)
+                } else {
+                    (Ingress::MappedNamed, None, None)
+                }
+            });
             let direct = call_lean_target(target, record)
                 || (call_table::is_builtin_funcall(target) && funcall_fast::call(record));
             if !direct {
@@ -1779,7 +1792,10 @@ impl TransferCode {
             self,
             match osr {
                 Some(resume) => resume.state,
-                None => ActivationState::prepare_reusing(self, env)?,
+                None => crate::cli::activation_census::at_preparation(
+                    crate::cli::activation_census::PrepareSite::GeneralRoot,
+                    || ActivationState::prepare_reusing(self, env),
+                )?,
             },
         );
         let mut children = SegmentActivations::default();

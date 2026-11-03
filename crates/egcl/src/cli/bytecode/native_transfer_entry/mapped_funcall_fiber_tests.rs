@@ -38,6 +38,10 @@ fn observe_hot_middle() {
         return;
     }
     if root_publication::published_frame_has_owner_for_test(unsafe { (*probe).owner }) {
+        assert!(
+            crate::cli::activation_census::migration_scope_live_for_test(),
+            "execution-owned diagnostic scope survives actual suspension/migration"
+        );
         unsafe {
             (*probe).observed = true;
             // The physical publication resolves to this exact code owner,
@@ -317,6 +321,9 @@ fn object_fiber_for_tier(tier: u8, fillers: usize) -> EgclVal {
         control: 0,
     };
     let _observing = observing(&mut probe);
+    let origin_before = crate::cli::activation_census::scope_snapshot_for_test();
+    let origin_scope = crate::cli::activation_census::migration_scope_for_test();
+    let origin_active = crate::cli::activation_census::scope_snapshot_for_test();
     egcl_rt::rooted!(
         result = run_mapped(
             symbol,
@@ -421,6 +428,16 @@ fn object_fiber_for_tier(tier: u8, fillers: usize) -> EgclVal {
     );
     assert_eq!(egcl_rt::native_transfer::current_segment(), segment);
     assert_eq!(unsafe { &*execution }.active_native_control(), control);
+    assert_eq!(
+        crate::cli::activation_census::scope_snapshot_for_test(),
+        origin_active,
+        "nested native ingress scopes restore the migrating outer diagnostic"
+    );
+    drop(origin_scope);
+    assert_eq!(
+        crate::cli::activation_census::scope_snapshot_for_test(),
+        origin_before
+    );
     EgclVal::from_fixnum(1)
 }
 

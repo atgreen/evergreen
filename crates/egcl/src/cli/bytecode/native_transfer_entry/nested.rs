@@ -285,7 +285,10 @@ unsafe fn prepare_child(
     };
     validate_declared_args(&code.body, args)?;
     let env = unsafe { &mut *NATIVE_ENV.with(Cell::get) };
-    let state = ActivationState::prepare_reusing(&code, env)?;
+    let state = crate::cli::activation_census::at_preparation(
+        crate::cli::activation_census::PrepareSite::NestedChild,
+        || ActivationState::prepare_reusing(&code, env),
+    )?;
     let children = unsafe { (*parent).children };
     unsafe { (*children).active.try_reserve(1) }.map_err(|_| EgclError::Oom)?;
     let mut child = Box::new(ChildActivation {

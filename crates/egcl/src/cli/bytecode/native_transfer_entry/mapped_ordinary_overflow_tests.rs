@@ -275,8 +275,26 @@ fn fifth_named_and_object_targets_execute_native_without_general_activations() {
             fixture.reset();
             let _observing = Observing::new();
             take_storage_births_for_test();
+            let census_owners: Vec<_> = fixture.children.iter().map(|child| child.0).collect();
+            let census_before = crate::cli::activation_census::origins_enabled().then(|| {
+                crate::cli::activation_census::bridge_lease_counts_for_test(&census_owners)
+            });
             assert_eq!(fixture.run(T, 99, &mut env).unwrap(), T);
             fixture.assert_route(100);
+            if let Some(before) = census_before {
+                let after =
+                    crate::cli::activation_census::bridge_lease_counts_for_test(&census_owners);
+                let difference: [u64; 4] = std::array::from_fn(|i| after[i] - before[i]);
+                assert_eq!(
+                    difference,
+                    if targets == 5 {
+                        [5, 0, 0, 0]
+                    } else {
+                        [16, 0, 1, 99]
+                    },
+                    "real contexts rebuild once per cachedtarget or every uncachedcall; pool reuse is separate"
+                );
+            }
             assert_eq!(
                 take_prepares_for_test(),
                 if targets == 5 { 5 } else { 116 },
@@ -302,6 +320,16 @@ fn fifth_named_and_object_targets_execute_native_without_general_activations() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires both census flags and actual native 5/17-target entry"]
+fn origin_census_counts_actual_cached_and_uncached_contexts() {
+    assert!(
+        crate::cli::activation_census::origins_enabled(),
+        "set EGCL_ACTIVATION_CENSUS and EGCL_ACTIVATION_CENSUS_ORIGINS=1 before process start"
+    );
+    fifth_named_and_object_targets_execute_native_without_general_activations();
 }
 
 #[test]
