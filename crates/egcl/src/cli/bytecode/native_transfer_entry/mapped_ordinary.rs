@@ -319,12 +319,24 @@ pub(super) unsafe fn call(
     let index = match cached {
         Some(index) => {
             if unsafe { (&*slot)[index].bridge().busy } {
+                crate::cli::activation_census::note_refusal(
+                    crate::cli::activation_census::Refusal::Busy,
+                    unsafe { (*(*parent).owner).installed_symbol },
+                    code.installed_symbol,
+                    code.is_t2,
+                );
                 return None;
             }
             index
         }
         None => {
             if unsafe { (&*slot).len() } == LANES {
+                crate::cli::activation_census::note_refusal(
+                    crate::cli::activation_census::Refusal::Capacity,
+                    unsafe { (*(*parent).owner).installed_symbol },
+                    code.installed_symbol,
+                    code.is_t2,
+                );
                 return None;
             }
             let frame = unsafe { (*parent).frame };

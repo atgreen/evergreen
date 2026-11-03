@@ -21,6 +21,7 @@ fn install(name: &str, params: &str, forms: &str, env: &mut Env) -> (u32, Rc<Nat
 
 struct Probe {
     owner: usize,
+    tier: u8,
     observed: bool,
     observed_after_resume: bool,
     control: u64,
@@ -38,6 +39,14 @@ fn observe_hot_middle() {
     if root_publication::published_frame_has_owner_for_test(unsafe { (*probe).owner }) {
         unsafe {
             (*probe).observed = true;
+            // The physical publication resolves to this exact code owner,
+            // independently of the function object's installed tier metadata.
+            let code = &*((*probe).owner as *const TransferCode);
+            assert_eq!(
+                code.is_t2,
+                (*probe).tier == 2,
+                "real published middle frame must execute the requested compiler tier"
+            );
             let execution = egcl_rt::thread::current_execution_context_for_native()
                 .expect("current bridge execution");
             let current_control = (&*execution).active_native_control();
@@ -156,15 +165,38 @@ fn wait_until(mut ready: impl FnMut() -> bool, message: &str) {
 }
 
 fn object_fiber() -> EgclVal {
+    object_fiber_for_tier(2)
+}
+fn object_t1_fiber() -> EgclVal {
+    object_fiber_for_tier(1)
+}
+fn object_fiber_for_tier(tier: u8) -> EgclVal {
     let mut env = Env::new_impl(false, false, false);
     egcl_rt::rooted_ref!(_env = &mut env);
-    let (middle_symbol, middle) = install(
+    let (middle_symbol, mut middle) = install(
         "MF-OBJECT-FIBER-MIDDLE",
         "(a b c d)",
         "((mf-object-fiber-terminal b d a c))",
         &mut env,
     );
+    if tier == 1 {
+        let body = Arc::clone(middle.body.as_ref().unwrap());
+        let baseline = with_ordinary_non_tail_emission_for_test(|| {
+            install_t1(middle_symbol, Arc::clone(&body), false)
+        })
+        .expect("real non-tail T1 ordinary middle");
+        assert!(!baseline.is_t2);
+        assert!(Arc::ptr_eq(baseline.body.as_ref().unwrap(), &body));
+        publish_native(
+            middle_symbol,
+            egcl_rt::symbols::symbol_function(middle_symbol),
+            &baseline,
+        );
+        middle = baseline;
+    }
+    assert_eq!(middle.is_t2, tier == 2);
     assert!(owner(&middle).ordinary_entry.is_some());
+    assert!(owner(&middle).lean_root_entry().is_some());
     let middle_owner = Rc::as_ptr(owner(&middle)) as usize;
     egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(middle_symbol).unwrap());
     let (symbol, outer) = install_mapped(
@@ -175,6 +207,17 @@ fn object_fiber() -> EgclVal {
            (multiple-value-prog1 (funcall f d c b a) (funcall f 5 6 7 8)))",
     );
     assert!(owner(&outer).ordinary_entry.is_none());
+    let heat_before_warm = egcl_rt::function::invoke_count(*function);
+    if tier == 1 {
+        assert!(
+            t2_invoke_threshold() > heat_before_warm.saturating_add(9),
+            "migration test must not cross a promotion boundary"
+        );
+        assert!(
+            funcall_fast::native_target(*function, 4).is_none(),
+            "T1 must not enter the T2 export/probe path"
+        );
+    }
     let warm = [11, 22, 33, 44].map(EgclVal::from_fixnum);
     mapped_ordinary::take_storage_births_for_test();
     for _ in 0..2 {
@@ -194,6 +237,14 @@ fn object_fiber() -> EgclVal {
         1,
         "two separate warm parents reuse the same execution-owned backing"
     );
+    if tier == 1 {
+        assert_eq!(
+            egcl_rt::function::invoke_count(*function),
+            heat_before_warm + 6,
+            "two warm parents each make three canonically counted T1 object calls"
+        );
+        assert!(funcall_fast::native_target(*function, 4).is_none());
+    }
     let storage = mapped_ordinary::idle_storage_for_test(owner(&middle));
     assert_eq!(storage.0, 1);
     // The exact callable stays rooted; the active segment/directory also owns
@@ -217,8 +268,10 @@ fn object_fiber() -> EgclVal {
     mapped_ordinary::take_prepares_for_test();
     take_lean_root_entries_for_test();
     start_activation_counts_for_test(middle_symbol);
+    let heat_before_live = egcl_rt::function::invoke_count(*function);
     let mut probe = Probe {
         owner: middle_owner,
+        tier,
         observed: false,
         observed_after_resume: false,
         control: 0,
@@ -265,8 +318,28 @@ fn object_fiber() -> EgclVal {
         0,
         "the migrating parent leases backing from an earlier retired parent"
     );
-    let (_, current, _, _) = funcall_fast::native_target(*function, 4).unwrap();
-    assert_eq!(mapped_ordinary::idle_storage_for_test(&current), storage);
+    if tier == 1 {
+        assert_eq!(
+            egcl_rt::function::invoke_count(*function),
+            heat_before_live + 3,
+            "warm, suspended and post-resume calls each credit T1 exactly once"
+        );
+        assert!(funcall_fast::native_target(*function, 4).is_none());
+        // The initial strong NativeCode was dropped before the live run. Look
+        // up only after return in this fiber's execution-local native registry.
+        let current = NATIVE_REGISTRY
+            .with(|registry| registry.borrow().get(&middle_symbol).cloned())
+            .expect("same execution retains exact T1 installation");
+        assert!(!current.is_t2);
+        assert_eq!(Rc::as_ptr(owner(&current)) as usize, middle_owner);
+        assert_eq!(
+            mapped_ordinary::idle_storage_for_test(owner(&current)),
+            storage
+        );
+    } else {
+        let (_, current, _, _) = funcall_fast::native_target(*function, 4).unwrap();
+        assert_eq!(mapped_ordinary::idle_storage_for_test(&current), storage);
+    }
     assert_eq!(
         take_activation_counts_for_test(),
         (0, 0),
@@ -352,6 +425,16 @@ fn native_arguments(rows: &[LogicalFrame]) -> Vec<EgclVal> {
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
 fn published_object_funcall_bridge_survives_actual_migration_and_external_gc() {
+    run_migration(object_fiber, 2);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn published_t1_object_funcall_bridge_preserves_heat_across_actual_migration_and_external_gc() {
+    run_migration(object_t1_fiber, 1);
+}
+
+fn run_migration(entry: fn() -> EgclVal, tier: u8) {
     let _lock = crate::cli::heap_test_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -374,7 +457,7 @@ fn published_object_funcall_bridge_survives_actual_migration_and_external_gc() {
     .unwrap();
     let group =
         egcl_rt::SchedulerGroup::init(&egcl_rt::SchedulerConfig { num_workers: 2 }).unwrap();
-    let entry = unsafe { EgclVal::from_function_ptr(object_fiber as *const () as *mut u8) };
+    let entry = unsafe { EgclVal::from_function_ptr(entry as *const () as *mut u8) };
     let fiber = egcl_rt::thread::make_fiber(entry).unwrap();
     let hold = Arc::new(CarrierHold::default());
     let mut cohort = Cohort {
@@ -423,6 +506,13 @@ fn published_object_funcall_bridge_survives_actual_migration_and_external_gc() {
         "origin carrier must acknowledge hold",
     );
     let middle_symbol = egcl_rt::symbols::intern("MF-OBJECT-FIBER-MIDDLE");
+    if tier == 1 {
+        assert_eq!(
+            egcl_rt::function::tier(egcl_rt::symbols::symbol_function(middle_symbol).unwrap()),
+            1,
+            "stopped native debug row plus exact published T1 owner prove the T1 path"
+        );
+    }
     start_activation_counts_for_test(middle_symbol);
     assert_eq!(
         activation_counts_for_test(),
