@@ -59,6 +59,14 @@ const SETUP: &str = r#"
   (assert (not (slot-boundp *owner-child-instance* 'shared)))
   (setf (owner-shared *owner-child-instance*) *owner-old-shared*)
   (assert (eq (slot-value *owner-old-instance* 'shared) *owner-old-shared*))
+  ;; Inherited unbinding must reach that same retained owner too, even after
+  ;; FIND-CLASS for its old name denotes a different class object.
+  (assert (eq (slot-makunbound *owner-child-instance* 'shared) *owner-child-instance*))
+  (assert (not (slot-boundp *owner-old-instance* 'shared)))
+  (assert (not (slot-boundp *owner-child-instance* 'shared)))
+  (setf (owner-shared *owner-old-instance*) *owner-old-shared*)
+  (assert (eq (owner-shared *owner-child-instance*) *owner-old-shared*))
+  (assert (not (eq (owner-new-shared *owner-new-instance*) *owner-old-shared*)))
   (reinitialize-instance *owner-old-instance* :defaulted (list :reset))
   (assert (equal (owner-defaulted *owner-old-instance*) '(:reset)))
   t)
