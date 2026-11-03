@@ -129,6 +129,12 @@ pub(crate) fn string_content(v: EgclVal) -> Option<String> {
 /// adjustable, displaced or registry-backed -- or `None` for a non-string.
 /// Unlike [`string_content`], this keeps surrogate characters (bliss-5fn6m).
 pub fn string_codes(v: EgclVal) -> Option<Vec<u32>> {
+    // NIL-element vectors follow the same empty-string contract as
+    // string_content. Respect active length, not backing capacity; nonempty
+    // storage has no characters to materialise.
+    if is_nil_sequence(v) {
+        return (length(v).ok()? == 0).then(Vec::new);
+    }
     if crate::pathnames::is_pathname(v) {
         return None;
     }

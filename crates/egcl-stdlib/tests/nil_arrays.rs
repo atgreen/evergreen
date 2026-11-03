@@ -48,6 +48,51 @@ fn nil_storage_metadata_displacement_and_stream_writes_remain_precise() {
 }
 
 #[test]
+fn empty_nil_string_codes_follow_active_length_after_displacement_moves() {
+    egcl_rt::rooted!(base = sequences::build_nil_complex_vector(6, 0, true, true).unwrap());
+    egcl_rt::rooted!(
+        view = sequences::build_nil_displaced_vector(*base, 1, 3, 0, false, true).unwrap()
+    );
+    egcl_rt::rooted!(
+        nonempty = sequences::build_nil_displaced_vector(*base, 1, 3, 3, false, false).unwrap()
+    );
+    assert_eq!(sequences::string_codes(*base), Some(Vec::new()));
+    assert_eq!(sequences::string_codes(*view), Some(Vec::new()));
+    assert_eq!(sequences::string_codes(*nonempty), None);
+    let base_before = base.to_raw();
+    let view_before = view.to_raw();
+    HeapCollector::new().minor_gc().unwrap();
+    assert_ne!(base.to_raw(), base_before, "NIL backing base must move");
+    assert_ne!(view.to_raw(), view_before, "displaced string must move");
+    assert_eq!(sequences::cvec_displacement(*view), Some((*base, 1, 3)));
+    assert_eq!(sequences::array_total_size(*base), Some(6));
+    assert_eq!(sequences::array_total_size(*view), Some(3));
+    assert_eq!(sequences::length(*view).unwrap(), 0);
+    egcl_rt::rooted!(simple = egcl_rt::nil_array::make(0).unwrap());
+    egcl_rt::rooted!(empty = streams::make_lisp_string(""));
+    egcl_rt::rooted!(text = streams::make_lisp_string("x"));
+    for value in [*base, *view, *simple] {
+        assert!(egcl_rt::types::stringp(value));
+        assert_eq!(sequences::string_codes(value), Some(Vec::new()));
+        assert!(egcl_stdlib::equality::equal(value, *empty));
+        assert!(egcl_stdlib::equality::equal(*empty, value));
+        assert!(egcl_stdlib::equality::equalp(value, *empty));
+        assert!(!egcl_stdlib::equality::equal(value, *text));
+        assert_eq!(sequences::string_code_at(value, 0), None);
+    }
+    assert!(sequences::aref(*view, 0).is_err());
+    assert!(sequences::set_aref(*view, 0, EgclVal::from_char('x')).is_err());
+    assert!(sequences::elt(*nonempty, 0).is_err());
+    assert_eq!(sequences::string_codes(*nonempty), None);
+    assert!(!egcl_stdlib::equality::equal(*nonempty, *empty));
+    sequences::set_fill_pointer(*base, 2).unwrap();
+    assert_eq!(sequences::length(*base).unwrap(), 2);
+    assert_eq!(sequences::string_codes(*base), None);
+    assert_eq!(sequences::string_codes(*view), Some(Vec::new()));
+    assert!(egcl_stdlib::equality::equal(*view, *empty));
+}
+
+#[test]
 fn nil_predicates_preserve_registered_strings_and_pathname_sequences() {
     use egcl_stdlib::pathnames;
     egcl_rt::rooted!(text = streams::make_lisp_string("nil-array-control"));

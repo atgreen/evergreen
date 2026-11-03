@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Empty NIL-element string comparisons honor active length for displaced and
+  fill-pointer vectors ([#996](https://github.com/atgreen/evergreen/pull/996)).
+
 ## 0.0.12 - 2026-11-03
 
 This release expands native compilation and improves closures, arrays, CLOS,
