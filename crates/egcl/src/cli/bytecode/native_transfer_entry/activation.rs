@@ -100,6 +100,24 @@ impl egcl_rt::gc::TraceHostRoots for ActivationState {
 }
 
 impl ActivationState {
+    #[inline]
+    fn census(code: &TransferCode, recycle: bool) {
+        use crate::cli::activation_census::{self, Shape};
+        if activation_census::enabled() {
+            activation_census::note(
+                Shape {
+                    owner: code.installed_symbol,
+                    t2: code.is_t2,
+                    ordinary: code.ordinary_entry.is_some(),
+                    captured: code.body.has_env,
+                    self_calls: !code.body.self_call_sites.is_empty(),
+                    osr: !code.osr_entries.is_empty(),
+                    variadic: code.body.variadic,
+                },
+                recycle,
+            );
+        }
+    }
     /// The per-call reservations in the live Env and control-value map. A
     /// pooled activation still makes them on every entry: they track the
     /// current dynamic state, not the code.
@@ -195,6 +213,9 @@ impl ActivationState {
         code: &TransferCode,
         env: &mut Env,
     ) -> Result<Box<Self>, EgclError> {
+        #[cfg(test)]
+        count_activation_for_test(code, false);
+        Self::census(code, false);
         let pooled = code.state_pool.borrow_mut().pop();
         let Some(mut state) = pooled else {
             return Self::prepare(code, env).map(Box::new);
@@ -216,6 +237,9 @@ impl ActivationState {
     /// and its snapshots are cleared first, so nothing in the pool holds a
     /// Lisp value that the collector would need to trace.
     pub(super) fn recycle(mut self: Box<Self>, code: &TransferCode) {
+        #[cfg(test)]
+        count_activation_for_test(code, true);
+        Self::census(code, true);
         // A bridge is an activation lease, never an idle code-pool root.
         self.mapped_ordinary.clear();
         let guard_idle = self.guard_resume.as_ref().is_none_or(|guard| {
@@ -518,4 +542,46 @@ impl Drop for ActivationState {
         // Repeated bindings of one symbol must restore newest first.
         while self.specials.pop().is_some() {}
     }
+}
+
+// Execution-owned, symbol-only fixture state: no unrooted Lisp values and no
+// carrier-local accounting that could confuse a migrated fiber's evidence.
+#[cfg(test)]
+static ACTIVATION_COUNTS: egcl_rt::execution_local::ExecutionLocal<
+    Cell<(Option<u32>, usize, usize)>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((None, 0, 0))) };
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn start_activation_counts_for_test(owner: u32) {
+    ACTIVATION_COUNTS.with(|slot| slot.set((Some(owner), 0, 0)));
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn activation_counts_for_test() -> (usize, usize) {
+    ACTIVATION_COUNTS.with(|slot| {
+        let (_, prepare, recycle) = slot.get();
+        (prepare, recycle)
+    })
+}
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_activation_counts_for_test() -> (usize, usize) {
+    ACTIVATION_COUNTS.with(|slot| {
+        let (_, prepare, recycle) = slot.replace((None, 0, 0));
+        (prepare, recycle)
+    })
+}
+
+#[cfg(test)]
+fn count_activation_for_test(code: &TransferCode, recycling: bool) {
+    ACTIVATION_COUNTS.with(|slot| {
+        let (owner, prepare, recycle) = slot.get();
+        if owner.is_some() && owner == code.installed_symbol {
+            slot.set((
+                owner,
+                prepare + usize::from(!recycling),
+                recycle + usize::from(recycling),
+            ));
+        }
+    });
 }

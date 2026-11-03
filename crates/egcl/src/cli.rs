@@ -25,6 +25,7 @@ use egcl_rt::lock_order::{LockLevel, OrderedMutex};
 mod bytecode;
 mod structure_subtype;
 use structure_subtype::raw_structure_boolean_subtypep;
+pub mod activation_census;
 pub mod builtin_census;
 mod class_protocol;
 mod control_payload;
@@ -29799,6 +29800,7 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 let _ = eval_args(cdr, env)?;
                 sprof::stop();
                 builtin_census::write_window();
+                activation_census::write_window();
                 return Ok(EgclVal::from_fixnum(sprof::sample_count() as i64));
             }
             "EGCL-EXT:SPROF-FOLD" => {

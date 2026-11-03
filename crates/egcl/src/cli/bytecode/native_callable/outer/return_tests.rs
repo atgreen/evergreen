@@ -241,3 +241,195 @@ fn published_return_registers_after_callable_fallback_and_unwind() {
         assert_tuple(returned, &env, &expected);
     }
 }
+
+thread_local! {
+    static OWNED_RECORD_PROBE_RAN: Cell<bool> = const { Cell::new(false) };
+    static OWNED_RECORD_PARENT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Mint the same verified outer record geometry as invoke_probe, but retain
+/// the enclosing mapped CAPTURE deliberately. Normal public outer entry clears
+/// CAPTURE already; this adversarial fixture makes the provenance gate itself
+/// necessary instead of passing merely because no parent is visible.
+fn invoke_named_outer_probe(symbol: u32, args: &[EgclVal]) -> Returned {
+    use std::sync::atomic::Ordering;
+    egcl_rt::rooted!(args = args.to_vec());
+    let cell = crate::cli::bytecode::call_table::resolve(symbol).unwrap();
+    let mut probe = Probe {
+        invocation: Invocation {
+            context: NativeCallContext {
+                request: std::ptr::null_mut(),
+                capture: egcl_rt::native_transfer::leave_native_segment as *const u8,
+                args: args.as_mut_ptr(),
+                nargs: args.len(),
+            },
+            // enter_probe transports this opaque first ABI word. A named cell
+            // entry consumes a CallCell address, not a callable-word pointer.
+            // The Arc above retains it; neither Rust nor GC dereferences this
+            // field as an EgclVal in the named-adapter fixture.
+            function: Arc::as_ptr(&cell).cast_mut().cast(),
+            entry: unsafe { &*cell.entry_address(true) }.load(Ordering::Acquire),
+            segment: std::ptr::null_mut(),
+            call_sp: 0,
+            return_pc: 0,
+            caller_segment: current_segment() as usize,
+            caller_capture: native_transfer_entry::child_capture_for_test(),
+            previous_invocation: ACTIVE.with(Cell::get),
+        },
+        returned: Returned::default(),
+    };
+    assert!(
+        probe.invocation.caller_capture.is_some(),
+        "a real mapped parent remains live"
+    );
+    let _active = ActiveInvocation(ACTIVE.with(|active| active.replace(&mut probe.invocation)));
+    // The enclosing real mapped helper publication and rooted args remain
+    // live throughout; only the test bypasses outer entry's CAPTURE clearing.
+    let outcome = unsafe {
+        egcl_rt::native_transfer::invoke_native_segment(
+            enter_probe as *const u8,
+            std::ptr::from_mut(&mut probe).cast(),
+            egcl_rt::current_stack(),
+        )
+    }
+    .expect("registered outer test segment");
+    assert_eq!(outcome.exit, egcl_rt::native_transfer::NativeExit::Returned);
+    assert_eq!(outcome.value.to_raw(), probe.returned.primary);
+    probe.returned
+}
+
+fn exercise_owned_records_below_mapped_parent(prior_entries: usize) {
+    use crate::cli::bytecode::native_transfer_entry::{self as native, mapped_ordinary};
+    let child = crate::cli::bytecode::symbol_index_of("OWNED-RECORD-CHILD").unwrap();
+    let funcall = crate::cli::bytecode::symbol_index_of("FUNCALL").unwrap();
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(child).unwrap());
+    assert!(
+        prior_entries > 0,
+        "the actual generated first call established an eligible reusable parent lane"
+    );
+    for symbol in [child, funcall] {
+        egcl_rt::rooted!(
+            args = if symbol == child {
+                vec![EgclVal::from_fixnum(41)]
+            } else {
+                vec![*function, EgclVal::from_fixnum(41)]
+            }
+        );
+        native::start_activation_counts_for_test(child);
+        native::take_lean_root_entries_for_test();
+        let returned = invoke_named_outer_probe(symbol, &args);
+        assert_eq!(returned.primary, EgclVal::from_fixnum(42).to_raw());
+        assert_eq!(returned.carry, 0);
+        assert_eq!(
+            native::take_lean_root_entries_for_test(),
+            1,
+            "the owned record uses lean root ingress, not a managed mapped child"
+        );
+        assert_eq!(
+            native::take_activation_counts_for_test(),
+            (1, 1),
+            "registered Rust outer record must use its valid root entry for named and FUNCALL targets"
+        );
+        assert_eq!(
+            mapped_ordinary::take_entries_for_test(),
+            0,
+            "an older CAPTURE never grants this outer record generated ingress"
+        );
+    }
+    OWNED_RECORD_PROBE_RAN.with(|slot| slot.set(true));
+}
+
+struct RestoreOwnedProfile(Option<fn()>);
+impl Drop for RestoreOwnedProfile {
+    fn drop(&mut self) {
+        native_transfer_entry::root_publication::PROFILE_OBSERVE.with(|slot| slot.set(self.0));
+    }
+}
+fn observe_live_owned_record_parent() {
+    use crate::cli::bytecode::native_transfer_entry::{self as native, mapped_ordinary};
+    if OWNED_RECORD_PROBE_RAN.with(Cell::get) {
+        return;
+    }
+    let parent = OWNED_RECORD_PARENT.with(Cell::get);
+    if parent == 0 || native::child_capture_for_test() != Some((parent, false)) {
+        return;
+    }
+    if native::root_publication::active_anchor_for_test().map(|(_, owner)| owner) != Some(parent) {
+        return;
+    }
+    let entries = mapped_ordinary::take_entries_for_test();
+    if entries == 0 {
+        return;
+    }
+    // Run before entering the helper adapter that deliberately clears CAPTURE.
+    // Avoid recursive observations while the adversarial records execute.
+    let _restore = RestoreOwnedProfile(
+        native::root_publication::PROFILE_OBSERVE.with(|slot| slot.replace(None)),
+    );
+    exercise_owned_records_below_mapped_parent(entries);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
+fn owned_outer_records_cannot_borrow_an_older_published_mapped_parent_lane() {
+    use crate::cli::bytecode::native_transfer_tests::ordinary_t2;
+    let _lock = heap_test_lock()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    read_eval_all_env(
+        "(defun owned-record-child (x) (+ x 1))
+         (defun owned-record-parent (f &key (seed (1+ 0)) &aux (unused 0))
+           (funcall f 1) (funcall f 2))",
+        &mut env,
+    )
+    .unwrap();
+    let (child, _) = ordinary_t2::install("OWNED-RECORD-CHILD", "(x)", "((+ x 1))", &mut env);
+    let (parent, code) = ordinary_t2::install(
+        "OWNED-RECORD-PARENT",
+        "(f &key (seed (1+ 0)) &aux (unused 0))",
+        "((funcall f 1) (funcall f 2))",
+        &mut env,
+    );
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        panic!("actual mapped parent");
+    };
+    assert!(mapped.ordinary_entry.is_none());
+    egcl_rt::rooted!(function = egcl_rt::symbols::symbol_function(child).unwrap());
+    // Warm both named slots before installing the observation hook.
+    struct RestoreEnv(*mut Env);
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            NATIVE_ENV.with(|slot| slot.set(self.0));
+        }
+    }
+    let saved = RestoreEnv(NATIVE_ENV.with(|slot| slot.replace(&mut env)));
+    crate::cli::bytecode::call_table::ordinary_call(child, &[EgclVal::from_fixnum(1)]).unwrap();
+    crate::cli::bytecode::call_table::ordinary_call(
+        crate::cli::bytecode::symbol_index_of("FUNCALL").unwrap(),
+        &[*function, EgclVal::from_fixnum(1)],
+    )
+    .unwrap();
+    drop(saved);
+    native_transfer_entry::mapped_ordinary::take_entries_for_test();
+    OWNED_RECORD_PROBE_RAN.with(|slot| slot.set(false));
+    OWNED_RECORD_PARENT.with(|slot| slot.set(Rc::as_ptr(mapped) as usize));
+    struct ResetCounts;
+    impl Drop for ResetCounts {
+        fn drop(&mut self) {
+            native_transfer_entry::take_activation_counts_for_test();
+            OWNED_RECORD_PARENT.with(|slot| slot.set(0));
+        }
+    }
+    let _counts = ResetCounts;
+    let _observer = RestoreOwnedProfile(
+        native_transfer_entry::root_publication::PROFILE_OBSERVE
+            .with(|slot| slot.replace(Some(observe_live_owned_record_parent))),
+    );
+    assert_eq!(
+        crate::cli::bytecode::run_native(&code, parent, &[*function], &mut env).unwrap(),
+        EgclVal::from_fixnum(3)
+    );
+    assert!(OWNED_RECORD_PROBE_RAN.with(Cell::get));
+}

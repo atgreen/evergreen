@@ -403,6 +403,13 @@ impl egcl_rt::gc::TraceHostRoots for MappedCallee {
 /// body. Cold resolution and pending promotion still use the existing cell.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
+    unsafe { mapped_callee_for_route(cell, true) }
+}
+
+/// Object T1 calls retain their existing managed child until their FUNCALL
+/// cache can preserve canonical T1 heat. Named checked calls own that credit.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+unsafe fn mapped_callee_for_route(cell: u64, prefer_named_t1: bool) -> Option<MappedCallee> {
     let state = unsafe { state(cell) };
     if state.cell.is_cold() {
         return None;
@@ -420,7 +427,12 @@ pub(super) unsafe fn mapped_callee(cell: u64) -> Option<MappedCallee> {
         return None;
     }
     if let NativeCodeStorage::Mapped(mapped) = &code._storage {
-        if mapped.mapped_entry().is_none() || mapped.needs_recompile() {
+        // Both tiers can advertise BOTH entries. Prefer their admitted
+        // ordinary child before prepare_child pushes a managed activation.
+        if ((code.is_t2 || prefer_named_t1) && prefer_ordinary_child(&code, function, promote))
+            || mapped.mapped_entry().is_none()
+            || mapped.needs_recompile()
+        {
             // Only explicitly advertised managed-slot entries accept this adapter.
             // Refresh still belongs to the linkage revision transition.
             return None;
@@ -500,7 +512,7 @@ pub(super) fn mapped_callable(function: EgclVal, nargs: usize) -> Option<MappedC
         }
         publish_target(state, revision, Some(target));
     }
-    let selected = unsafe { mapped_callee(Arc::as_ptr(&cell) as u64) }?;
+    let selected = unsafe { mapped_callee_for_route(Arc::as_ptr(&cell) as u64, false) }?;
     (selected.function == *function).then_some(selected)
 }
 
@@ -797,10 +809,40 @@ fn run_bridge_call(
     }
 }
 
-/// What `warm` would enter for this cell when that is installed T2 code with a
-/// lean ordinary root entry (see `native_transfer_entry::lean_root`): the code,
-/// its callable, the cell's symbol and the entry offset. `None` leaves every
-/// other case, and every tier or depth decision, to `warm`.
+/// A dual-entry native target whose checked call can use the existing ordinary
+/// child lane. No counting here: nested preparation must decline first, then
+/// lean_native_target credits T1 exactly once when checked dispatch consumes it.
+/// Installed T2 targets keep their existing promote:false/no-credit policy.
+/// Keep promotion boundaries and self-recursive/OSR/binding cohorts on their
+/// original preparation route. No Lisp allocation or registry mutation.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn prefer_ordinary_child(code: &NativeCode, function: EgclVal, promote: bool) -> bool {
+    if (code.is_t2 && promote)
+        || (!code.is_t2 && (!t1_ordinary_child_enabled() || (promote && promotion_due(function))))
+    {
+        return false;
+    }
+    let NativeCodeStorage::Mapped(mapped) = &code._storage else {
+        return false;
+    };
+    !mapped.needs_recompile()
+        && fixed_ordinary_child_shape(code)
+        && mapped.lean_root_entry().is_some()
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn fixed_ordinary_child_shape(code: &NativeCode) -> bool {
+    code.body.as_ref().is_some_and(|body| {
+        super::native_transfer_entry::fixed_tagged_parameters(body)
+            && body.self_call_sites.is_empty()
+    })
+}
+
+/// What `warm` would enter for this cell when it has a lean ordinary root.
+/// Selection is noncollecting and mirrors warm's heat/promotion decisions:
+/// failed admission credits nothing; an admitted T1 invocation is counted once
+/// before either the native child or the original root fallback executes.
+/// T1 targets MUST NOT install a generated binding that bypasses this selector.
 ///
 /// # Safety
 /// As for [`ordinary_call_cell`].
@@ -822,7 +864,7 @@ pub(super) unsafe fn lean_native_target(
     let Some(Target::Native {
         code,
         function,
-        promote: false,
+        promote,
     }) = target.as_ref()
     else {
         return None;
@@ -830,8 +872,13 @@ pub(super) unsafe fn lean_native_target(
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         return None;
     };
-    // Only T2 code: `warm` counts invocations below T2.
-    if !code.is_t2
+    // Preserve the old T2 cohort. For T1 the threshold call still belongs to
+    // cold dispatch, which owns scheduling/publishing the replacement tier.
+    if (code.is_t2 && *promote)
+        || (!code.is_t2
+            && (!t1_ordinary_child_enabled()
+                || !fixed_ordinary_child_shape(code)
+                || (*promote && promotion_due(*function))))
         || mapped.needs_recompile()
         || !code
             .body
@@ -841,8 +888,19 @@ pub(super) unsafe fn lean_native_target(
     {
         return None;
     }
+    // This excludes optional/variadic binding and T1 loops that need a mapped
+    // OSR companion. Every rejection above or here leaves warm's count intact.
     let offset = mapped.lean_root_entry()?;
+    if !code.is_t2 && !profiling_disabled() {
+        egcl_rt::function::record_invocation(*function);
+    }
     Some((Rc::clone(mapped), *function, state.symbol, offset))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn t1_ordinary_child_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("EGCL_MAPPED_T1_ORDINARY").as_deref() != Ok("0"))
 }
 
 /// The symbol a named adapter's cell dispatches.
@@ -874,8 +932,14 @@ pub(super) unsafe fn mapped_callee_declines(cell: u64) -> bool {
             !super::call_table_funcall::names_funcall_or_apply(state.symbol)
         }
         Some(Target::Accessor { .. } | Target::MakeInstance | Target::Generic) => true,
-        Some(Target::Native { code, .. }) => match &code._storage {
-            NativeCodeStorage::Mapped(mapped) => mapped.mapped_entry().is_none(),
+        Some(Target::Native {
+            code,
+            function,
+            promote,
+        }) => match &code._storage {
+            NativeCodeStorage::Mapped(mapped) => {
+                prefer_ordinary_child(code, *function, *promote) || mapped.mapped_entry().is_none()
+            }
             _ => false,
         },
         Some(Target::Bytecode { .. } | Target::Function(_)) => {
@@ -2202,3 +2266,11 @@ mod tests {
         registry_remove(symbol);
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "call_table_t1_tests.rs"]
+mod t1_ordinary_tests;
+
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "call_table_t1_moving_tests.rs"]
+mod t1_moving_roots_tests;

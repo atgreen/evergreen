@@ -33,7 +33,7 @@ fn uninstall(symbols: &[u32]) {
 }
 
 /// A mapped T2 caller's FUNCALL runs the object's T2 code from the checked
-/// call, through the lean root. An argument count the callee does not accept
+/// call, through the reusable ordinary bridge. An argument count the callee does not accept
 /// takes the general route, which signals.
 #[test]
 fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
@@ -71,6 +71,7 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
         "a &key body with an evaluated default keeps the mapped ABI"
     );
     let calls = 100;
+    super::super::native_transfer_entry::mapped_ordinary::take_entries_for_test();
     let result = run_caller(
         "FC-KW-CALLER",
         "((let ((s 0)) (dotimes (i n s) (setq s (fc-kw #'fc-inner s :b 2)))))",
@@ -79,6 +80,7 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
     )
     .unwrap();
     let lean = super::super::native_transfer_entry::take_lean_root_entries_for_test();
+    let bridges = super::super::native_transfer_entry::mapped_ordinary::take_entries_for_test();
     let (fast, _) = funcall_fast::take_fast_calls_for_test();
     // One argument short: the fast target declines and the general route
     // signals the standard argument-count error.
@@ -97,9 +99,13 @@ fn a_mapped_caller_funcalls_an_installed_t2_object_through_its_fast_target() {
         fast >= calls as usize,
         "only {fast} of {calls} FUNCALLs ran the fast target"
     );
+    assert_eq!(
+        lean, 0,
+        "hot mapped FUNCALLs must not prepare root activations"
+    );
     assert!(
-        lean >= calls as usize,
-        "only {lean} of {calls} FUNCALLs took the lean root entry"
+        bridges >= calls as usize,
+        "only {bridges} of {calls} FUNCALLs used native ABI bridges"
     );
     let report = format!("{:?}", error.expect_err("a missing argument signals"));
     assert!(report.to_ascii_lowercase().contains("argument"), "{report}");

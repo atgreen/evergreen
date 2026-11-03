@@ -206,7 +206,7 @@ fn mapped_bridge_propagates_throw_to_real_parent_and_rechecks_redefinitions() {
     let (symbol, parent) = install(
         &mut env,
         "BRIDGE-THROW-PARENT",
-        "(flag x &key (seed (1+ 0)))",
+        "(flag x &key (seed (1+ 0)) &aux (mapped-only 0))",
         "(let ((*bridge-special* 17)) (declare (special *bridge-special*)) (catch 'bridge-outer (bridge-throw-child nil nil) (bridge-throw-child flag x)))",
     );
     egcl_rt::rooted!(payload = crate::cli::arena_cons(EgclVal::from_fixnum(59), NIL));
@@ -232,7 +232,7 @@ fn mapped_bridge_propagates_throw_to_real_parent_and_rechecks_redefinitions() {
     let (symbol, parent) = install(
         &mut env,
         "BRIDGE-REDEFINE-PARENT",
-        "(x &key (seed (1+ 0)))",
+        "(x &key (seed (1+ 0)) &aux (mapped-only 0))",
         "(progn (bridge-version x) (let ((first (bridge-version x))) (bridge-change) (+ first (bridge-version x))))",
     );
     assert_eq!(
@@ -253,7 +253,7 @@ fn mapped_bridge_alternating_targets_prepare_once_per_distinct_owner() {
     let (symbol, parent) = install(
         &mut env,
         "BRIDGE-ALTERNATE-PARENT",
-        "(n &key (seed (1+ 0)))",
+        "(n &key (seed (1+ 0)) &aux (mapped-only 0))",
         "(let ((sum 0)) (dotimes (i n sum) (setq sum (+ sum (bridge-alternate-a i) (bridge-alternate-b i)))))",
     );
     run_mapped(symbol, &parent, &[EgclVal::from_fixnum(1)], &mut env).unwrap();

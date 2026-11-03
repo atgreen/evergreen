@@ -464,6 +464,7 @@ fn main() {
     }
     cli::events::maybe_report_direct_builtin_stats();
     cli::builtin_census::maybe_write_on_exit();
+    cli::activation_census::maybe_write_on_exit();
     cli::events::maybe_dump_on_exit();
     // egcl-jitrec: finalize the NDJSON stream (symbol + function records) and
     // close it, if EGCL_EVENTS_STREAM was set.

@@ -334,9 +334,12 @@ fn select(function: EgclVal, nargs: usize) -> Option<Target> {
     if code.needs_recompile() {
         return None;
     }
-    // `call_table::mapped_callable` admits only the current, uncaptured
-    // definition of its name; a function cell change moves the epoch.
+    // Mirror the named adapter's actual managed-entry preference. An
+    // eligible dual-entry T2 object takes the ordinary bridge; advertising a
+    // mapped offset alone no longer means mapped_callable will select it.
+    // A function cell change moves the cache epoch as before.
     let child = code.mapped_entry().is_some()
+        && !call_table::prefer_ordinary_child(&native, callable, false)
         && closure_captured_env(callable).is_none()
         && egcl_rt::symbols::symbol_function(name) == Some(callable);
     let actual_instance =
@@ -389,9 +392,24 @@ fn admissible(target: &Target, nargs: usize) -> bool {
     }
 }
 
+/// Provenance of this dispatch, not merely whether CAPTURE is nonnull.
+/// Generic Rust/ordinary reentry can retain a mapped context without owning a
+/// currently published mapped call. Only `call(record)` constructs the second
+/// variant, inside checked_call_published's published_mapped scope.
+#[derive(Clone, Copy)]
+enum Ingress {
+    Root,
+    PublishedMapped,
+}
+
 /// Run `target` on `args`, or `None`, having done nothing, when its builtin
 /// declines them. The caller roots or scans every argument word.
-fn run(target: Target, args: &[EgclVal], env: &mut Env) -> Option<Result<EgclVal, EgclError>> {
+fn run(
+    target: Target,
+    args: &[EgclVal],
+    env: &mut Env,
+    ingress: Ingress,
+) -> Option<Result<EgclVal, EgclError>> {
     // The same call-depth accounting as `apply_function_impl`.
     let _call_depth = match super::super::super::CallDepthGuard::enter() {
         Ok(guard) => guard,
@@ -411,6 +429,18 @@ fn run(target: Target, args: &[EgclVal], env: &mut Env) -> Option<Result<EgclVal
             egcl_rt::rooted!(
                 _active_callable_root = super::super::ActiveCallableRoot(actual_instance)
             );
+            // Reuse the existing native ABI only below the explicit mapped
+            // publication. Preserve run_callable's declaration-scope handling
+            // by declining when the caller has local SPECIAL declarations.
+            if matches!(ingress, Ingress::PublishedMapped)
+                && env.locally_specials.is_empty()
+                && code.is_t2
+                && let Some(offset) = code.lean_root_entry()
+                && let Some(result) =
+                    unsafe { mapped_ordinary::call(&code, offset, function, args, env, None) }
+            {
+                return Some(result);
+            }
             Some(code.run_callable(function, args, env))
         }
         Target::Builtin { symbol } => {
@@ -457,14 +487,15 @@ pub(in crate::cli::bytecode) fn apply(
     admit: Admit,
 ) -> Option<Result<EgclVal, EgclError>> {
     if let Some(target) = lookup(function) {
-        return admitted(target, args.len(), admit).and_then(|target| run(target, args, env));
+        return admitted(target, args.len(), admit)
+            .and_then(|target| run(target, args, env, Ingress::Root));
     }
     // Selection may collect: keep the callable and the actuals rooted across
     // it, and run on the rooted copies.
     egcl_rt::rooted!(function = function);
     egcl_rt::rooted!(args = args.to_vec());
     let target = admitted(fill(*function, args.len())?, args.len(), admit)?;
-    run(target, &args, env)
+    run(target, &args, env, Ingress::Root)
 }
 
 fn admitted(target: Target, nargs: usize, admit: Admit) -> Option<Target> {
@@ -528,9 +559,16 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
     if env.is_null() {
         return false;
     }
+    // published_mapped intentionally exempts registered Rust outer records:
+    // their words are host roots, not a newly published generated caller.
+    let ingress = if unsafe { super::generated_mapped_ingress(record) } {
+        Ingress::PublishedMapped
+    } else {
+        Ingress::Root
+    };
     let declined = Cell::new(false);
     let result = guard_c2i(|| {
-        run(target, rest, unsafe { &mut *env }).unwrap_or_else(|| {
+        run(target, rest, unsafe { &mut *env }, ingress).unwrap_or_else(|| {
             declined.set(true);
             Ok(NIL)
         })

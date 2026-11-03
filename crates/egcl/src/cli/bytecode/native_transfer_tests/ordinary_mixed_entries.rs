@@ -34,7 +34,7 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
         &mut env,
     )
     .unwrap();
-    let (_, leaf) = install("MIXED-ENTRY-LEAF", "(a b c d)", "(d)", &mut env);
+    let (leaf_symbol, leaf) = install("MIXED-ENTRY-LEAF", "(a b c d)", "(d)", &mut env);
     let (bridge_symbol, bridge) = install(
         "MIXED-ENTRY-BRIDGE",
         "(a b c d)",
@@ -83,7 +83,10 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
     let leaf_cell =
         call_table::resolve(egcl_rt::symbols::find_index("MIXED-ENTRY-LEAF").unwrap()).unwrap();
     let bridge_cell = call_table::resolve(bridge_symbol).unwrap();
-    assert!(unsafe { call_table::mapped_callee(Arc::as_ptr(&leaf_cell) as u64) }.is_some());
+    assert!(
+        unsafe { call_table::mapped_callee(Arc::as_ptr(&leaf_cell) as u64) }.is_none(),
+        "admitted ordinary leaf is preferred before managed child preparation"
+    );
     assert!(unsafe { call_table::mapped_callee(Arc::as_ptr(&bridge_cell) as u64) }.is_none());
 
     egcl_rt::collect_t0_minor().unwrap();
@@ -101,11 +104,34 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
     let sp = stack.sp();
     env.set_mv(vec![T, NIL, EgclVal::from_fixnum(99)]);
     take_nested_entries();
+    native_transfer_entry::mapped_ordinary::take_entries_for_test();
+    native_transfer_entry::mapped_ordinary::take_prepares_for_test();
+    native_transfer_entry::take_lean_root_entries_for_test();
+    native_transfer_entry::start_activation_counts_for_test(leaf_symbol);
     egcl_rt::rooted!(result = direct.run(&arguments, &mut env).unwrap());
     assert_eq!(
         take_nested_entries(),
+        0,
+        "preferred ordinary leaf must not push a managed child"
+    );
+    assert_eq!(
+        native_transfer_entry::mapped_ordinary::take_entries_for_test(),
         1,
-        "leaf must use the warmed same-segment managed entry"
+        "the actual mapped caller enters the ordinary leaf bridge"
+    );
+    assert_eq!(
+        native_transfer_entry::mapped_ordinary::take_prepares_for_test(),
+        1
+    );
+    assert_eq!(
+        native_transfer_entry::take_lean_root_entries_for_test(),
+        0,
+        "native child must not reopen a standalone native root"
+    );
+    assert_eq!(
+        native_transfer_entry::take_activation_counts_for_test(),
+        (0, 1),
+        "no leaf managed preparation; one cached bridge retirement at caller exit"
     );
     assert_ne!(
         arguments[3].to_raw(),
@@ -123,12 +149,24 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
     );
     assert_eq!((stack.fp(), stack.sp()), (frame, sp));
 
-    // The same legacy caller must fall back for an ordinary-only bridge,
-    // rather than accidentally jumping to its non-entry byte zero.
+    // The same managed caller uses the ordinary-only forwarder's bridge,
+    // preserving its real ABI instead of jumping to non-entry byte zero.
     env.set_mv(vec![T, NIL]);
     take_nested_entries();
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::mapped_ordinary::take_entries_for_test();
+    native_transfer_entry::take_lean_root_entries_for_test();
+    native_transfer_entry::start_activation_counts_for_test(bridge_symbol);
     assert_eq!(forwarded.run(&arguments, &mut env).unwrap(), arguments[3]);
+    assert_eq!(
+        native_transfer_entry::mapped_ordinary::take_entries_for_test(),
+        1
+    );
+    assert_eq!(native_transfer_entry::take_lean_root_entries_for_test(), 0);
+    assert_eq!(
+        native_transfer_entry::take_activation_counts_for_test(),
+        (0, 1)
+    );
     assert_eq!(
         take_nested_entries(),
         0,
@@ -140,10 +178,13 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
     );
     assert!(!env.mv_active);
 
-    // Admitting the leaf's managed entry must not displace its register entry
-    // when an ordinary caller already has a compatible warmed descriptor.
+    // Advertising the leaf's managed capability must not displace its register
+    // entry when an ordinary caller has a compatible warmed descriptor.
     take_nested_entries();
     native_transfer_entry::ordinary_calls::take_cold_calls_for_test();
+    native_transfer_entry::mapped_ordinary::take_entries_for_test();
+    native_transfer_entry::take_lean_root_entries_for_test();
+    native_transfer_entry::start_activation_counts_for_test(bridge_symbol);
     assert_eq!(
         run_native(&bridge, bridge_symbol, &arguments, &mut env).unwrap(),
         arguments[3]
@@ -153,6 +194,20 @@ fn ordinary_mixed_entries_preserve_legacy_leaf_and_register_bridge_paths() {
         0
     );
     assert_eq!(take_nested_entries(), 0);
+    assert_eq!(
+        native_transfer_entry::mapped_ordinary::take_entries_for_test(),
+        0,
+        "ordinary register caller uses its warmed descriptor directly"
+    );
+    assert_eq!(
+        native_transfer_entry::take_lean_root_entries_for_test(),
+        1,
+        "only the explicit Rust-to-native root exists for this path"
+    );
+    assert_eq!(
+        native_transfer_entry::take_activation_counts_for_test(),
+        (1, 1)
+    );
     assert!(!env.mv_active);
     assert_eq!((stack.fp(), stack.sp()), (frame, sp));
 }

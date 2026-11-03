@@ -148,7 +148,7 @@ pub(super) unsafe fn call(
     function: EgclVal,
     args: &[EgclVal],
     env: &mut Env,
-    cell: u64,
+    cell: Option<u64>,
 ) -> Option<Result<EgclVal, EgclError>> {
     let parent = CAPTURE.with(Cell::get);
     if parent.is_null() || !current_poll_idle() || native_error_pending() {
@@ -201,7 +201,12 @@ pub(super) unsafe fn call(
     // OSR may replace/grow the parent managed extent between calls.
     unsafe { (*bridge).context.frame = (*parent).frame };
     let result = unsafe { run(bridge, offset, function, args, env, execution) };
-    if result.is_ok() {
+    // Only callers that authorize generated reuse supply a named cell. T1
+    // keeps selecting/counting heat in Rust. A function-object call has no
+    // named descriptor cell: FUNCALL must not be bound as its target callee.
+    if result.is_ok()
+        && let Some(cell) = cell
+    {
         unsafe { mapped_generated::bind(parent, bridge, cell, offset) };
     }
     Some(result)
