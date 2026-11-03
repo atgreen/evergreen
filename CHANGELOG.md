@@ -5,8 +5,8 @@
 ## 0.0.12 - 2026-11-03
 
 This release expands native compilation and improves closures, arrays, CLOS,
-printing and library compatibility. The [full v0.0.12 notes](https://github.com/atgreen/evergreen/blob/v0.0.12/docs/changelog/0.0.12.md)
-retain every detailed entry and PR reference. [Published releases through v0.0.11](https://github.com/atgreen/evergreen/blob/v0.0.12/docs/changelog/0.0.11-and-earlier.md)
+printing and library compatibility. The [full v0.0.12 notes](https://github.com/atgreen/evergreen/blob/main/docs/changelog/0.0.12.md)
+retain every detailed entry and PR reference. [Published releases through v0.0.11](https://github.com/atgreen/evergreen/blob/main/docs/changelog/0.0.11-and-earlier.md)
 are archived separately.
 
 ### Compatibility
