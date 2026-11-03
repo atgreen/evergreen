@@ -35,6 +35,10 @@
 //! runs only native targets this way, since their entry polls and owns a
 //! segment, and leaves builtins to the published entry.
 //!
+//! Eligible published T1 object calls use a separate uncached candidate and
+//! canonical per-call heat/dispatch. They never enter this T2 table or teach
+//! generated probes; crossing promotion thresholds stays on general dispatch.
+//!
 //! An entry names its object by identity without rooting it. Every collection
 //! clears the table (the root scanner calls [`clear_for_collection`]), so no
 //! entry can outlive, or be confused with a successor at the same address of,
@@ -216,6 +220,12 @@ fn lookup(function: EgclVal) -> Option<Target> {
     })
 }
 
+/// Preserve existing admissible T2/builtin cache hits before attempting an
+/// uncached T1 query. Child hits still belong to their original preparation.
+fn lookup_admissible(function: EgclVal, nargs: usize) -> Option<Target> {
+    lookup(function).filter(|target| admissible(target, nargs))
+}
+
 /// Select the target the general route would run, and remember it.
 /// Selection reads Rust-side registries only and should never collect; if a
 /// collection does intervene, the selected target's callable may have moved,
@@ -269,6 +279,8 @@ pub(in crate::cli::bytecode) fn closure_carrier(mut function: EgclVal) -> Option
 }
 
 fn select(function: EgclVal, nargs: usize) -> Option<Target> {
+    #[cfg(test)]
+    record_dispatch_query_for_test(function, false);
     if profiling_disabled() {
         return None;
     }
@@ -357,6 +369,282 @@ fn select(function: EgclVal, nargs: usize) -> Option<Target> {
         actual_instance,
         child,
     })
+}
+
+/// A read-only preparation result, deliberately absent from the T2 table and
+/// native_target exports: T1 must credit heat on every committed invocation.
+struct T1Candidate {
+    symbol: u32,
+    body: Arc<BytecodeFunction>,
+    native: Rc<NativeCode>,
+    actual_instance: u32,
+    ordinary_offset: usize,
+}
+
+fn t1_object_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("EGCL_MAPPED_T1_FUNCALL").as_deref() != Some("0".as_ref()))
+}
+
+/// Routing hint only: leave a possible ordinary T1 call to the published
+/// checked entry. It does not authorize execution. That entry must still take
+/// a fresh `t1_candidate`, including exact owner/body/generation, dynamic scope,
+/// profile, depth and promotion guards, after any intervening poll.
+///
+/// Borrow the installed code without cloning owners or synchronizing registries.
+/// False positives use the checked call's existing generic fallback.
+fn t1_preparation_hint(function: EgclVal, nargs: usize) -> bool {
+    if !t1_object_enabled() || !egcl_rt::function::is_interpreted_function(function) {
+        return false;
+    }
+    let Some(symbol) = egcl_rt::function::name(function).symbol_index() else {
+        return false;
+    };
+    NATIVE_REGISTRY.with(|registry| {
+        let registry = registry.borrow();
+        let Some(native) = registry.get(&symbol) else {
+            return false;
+        };
+        let NativeCodeStorage::Mapped(code) = &native._storage else {
+            return false;
+        };
+        !native.is_t2
+            && code.ordinary_entry.is_some()
+            && fixed_tagged_parameters(&code.body)
+            && code.body.self_call_sites.is_empty()
+            && arity_accepts(&code.body, nargs)
+    })
+}
+
+/// Pure unpublished preparation. No heat, completion poll, compiler request,
+/// cache publication or Lisp allocation belongs here. Legacy non-template
+/// uninterned objects have additional representative-owner aggregation; their
+/// original route remains authoritative, as do cons/reified source wrappers.
+fn t1_candidate(function: EgclVal, nargs: usize) -> Option<T1Candidate> {
+    #[cfg(test)]
+    record_dispatch_query_for_test(function, true);
+    if !t1_object_enabled()
+        || profiling_disabled()
+        || !egcl_rt::function::is_interpreted_function(function)
+        || super::super::super::reified_closure(function).is_some()
+        || NATIVE_DEPTH.with(Cell::get) >= native_depth_cap()
+    {
+        return None;
+    }
+    let env = NATIVE_ENV.with(Cell::get);
+    if env.is_null() || !unsafe { (&*env).locally_specials.is_empty() } {
+        return None;
+    }
+    let name = egcl_rt::function::name(function).symbol_index()?;
+    let symbol = name;
+    let template = egcl_rt::function::is_closure_instance(function)
+        || egcl_rt::function::is_closure_template(function);
+    let identity_matches = if template {
+        egcl_rt::function::definition_index(function) == symbol
+    } else {
+        !egcl_rt::symbols::is_uninterned(symbol)
+            && egcl_rt::symbols::symbol_function(symbol) == Some(function)
+    };
+    if !identity_matches || t1_declined(symbol) || is_profile_pinned(symbol) {
+        return None;
+    }
+    // Unlike bytecode_for_callable/registry_get, this query must NOT synchronize
+    // a stale local generation, retire native code or mint a private registry.
+    let body = REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())?;
+    if template {
+        if closure_bodies()
+            .borrow()
+            .get(&symbol)
+            .is_none_or(|shared| !Arc::ptr_eq(shared, &body))
+        {
+            return None;
+        }
+    } else {
+        let definitions = named_definitions();
+        let definitions = definitions.borrow();
+        let definition = definitions.get(&symbol)?;
+        if definition.function != function
+            || REGISTRY_GENERATION.with(|generation| generation.borrow().get(&symbol).copied())
+                != Some(definition.generation)
+            || definition
+                .body
+                .as_ref()
+                .is_none_or(|shared| !Arc::ptr_eq(shared, &body))
+        {
+            return None;
+        }
+    }
+    if !arity_accepts(&body, nargs)
+        || CLOSURE_COMPILATION.with(|cache| {
+            cache
+                .borrow()
+                .get(&(Arc::as_ptr(&body) as usize))
+                .is_some_and(|owner| owner.owner != symbol)
+        })
+    {
+        return None;
+    }
+    let native = NATIVE_REGISTRY.with(|registry| registry.borrow().get(&symbol).cloned())?;
+    if native.is_t2 || native.body.as_ref().is_none_or(|saved| !Arc::ptr_eq(saved, &body))
+        // This includes the named T1 switch, fixed ordinary shape and the
+        // next-invocation/backedge promotion boundary BEFORE any credit.
+        || !call_table::prefer_ordinary_child(&native, function, t2_enabled())
+    {
+        return None;
+    }
+    let NativeCodeStorage::Mapped(code) = &native._storage else {
+        return None;
+    };
+    // The explicit receiver guard's private-body lookup is already satisfied
+    // by the pure local/shared template checks above. Avoid its registry_get.
+    if code.native_callable_slot.is_some()
+        && (egcl_rt::function::definition_index(function) != symbol
+            || (code.body.has_env && closure_captured_env(function).is_none()))
+    {
+        return None;
+    }
+    let actual_instance =
+        if code.native_callable_slot.is_some() || egcl_rt::symbols::is_uninterned(symbol) {
+            egcl_rt::function::definition_index(function)
+        } else {
+            symbol
+        };
+    // prefer_ordinary_child has just validated this exact offset through
+    // lean_root_entry; do not repeat its immutable body classification.
+    let ordinary_offset = code.ordinary_entry?;
+    Some(T1Candidate {
+        symbol,
+        body,
+        native,
+        actual_instance,
+        ordinary_offset,
+    })
+}
+
+struct T1InvocationRoots {
+    function: EgclVal,
+    args: EntryArgs,
+    active: super::super::ActiveCallableRoot,
+    body: super::super::ActiveBytecodeRoot,
+}
+impl egcl_rt::gc::TraceHostRoots for T1InvocationRoots {
+    fn trace_host_roots(&mut self, visit: &mut dyn FnMut(*mut EgclVal)) {
+        visit(&mut self.function);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.args, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.active, visit);
+        egcl_rt::gc::TraceHostRoots::trace_host_roots(&mut self.body, visit);
+    }
+}
+
+/// Polling may publish replacement code. Only the exact retained code owner
+/// can reuse its already validated immutable entry offset; a replacement
+/// must establish its own root-entry capability. Neither may bypass a newly
+/// requested recompile.
+fn t1_selected_offset(
+    prepared: &Rc<NativeCode>,
+    ordinary_offset: usize,
+    selected: &Rc<NativeCode>,
+) -> Option<usize> {
+    let NativeCodeStorage::Mapped(code) = &selected._storage else {
+        return None;
+    };
+    if code.needs_recompile() {
+        return None;
+    }
+    if Rc::ptr_eq(prepared, selected) {
+        Some(ordinary_offset)
+    } else {
+        code.lean_root_entry()
+    }
+}
+
+/// Once credited, this call is consumed even if the bridge declines. Reentering
+/// apply_function_impl would count it twice. Keep canonical completion/queue/
+/// force policy, including a replacement that arrives after preparation.
+fn run_t1(
+    candidate: T1Candidate,
+    function: EgclVal,
+    args: &[EgclVal],
+    env: &mut Env,
+) -> Result<EgclVal, EgclError> {
+    let _call_depth = super::super::super::CallDepthGuard::enter()?;
+    let T1Candidate {
+        symbol,
+        body,
+        native,
+        actual_instance,
+        ordinary_offset,
+    } = candidate;
+    // One registration retains exactly the same four traced components. Move
+    // the already-owned body lease instead of cloning another Arc for its root.
+    egcl_rt::rooted!(
+        roots = T1InvocationRoots {
+            function,
+            args: EntryArgs::new(args),
+            active: super::super::ActiveCallableRoot(actual_instance),
+            body: super::super::ActiveBytecodeRoot::from_owned(body),
+        }
+    );
+    // Declared after roots: code/helpers retire while body/argument roots
+    // remain linked, including on cold fallback and exceptional return.
+    let prepared_owner = native;
+    let resolved = record_callable_invocation_and_body(roots.function);
+    // A concurrent definition setter may win after the pure snapshot. Once
+    // counted, let canonical retained-object dispatch resolve that race, without
+    // reentering apply_function_impl or crediting the invocation again.
+    let name = egcl_rt::function::name(roots.function).as_symbol_index();
+    if resolved.is_none_or(|(resolved_symbol, body)| {
+        resolved_symbol != symbol || !Arc::ptr_eq(&body, &roots.body._function)
+    }) {
+        return call_registered(name, roots.args.as_slice(), roots.function, env).unwrap_or_else(
+            || {
+                run_with_sym(
+                    Arc::clone(&roots.body._function),
+                    roots.args.as_slice(),
+                    roots.function,
+                    symbol,
+                    env,
+                )
+            },
+        );
+    }
+    let count = dispatch_invoke_count(symbol, Some(roots.function));
+    let selected = native_for_dispatch(symbol, Some(roots.function), count, &roots.body._function);
+    #[cfg(test)]
+    FAST_CALLS.with(|counter| counter.set((counter.get().0 + 1, counter.get().1)));
+    if let Some(native) = selected
+        && native
+            .body
+            .as_ref()
+            .is_some_and(|body| Arc::ptr_eq(body, &roots.body._function))
+        && NATIVE_DEPTH.with(Cell::get) < native_depth_cap()
+    {
+        if let NativeCodeStorage::Mapped(code) = &native._storage
+            && fixed_tagged_parameters(&roots.body._function)
+            && roots.body._function.self_call_sites.is_empty()
+            && let Some(offset) = t1_selected_offset(&prepared_owner, ordinary_offset, &native)
+            && let Some(result) = unsafe {
+                mapped_ordinary::call(
+                    code,
+                    offset,
+                    roots.function,
+                    roots.args.as_slice(),
+                    env,
+                    None,
+                )
+            }
+        {
+            return result;
+        }
+        return run_native_callable(&native, symbol, roots.function, roots.args.as_slice(), env);
+    }
+    run_with_sym(
+        Arc::clone(&roots.body._function),
+        roots.args.as_slice(),
+        roots.function,
+        symbol,
+        env,
+    )
 }
 
 fn invocation(record: *mut MappedCallRecord) -> &'static [EgclVal] {
@@ -512,7 +800,7 @@ fn enters_as_child(target: &Target) -> bool {
 }
 
 /// Whether preparation may leave this FUNCALL to the checked call, which then
-/// runs it through [`call`]. Allocation-free and unpublished: a miss declines.
+/// runs it through [`call`]. Unpublished and noncollecting: a miss declines.
 ///
 /// # Safety
 /// `record` is the live adapter record of the builtin FUNCALL cell.
@@ -521,8 +809,10 @@ pub(in crate::cli::bytecode) unsafe fn cached(record: *mut MappedCallRecord) -> 
     let Some((&function, rest)) = args.split_first() else {
         return false;
     };
-    lookup(function)
-        .is_some_and(|target| admissible(&target, rest.len()) && !enters_as_child(&target))
+    if let Some(target) = lookup_admissible(function, rest.len()) {
+        return !enters_as_child(&target);
+    }
+    t1_preparation_hint(function, rest.len())
 }
 
 /// [`cached`], filling the table first on a miss. The caller is published, and
@@ -535,7 +825,13 @@ pub(in crate::cli::bytecode) unsafe fn prepare(record: *mut MappedCallRecord) ->
     let Some((&function, rest)) = args.split_first() else {
         return false;
     };
-    lookup_or_fill(function, rest.len()).is_some_and(|target| !enters_as_child(&target))
+    if let Some(target) = lookup_admissible(function, rest.len()) {
+        return !enters_as_child(&target);
+    }
+    // A positive T1 hint is only routing: checked call takes the full proof.
+    // Existing nonadmissible entries retain lookup_or_fill's miss semantics.
+    t1_preparation_hint(function, rest.len())
+        || lookup_or_fill(function, rest.len()).is_some_and(|target| !enters_as_child(&target))
 }
 
 /// Run a builtin FUNCALL's cached target from the checked call. Returns
@@ -550,11 +846,6 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
     let Some((&function, rest)) = args.split_first() else {
         return false;
     };
-    let Some(target) =
-        lookup_or_fill(function, rest.len()).filter(|target| !enters_as_child(target))
-    else {
-        return false;
-    };
     let env = NATIVE_ENV.with(Cell::get);
     if env.is_null() {
         return false;
@@ -566,12 +857,39 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
     } else {
         Ingress::Root
     };
+    let cached = lookup_admissible(function, rest.len());
+    if cached.as_ref().is_some_and(enters_as_child) {
+        return false;
+    }
+    let t1 = if cached.is_none() && matches!(ingress, Ingress::PublishedMapped) {
+        t1_candidate(function, rest.len())
+    } else {
+        None
+    };
+    // Eligible T1 has no T2 table entry by design. Do not run the failing T2
+    // selector before its canonical dispatch; real T2 hits stayed first above.
+    let target = match cached {
+        Some(target) => Some(target),
+        None if t1.is_none() => {
+            lookup_or_fill(function, rest.len()).filter(|target| !enters_as_child(target))
+        }
+        None => None,
+    };
+    if target.is_none() && t1.is_none() {
+        return false;
+    }
     let declined = Cell::new(false);
     let result = guard_c2i(|| {
-        run(target, rest, unsafe { &mut *env }, ingress).unwrap_or_else(|| {
-            declined.set(true);
-            Ok(NIL)
-        })
+        if let Some(candidate) = t1 {
+            // Only this private published ingress can consume a T1 candidate.
+            // It cannot arm a closure word, table entry or generated probe.
+            run_t1(candidate, function, rest, unsafe { &mut *env })
+        } else {
+            run(target.unwrap(), rest, unsafe { &mut *env }, ingress).unwrap_or_else(|| {
+                declined.set(true);
+                Ok(NIL)
+            })
+        }
     });
     if declined.get() {
         return false;
@@ -595,3 +913,31 @@ pub(in crate::cli::bytecode) unsafe fn call(record: *mut MappedCallRecord) -> bo
     }
     true
 }
+
+#[cfg(test)]
+#[path = "t1_object_tests.rs"]
+mod t1_object_tests;
+
+#[cfg(test)]
+static DISPATCH_QUERIES: egcl_rt::execution_local::ExecutionLocal<
+    Cell<(Option<u32>, usize, usize)>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((None, 0, 0))) };
+#[cfg(test)]
+fn record_dispatch_query_for_test(function: EgclVal, t1: bool) {
+    DISPATCH_QUERIES.with(|slot| {
+        let (owner, selects, candidates) = slot.get();
+        if owner.is_some()
+            && egcl_rt::function::is_interpreted_function(function)
+            && egcl_rt::function::name(function).symbol_index() == owner
+        {
+            slot.set((
+                owner,
+                selects + usize::from(!t1),
+                candidates + usize::from(t1),
+            ));
+        }
+    });
+}
+#[cfg(test)]
+#[path = "t1_dispatch_overhead_tests.rs"]
+mod t1_dispatch_overhead_tests;

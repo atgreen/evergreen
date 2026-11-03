@@ -686,6 +686,12 @@
 
 ### Performance
 
+- Reuse ordinary native bridges for eligible T1 function-object calls from
+  mapped code. Retain eligible bridge contexts within each caller beyond
+  its four generated bindings, avoiding repeated activation and context setup
+  while preserving invocation counts and tier promotion boundaries
+  ([#990](https://github.com/atgreen/evergreen/pull/990)).
+
 - Route eligible mapped T1/T2 calls and T2 `FUNCALL` targets through existing
   ordinary native entries, avoiding repeated managed child activation setup.
   Reuse clean native bridge storage across parent calls while refreshing each

@@ -120,6 +120,50 @@ fn pooling_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("EGCL_MAPPED_BRIDGE_POOL").as_deref() != Some("0".as_ref()))
 }
+
+pub(in crate::cli::bytecode) fn overflow_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("EGCL_MAPPED_BRIDGE_OVERFLOW").as_deref() != Some("0".as_ref())
+    })
+}
+
+#[cfg(test)]
+static UNCACHED_CALLS: egcl_rt::execution_local::ExecutionLocal<Cell<(usize, usize)>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((0, 0))) };
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_uncached_calls_for_test() -> (usize, usize) {
+    UNCACHED_CALLS.with(|slot| slot.replace((0, 0)))
+}
+#[cfg(test)]
+static CACHE_SHAPE: egcl_rt::execution_local::ExecutionLocal<Cell<(usize, usize)>> =
+    unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| Cell::new((0, 0))) };
+
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_cache_shape_for_test() -> (usize, usize) {
+    CACHE_SHAPE.with(|slot| slot.replace((0, 0)))
+}
+
+#[cfg(test)]
+fn record_cache_shape(lanes: &Lanes) {
+    assert!(
+        lanes
+            .iter()
+            .skip(mapped_generated::MAX_GENERATED_LANES)
+            .all(|lease| lease.bridge().generated.is_none())
+    );
+    let generated = lanes
+        .iter()
+        .filter(|lease| lease.bridge().generated.is_some())
+        .count();
+    assert!(generated <= mapped_generated::MAX_GENERATED_LANES);
+    CACHE_SHAPE.with(|slot| {
+        let (length, bindings) = slot.get();
+        slot.set((length.max(lanes.len()), bindings.max(generated)));
+    });
+}
+
 impl Lease {
     fn new(code: Rc<TransferCode>, env: &mut Env, frame: *mut Frame) -> Self {
         #[cfg(test)]
@@ -310,7 +354,15 @@ pub(super) unsafe fn call(
     }
     let execution = egcl_rt::thread::current_execution_context_for_native()?;
     // No Rust borrow of the GC-scanned cache survives an allocating callee.
-    const LANES: usize = 4;
+    // Generated pointers remain limited to their first four stable slots.
+    // Append-only Rust spill leases reuse context/body roots within a parent;
+    // more-polymorphic calls retain the rooted uncached ABI below this bound.
+    const RUST_LANES: usize = 16;
+    let cache_limit = if overflow_enabled() {
+        RUST_LANES
+    } else {
+        mapped_generated::MAX_GENERATED_LANES
+    };
     let cached = unsafe {
         (&*slot)
             .iter()
@@ -319,12 +371,46 @@ pub(super) unsafe fn call(
     let index = match cached {
         Some(index) => {
             if unsafe { (&*slot)[index].bridge().busy } {
+                crate::cli::activation_census::note_refusal(
+                    crate::cli::activation_census::Refusal::Busy,
+                    unsafe { (*(*parent).owner).installed_symbol },
+                    code.installed_symbol,
+                    code.is_t2,
+                );
                 return None;
             }
             index
         }
         None => {
-            if unsafe { (&*slot).len() } == LANES {
+            if unsafe { (&*slot).len() } == cache_limit {
+                if overflow_enabled() {
+                    // This call owns an uncached lease, not another generated
+                    // lane. Its precise host root replaces parent-lane tracing;
+                    // pinned backing and code/body ownership span all native
+                    // execution and cold recovery. run's Restore retires the
+                    // active context before the lease can detach/pool storage.
+                    egcl_rt::rooted!(
+                        lease = Lease::new(Rc::clone(code), env, unsafe { (*parent).frame })
+                    );
+                    let bridge = lease.bridge_mut() as *mut Bridge;
+                    #[cfg(test)]
+                    UNCACHED_CALLS.with(|counts| {
+                        let (calls, _) = counts.get();
+                        counts.set((calls + 1, unsafe { (&*slot).len() }));
+                    });
+                    #[cfg(test)]
+                    record_cache_shape(unsafe { &*slot });
+                    // Never bind a generated pointer into this local lease.
+                    return Some(unsafe {
+                        run(code, bridge, offset, function, args, env, execution)
+                    });
+                }
+                crate::cli::activation_census::note_refusal(
+                    crate::cli::activation_census::Refusal::Capacity,
+                    unsafe { (*(*parent).owner).installed_symbol },
+                    code.installed_symbol,
+                    code.is_t2,
+                );
                 return None;
             }
             let frame = unsafe { (*parent).frame };
@@ -341,11 +427,14 @@ pub(super) unsafe fn call(
     // Only callers that authorize generated reuse supply a named cell. T1
     // keeps selecting/counting heat in Rust. A function-object call has no
     // named descriptor cell: FUNCALL must not be bound as its target callee.
-    if result.is_ok()
+    if index < mapped_generated::MAX_GENERATED_LANES
+        && result.is_ok()
         && let Some(cell) = cell
     {
         unsafe { mapped_generated::bind(parent, bridge, code, cell, offset) };
     }
+    #[cfg(test)]
+    record_cache_shape(unsafe { &*slot });
     Some(result)
 }
 
@@ -499,3 +588,7 @@ unsafe fn run(
 #[cfg(test)]
 #[path = "mapped_ordinary_pool_tests.rs"]
 mod pool_tests;
+
+#[cfg(test)]
+#[path = "mapped_ordinary_overflow_tests.rs"]
+mod overflow_tests;
