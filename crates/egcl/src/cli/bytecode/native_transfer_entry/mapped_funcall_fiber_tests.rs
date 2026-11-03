@@ -324,6 +324,13 @@ fn object_fiber_for_tier(tier: u8, fillers: usize) -> EgclVal {
     let origin_before = crate::cli::activation_census::scope_snapshot_for_test();
     let origin_scope = crate::cli::activation_census::migration_scope_for_test();
     let origin_active = crate::cli::activation_census::scope_snapshot_for_test();
+    let admission_before = crate::cli::activation_census::admission_snapshot_for_test();
+    let admission_scope = crate::cli::activation_census::migration_admission_scope_for_test();
+    let admission_active = crate::cli::activation_census::admission_snapshot_for_test();
+    assert_eq!(
+        admission_active.is_some(),
+        crate::cli::activation_census::origins_enabled()
+    );
     egcl_rt::rooted!(
         result = run_mapped(
             symbol,
@@ -437,6 +444,17 @@ fn object_fiber_for_tier(tier: u8, fillers: usize) -> EgclVal {
     assert_eq!(
         crate::cli::activation_census::scope_snapshot_for_test(),
         origin_before
+    );
+    assert_eq!(
+        crate::cli::activation_census::admission_snapshot_for_test(),
+        admission_active,
+        "nested checked requests restore the outer admission scope after actual migration"
+    );
+    drop(admission_scope);
+    assert_eq!(
+        crate::cli::activation_census::admission_snapshot_for_test(),
+        admission_before,
+        "admission scope retirement restores the original execution-local state"
     );
     EgclVal::from_fixnum(1)
 }

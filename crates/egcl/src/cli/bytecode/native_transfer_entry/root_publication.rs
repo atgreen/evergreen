@@ -632,6 +632,29 @@ pub(super) unsafe fn published_mapped<R>(
     unsafe { publish_with(mapped_cursor(record), None, record as usize, body) }
 }
 
+/// Resolve only this request's innermost publication, never an enclosing
+/// compatibility boundary. Called only by the enabled admission diagnostic.
+///
+/// # Safety
+/// `record` is the live checked adapter request, already published_mapped.
+pub(super) unsafe fn admission_caller(
+    record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
+) -> Option<crate::cli::activation_census::AdmissionCaller> {
+    let boundary = unsafe { ACTIVE.with(Cell::get).as_ref() }?;
+    if boundary.bounds.start != record as usize {
+        return None;
+    }
+    let cursor = unsafe { mapped_cursor(record) };
+    if cursor.pc != boundary.cursor.pc || cursor.call_sp != boundary.cursor.call_sp {
+        return None;
+    }
+    let owner = unsafe { boundary.owner().as_ref() }?;
+    Some(crate::cli::activation_census::AdmissionCaller {
+        owner: owner.installed_symbol,
+        ordinary_entry: owner.ordinary_entry.is_some(),
+    })
+}
+
 /// Use this once a child activation is live, i.e. from cold resumption.
 /// `CAPTURE` then names the CHILD, so the owner of the caller's PC has to come
 /// from the record's own activation instead.

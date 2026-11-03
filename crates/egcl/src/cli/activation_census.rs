@@ -30,6 +30,13 @@
 //! through a reused context or claim that all per-call setup was eliminated.
 //! Missing caller identity means unknown, never infer it from CAPTURE. Names
 //! stay in the original table; companion keys use exact scalar owner IDs.
+//! .admissions[.window] records selector/early-bridge outcomes only within an
+//! explicit checked request. Caller IDs come from that request's exact published
+//! PC/directory; unresolved callers remain unknown. BridgeEligible means only
+//! the early guards passed, not that a native call or cache checkout succeeded.
+//! .entry-shapes[.window] appends installed parameter/bound-entry facts to each
+//! preparation's origin key. Its per-shape sums match preparations; admission
+//! events and bridge leases are separate families, never added to that total.
 
 #![cfg_attr(
     not(all(target_arch = "x86_64", target_os = "linux")),
@@ -51,6 +58,216 @@ pub(crate) struct Shape {
     pub variadic: bool,
 }
 
+// Entry facts deliberately kept out of Shape's existing wire schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct EntryMetadata {
+    pub min_args: u16,
+    pub arity: u16,
+    pub max_args: Option<u16>,
+    pub params_any: bool,
+    pub bound_entry: bool,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct AdmissionCaller {
+    pub owner: Option<u32>,
+    pub ordinary_entry: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum AdmissionReason {
+    SelectorCold,
+    SelectorMissingTarget,
+    SelectorFunctionTarget,
+    SelectorBytecodeTarget,
+    SelectorBuiltinTarget,
+    SelectorOtherTarget,
+    SelectorNonMapped,
+    SelectorT2Promote,
+    SelectorT1Disabled,
+    SelectorT1Shape,
+    SelectorPromotion,
+    SelectorRecompile,
+    SelectorArity,
+    SelectorDepth,
+    SelectorNoLeanEntry,
+    SelectorAccepted,
+    BridgeNoContext,
+    BridgePollPending,
+    BridgeNativeError,
+    BridgeContextIsBridge,
+    BridgeContextHasOrdinaryEntry,
+    BridgeSelfCalls,
+    BridgeNoLanes,
+    BridgeArity,
+    BridgeReceiver,
+    BridgeNoExecution,
+    BridgeEligible,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct AdmissionRequest {
+    // None means this exact request did not resolve a verified physical owner.
+    caller: Option<AdmissionCaller>,
+}
+static ADMISSION_REQUEST: egcl_rt::execution_local::ExecutionLocal<
+    std::cell::Cell<Option<AdmissionRequest>>,
+> = unsafe { egcl_rt::execution_local::ExecutionLocal::new(|| std::cell::Cell::new(None)) };
+pub(crate) struct AdmissionScope {
+    previous: Option<AdmissionRequest>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for AdmissionScope {
+    fn drop(&mut self) {
+        ADMISSION_REQUEST.with(|slot| slot.set(self.previous));
+    }
+}
+/// Invoked only inside this exact checked request's published_mapped extent.
+/// Compatibility records install None, masking any enclosing request scope.
+pub(crate) fn admission_scope(
+    metadata: impl FnOnce() -> Option<Option<AdmissionCaller>>,
+) -> Option<AdmissionScope> {
+    admission_scope_when(origins_enabled(), metadata)
+}
+fn admission_scope_when(
+    enabled: bool,
+    metadata: impl FnOnce() -> Option<Option<AdmissionCaller>>,
+) -> Option<AdmissionScope> {
+    if !enabled {
+        return None;
+    }
+    let next = metadata().map(|caller| AdmissionRequest { caller });
+    Some(AdmissionScope {
+        previous: ADMISSION_REQUEST.with(|slot| slot.replace(next)),
+        _not_send: std::marker::PhantomData,
+    })
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct AdmissionKey {
+    request: AdmissionRequest,
+    reason: AdmissionReason,
+    requested: Option<u32>,
+    shape: Option<Shape>,
+    entry: Option<EntryMetadata>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct EntryKey {
+    origin: OriginKey,
+    entry: EntryMetadata,
+}
+/// Scalar callback is evaluated only with both flags and a live request scope.
+#[inline]
+pub(crate) fn admission(
+    reason: AdmissionReason,
+    metadata: impl FnOnce() -> (Option<u32>, Option<Shape>, Option<EntryMetadata>),
+) {
+    admission_when(origins_enabled(), reason, metadata)
+}
+#[inline]
+fn admission_when(
+    enabled: bool,
+    reason: AdmissionReason,
+    metadata: impl FnOnce() -> (Option<u32>, Option<Shape>, Option<EntryMetadata>),
+) {
+    if !enabled {
+        return;
+    }
+    let Some(request) = ADMISSION_REQUEST.with(std::cell::Cell::get) else {
+        return;
+    };
+    let (requested, shape, entry) = metadata();
+    if let Ok(mut counts) = COUNTS.lock() {
+        *counts
+            .get_or_insert_with(Counters::default)
+            .admissions
+            .entry(AdmissionKey {
+                request,
+                reason,
+                requested,
+                shape,
+                entry,
+            })
+            .or_default() += 1;
+    }
+}
+
+fn scalar_id(id: Option<u32>) -> String {
+    id.map_or_else(|| "none".into(), |id| id.to_string())
+}
+fn entry_columns(entry: Option<EntryMetadata>) -> String {
+    match entry {
+        Some(entry) => format!(
+            "{} {} {} {} {}",
+            entry.min_args,
+            entry.arity,
+            entry
+                .max_args
+                .map_or_else(|| "none".into(), |n| n.to_string()),
+            entry.params_any,
+            entry.bound_entry
+        ),
+        None => "unknown unknown unknown unknown unknown".into(),
+    }
+}
+fn render_admissions(mut rows: Vec<(AdmissionKey, u64)>) -> String {
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = String::from(
+        "# events reason caller_owner_id caller_has_ordinary caller_verified requested_symbol_id callee_owner_id tier has_ordinary_entry has_env has_self_calls has_osr_entries variadic min_args arity max_args params_any bound_entry\n",
+    );
+    for (key, count) in rows {
+        let caller = key.request.caller;
+        let shape = match key.shape {
+            Some(s) => format!(
+                "{} {} {} {} {} {} {}",
+                scalar_id(s.owner),
+                if s.t2 { "T2" } else { "T1" },
+                s.ordinary,
+                s.captured,
+                s.self_calls,
+                s.osr,
+                s.variadic
+            ),
+            None => "none unknown unknown unknown unknown unknown unknown".into(),
+        };
+        out.push_str(&format!(
+            "{count} {:?} {} {} {} {} {shape} {}\n",
+            key.reason,
+            scalar_id(caller.and_then(|c| c.owner)),
+            caller.map_or_else(|| "unknown".into(), |c| c.ordinary_entry.to_string()),
+            caller.is_some(),
+            scalar_id(key.requested),
+            entry_columns(key.entry)
+        ));
+    }
+    out
+}
+fn render_entries(mut rows: Vec<(EntryKey, u64)>) -> String {
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut out = String::from(
+        "# preparations site ingress active_ingresses caller_owner_id receiver tier has_ordinary_entry has_env has_self_calls has_osr_entries variadic callee_owner_id min_args arity max_args params_any bound_entry\n",
+    );
+    for (key, count) in rows {
+        let OriginKey {
+            shape: s,
+            provenance: p,
+        } = key.origin;
+        out.push_str(&format!(
+            "{count} {:?} {:?} {} {} {:?} {} {} {} {} {} {} {} {}\n",
+            p.site,
+            p.ingress,
+            p.active_ingresses,
+            scalar_id(p.caller),
+            p.receiver,
+            if s.t2 { "T2" } else { "T1" },
+            s.ordinary,
+            s.captured,
+            s.self_calls,
+            s.osr,
+            s.variadic,
+            scalar_id(s.owner),
+            entry_columns(Some(key.entry))
+        ));
+    }
+    out
+}
+
 static ENABLED: AtomicU8 = AtomicU8::new(0);
 // Keep both views in one transaction, so concurrent snapshots cannot report
 // different preparation totals. No second census lock is added.
@@ -59,8 +276,28 @@ struct Counters {
     counts: HashMap<Shape, [u64; 2]>,
     origins: HashMap<OriginKey, u64>,
     bridge_leases: HashMap<BridgeLeaseKey, u64>,
+    admissions: HashMap<AdmissionKey, u64>,
+    entries: HashMap<EntryKey, u64>,
 }
 impl Counters {
+    fn note_entry(
+        &mut self,
+        shape: Shape,
+        recycle: bool,
+        provenance: Option<Provenance>,
+        entry: Option<EntryMetadata>,
+    ) {
+        self.note(shape, recycle, provenance);
+        if !recycle && let (Some(provenance), Some(entry)) = (provenance, entry) {
+            *self
+                .entries
+                .entry(EntryKey {
+                    origin: OriginKey { shape, provenance },
+                    entry,
+                })
+                .or_default() += 1;
+        }
+    }
     fn note(&mut self, shape: Shape, recycle: bool, provenance: Option<Provenance>) {
         self.counts.entry(shape).or_default()[usize::from(recycle)] += 1;
         if let Some(provenance) = provenance {
@@ -76,6 +313,8 @@ struct Snapshot {
     counts: Vec<(Shape, [u64; 2])>,
     origins: Vec<(OriginKey, u64)>,
     bridge_leases: Vec<(BridgeLeaseKey, u64)>,
+    admissions: Vec<(AdmissionKey, u64)>,
+    entries: Vec<(EntryKey, u64)>,
 }
 static COUNTS: Mutex<Option<Counters>> = Mutex::new(None);
 
@@ -325,6 +564,16 @@ fn snapshot() -> Snapshot {
                     .iter()
                     .map(|(key, count)| (*key, *count))
                     .collect(),
+                admissions: counts
+                    .admissions
+                    .iter()
+                    .map(|(key, count)| (*key, *count))
+                    .collect(),
+                entries: counts
+                    .entries
+                    .iter()
+                    .map(|(key, count)| (*key, *count))
+                    .collect(),
             })
         })
         .unwrap_or_default()
@@ -448,11 +697,13 @@ fn initialize() -> bool {
 // Managed native activation entries exist only on this backend.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[cold]
-pub(crate) fn note(shape: Shape, recycle: bool) {
+pub(crate) fn note(shape: Shape, recycle: bool, entry: impl FnOnce() -> EntryMetadata) {
     let provenance = (!recycle && origins_enabled()).then(|| PROVENANCE.with(std::cell::Cell::get));
+    let entry = provenance.map(|_| entry());
     if let Ok(mut counts) = COUNTS.lock() {
-        let counts = counts.get_or_insert_with(Counters::default);
-        counts.note(shape, recycle, provenance);
+        counts
+            .get_or_insert_with(Counters::default)
+            .note_entry(shape, recycle, provenance, entry);
     }
 }
 
@@ -554,8 +805,20 @@ fn write(window: bool) {
             counts,
             origins,
             bridge_leases,
+            admissions,
+            entries,
         } = snapshot();
         if origins_enabled() {
+            let suffix = if window { ".window" } else { "" };
+            for (kind, text) in [
+                ("admissions", render_admissions(admissions)),
+                ("entry-shapes", render_entries(entries)),
+            ] {
+                let companion = format!("{base}.{kind}{suffix}");
+                if let Err(error) = std::fs::write(&companion, text) {
+                    eprintln!("egcl: could not write {kind} to {companion}: {error}");
+                }
+            }
             let lease_path = format!(
                 "{base}.bridge-leases{}",
                 if window { ".window" } else { "" }
@@ -900,5 +1163,152 @@ mod origin_tests {
                 .sum::<u64>(),
             87350
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn admission_count_for_test(
+    reason: AdmissionReason,
+    requested: u32,
+    caller: Option<AdmissionCaller>,
+) -> u64 {
+    snapshot()
+        .admissions
+        .into_iter()
+        .filter(|(key, _)| {
+            key.reason == reason && key.requested == Some(requested) && key.request.caller == caller
+        })
+        .map(|(_, n)| n)
+        .sum()
+}
+#[cfg(test)]
+pub(crate) fn admission_snapshot_for_test() -> Option<Option<AdmissionCaller>> {
+    ADMISSION_REQUEST.with(|slot| slot.get().map(|request| request.caller))
+}
+#[cfg(test)]
+pub(crate) fn migration_admission_scope_for_test() -> Option<AdmissionScope> {
+    // A scope-restoration sentinel only, never physical caller evidence.
+    admission_scope(|| {
+        Some(Some(AdmissionCaller {
+            owner: Some(u32::MAX),
+            ordinary_entry: false,
+        }))
+    })
+}
+#[cfg(test)]
+pub(crate) fn entry_metadata_counts_for_test(owner: u32) -> Vec<(EntryMetadata, PrepareSite, u64)> {
+    snapshot()
+        .entries
+        .into_iter()
+        .filter(|(key, _)| key.origin.shape.owner == Some(owner))
+        .map(|(key, count)| (key.entry, key.origin.provenance.site, count))
+        .collect()
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    fn shape() -> Shape {
+        Shape {
+            owner: Some(42),
+            t2: true,
+            ordinary: true,
+            captured: false,
+            self_calls: false,
+            osr: false,
+            variadic: false,
+        }
+    }
+    fn entry() -> EntryMetadata {
+        EntryMetadata {
+            min_args: 1,
+            arity: 3,
+            max_args: Some(3),
+            params_any: true,
+            bound_entry: false,
+        }
+    }
+    #[test]
+    fn disabled_admission_scope_does_not_evaluate_metadata() {
+        assert!(admission_scope_when(false, || panic!("disabled request metadata")).is_none());
+        admission_when(false, AdmissionReason::SelectorAccepted, || {
+            panic!("disabled event metadata")
+        });
+    }
+    #[test]
+    fn exact_request_scope_masks_ancestry_and_restores_after_panic() {
+        let before = ADMISSION_REQUEST.with(std::cell::Cell::get);
+        let outer = admission_scope_when(true, || {
+            Some(Some(AdmissionCaller {
+                owner: Some(42),
+                ordinary_entry: true,
+            }))
+        });
+        let expected = ADMISSION_REQUEST.with(std::cell::Cell::get);
+        let panic = std::panic::catch_unwind(|| {
+            let _compatibility = admission_scope_when(true, || None);
+            assert!(ADMISSION_REQUEST.with(std::cell::Cell::get).is_none());
+            let _unresolved = admission_scope_when(true, || Some(None));
+            assert_eq!(
+                ADMISSION_REQUEST.with(std::cell::Cell::get).unwrap().caller,
+                None,
+                "unknown current request never adopts enclosing caller"
+            );
+            panic!("request unwind");
+        });
+        assert!(panic.is_err());
+        assert_eq!(ADMISSION_REQUEST.with(std::cell::Cell::get), expected);
+        drop(outer);
+        assert_eq!(ADMISSION_REQUEST.with(std::cell::Cell::get), before);
+    }
+    #[test]
+    fn entry_metadata_transaction_preserves_original_counts_and_origin_sums() {
+        let mut counts = Counters::default();
+        for site in [
+            PrepareSite::LeanRoot,
+            PrepareSite::GeneralRoot,
+            PrepareSite::NestedChild,
+        ] {
+            let p = Some(Provenance {
+                site,
+                ..Provenance::default()
+            });
+            counts.note_entry(shape(), false, p, Some(entry()));
+            counts.note_entry(shape(), true, None, Some(entry()));
+        }
+        assert_eq!(counts.counts.get(&shape()), Some(&[3, 3]));
+        assert_eq!(counts.origins.values().sum::<u64>(), 3);
+        assert_eq!(counts.entries.values().sum::<u64>(), 3);
+        assert_eq!(counts.entries.len(), 3);
+    }
+    #[test]
+    fn admission_and_entry_schema_keep_unknowns_and_parameter_facts_separate() {
+        let key = AdmissionKey {
+            request: AdmissionRequest { caller: None },
+            reason: AdmissionReason::SelectorNoLeanEntry,
+            requested: Some(42),
+            shape: Some(shape()),
+            entry: Some(entry()),
+        };
+        let text = render_admissions(vec![(key, 7)]);
+        let row = text.lines().nth(1).unwrap();
+        assert_eq!(row.split_whitespace().count(), 18);
+        assert_eq!(
+            row,
+            "7 SelectorNoLeanEntry none unknown false 42 42 T2 true false false false false 1 3 3 true false"
+        );
+        let text = render_entries(vec![(
+            EntryKey {
+                origin: OriginKey {
+                    shape: shape(),
+                    provenance: Provenance::default(),
+                },
+                entry: entry(),
+            },
+            7,
+        )]);
+        let row = text.lines().nth(1).unwrap();
+        assert_eq!(row.split_whitespace().count(), 18);
+        assert!(row.ends_with("42 1 3 3 true false"));
     }
 }

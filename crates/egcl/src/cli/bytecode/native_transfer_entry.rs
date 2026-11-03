@@ -811,6 +811,13 @@ unsafe extern "C" fn checked_call_published(
                     (Ingress::MappedNamed, None, None)
                 }
             });
+            let _admission_scope = crate::cli::activation_census::admission_scope(|| {
+                if !generated_mapped_ingress(record) {
+                    None // A Rust-owned request masks any enclosing scope.
+                } else {
+                    Some(root_publication::admission_caller(record))
+                }
+            });
             let direct = call_lean_target(target, record)
                 || (call_table::is_builtin_funcall(target) && funcall_fast::call(record));
             if !direct {
@@ -1060,6 +1067,27 @@ impl TransferCode {
 
     pub(super) fn needs_callable_identity(&self) -> bool {
         self.ordinary_entry.is_some() && (self.has_deopt || !self.body.self_call_sites.is_empty())
+    }
+
+    pub(super) fn census_shape(&self) -> crate::cli::activation_census::Shape {
+        crate::cli::activation_census::Shape {
+            owner: self.installed_symbol,
+            t2: self.is_t2,
+            ordinary: self.ordinary_entry.is_some(),
+            captured: self.body.has_env,
+            self_calls: !self.body.self_call_sites.is_empty(),
+            osr: !self.osr_entries.is_empty(),
+            variadic: self.body.variadic,
+        }
+    }
+    pub(super) fn census_entry(&self) -> crate::cli::activation_census::EntryMetadata {
+        crate::cli::activation_census::EntryMetadata {
+            min_args: self.body.min_args,
+            arity: self.body.arity,
+            max_args: self.body.max_args,
+            params_any: self.body.param_types.iter().all(|ty| ty.is_any()),
+            bound_entry: self.ordinary_bound_entry.is_some(),
+        }
     }
 
     /// Arguments the ordinary entry's body receives: a `&key` body's bound
@@ -6392,3 +6420,6 @@ mod ordinary_osr_companion_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod admission_reason_tests;
