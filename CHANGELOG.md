@@ -2,7 +2,13 @@
 
 ## Unreleased
 
+## 0.0.12 - 2026-11-03
+
 ### Added
+
+- `WITH-POINTER-TO-VECTOR-DATA` accepts packed octet and double-float vectors
+  through the existing foreign-memory copy-in/copy-out interface
+  ([#722](https://github.com/atgreen/evergreen/pull/722)).
 
 - Add opt-in execution-owned T1 sampling countdowns on x86-64 Linux with
   `EGCL_EXECUTION_T1_HEAT=1`
@@ -685,6 +691,22 @@
   ([#638](https://github.com/atgreen/evergreen/pull/638)).
 
 ### Performance
+
+- Native RPM runtimes use profile-guided builds trained separately for their
+  release feature sets ([#659](https://github.com/atgreen/evergreen/pull/659)).
+
+- AArch64 T2 reaches portable-call adapters for closure creation and avoids
+  clearing GC shadow slots that runtime calls overwrite
+  ([#839](https://github.com/atgreen/evergreen/pull/839),
+  [#750](https://github.com/atgreen/evergreen/pull/750)).
+
+- System Z compiles more fixnum division and single-float comparisons natively,
+  reads simple-string characters inline, and preserves observed single-float
+  profiles instead of assuming fixnums
+  ([#851](https://github.com/atgreen/evergreen/pull/851),
+  [#758](https://github.com/atgreen/evergreen/pull/758),
+  [#852](https://github.com/atgreen/evergreen/pull/852),
+  [#757](https://github.com/atgreen/evergreen/pull/757)).
 
 - Reuse initialized native bridge contexts across parent calls on x86-64 Linux,
   avoiding repeated context construction while refreshing execution controls

@@ -5029,7 +5029,7 @@ under it, otherwise the full namestring (ANSI 19.4; bliss-s1k)."
   (egcl::%native-condition :broadcast condition-variable))
 
 (defun lisp-implementation-type () "EGCL")
-(defun lisp-implementation-version () "0.0.11")
+(defun lisp-implementation-version () "0.0.12")
 (defun machine-type () (egcl-ext::%machine-type))
 (defun machine-version () (egcl-ext::%machine-type))
 (defun machine-instance () "localhost")
