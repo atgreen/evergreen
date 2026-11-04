@@ -46,6 +46,7 @@ mod shake;
 mod slot_access;
 pub mod sprof;
 pub mod tw_census;
+mod type_registry_index;
 use egcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use egcl_rt::runtime::parse_cli as parse_runtime_cli;
 use egcl_rt::value::{EOF, EgclVal, NIL, T};
@@ -17673,19 +17674,12 @@ fn names_a_standard_condition(type_name: &str) -> bool {
 /// DEFTYPE registries store the actual name symbol, including in legacy
 /// zero-argument entries. Imported aliases share that identity; unrelated
 /// same-named symbols must never select each other's expander or expansion.
-fn type_definition_lookup(list: EgclVal, name: EgclVal) -> Option<EgclVal> {
-    let mut cursor = list;
-    while cursor.is_cons() {
-        let (entry, rest) = cp(cursor);
-        if entry.is_cons() {
-            let (key, values) = cp(entry);
-            if key == name {
-                return Some(cp(values).0);
-            }
-        }
-        cursor = rest;
-    }
-    None
+fn type_definition_lookup(
+    registry: type_registry_index::TypeRegistry,
+    env: &Env,
+    name: EgclVal,
+) -> Option<EgclVal> {
+    type_registry_index::lookup(registry, registry.current(env), name)
 }
 
 /// Match the FULL, package-qualified name for the
@@ -17783,7 +17777,7 @@ fn resolve_type_spec_once(env: &Env, type_spec: EgclVal) -> Result<EgclVal, Egcl
         return Ok(type_spec);
     }
     if let Some(expander) =
-        type_definition_lookup(env.lookup_var("*TYPE-EXPANDERS*").unwrap_or(NIL), name)
+        type_definition_lookup(type_registry_index::TypeRegistry::Expanders, env, name)
     {
         if !expander.is_nil() {
             let mut expansion_env = env.clone();
@@ -17794,7 +17788,7 @@ fn resolve_type_spec_once(env: &Env, type_spec: EgclVal) -> Result<EgclVal, Egcl
     // Zero-argument aliases (including older boot images) carry concrete expansions.
     if args.is_nil() {
         if let Some(expanded) =
-            type_definition_lookup(env.lookup_var("*TYPE-DEFINITIONS*").unwrap_or(NIL), name)
+            type_definition_lookup(type_registry_index::TypeRegistry::Definitions, env, name)
         {
             return Ok(expanded);
         }
