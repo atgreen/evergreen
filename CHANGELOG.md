@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `TYPEP` and type declaration checks find DEFTYPE definitions through a
+  symbol index instead of scanning every definition ever made
+  ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
+
 - Activation census diagnostics can report exact native-call admission reasons
   and installed argument metadata, keeping eligibility events separate from
   managed preparation counts
