@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- FORMAT's `~&` at the start of a control string starts a new line when the
+  stream already holds output on its current line, including through
+  broadcast, two-way and echo streams
+  ([#1006](https://github.com/atgreen/evergreen/pull/1006)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
