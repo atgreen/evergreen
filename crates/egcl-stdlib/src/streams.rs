@@ -258,6 +258,8 @@ pub const IF_EXISTS_ERROR_VAL: EgclVal = EgclVal(1 << 3); // fixnum 1
 pub const IF_EXISTS_SUPERSEDE_VAL: EgclVal = EgclVal(2 << 3); // fixnum 2
 pub const IF_EXISTS_APPEND_VAL: EgclVal = EgclVal(3 << 3); // fixnum 3
 pub const IF_EXISTS_OVERWRITE_VAL: EgclVal = EgclVal(4 << 3); // fixnum 4
+/// :RENAME — like :SUPERSEDE, but the old file stays under its new name.
+pub const IF_EXISTS_RENAME_VAL: EgclVal = EgclVal(6 << 3); // fixnum 6
 
 /// Missing-file creation policy; NIL returns NIL and T signals a file error.
 pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
@@ -318,6 +320,9 @@ struct StreamMutableState {
     /// `get_stream_alloc`. Points into the same (stable, off-heap) `Box`, so it
     /// stays valid for the block's lifetime. Read via `self.components()`.
     components_ptr: *const [EgclVal],
+    /// What CLOSE :ABORT T undoes, for a file stream whose OPEN created or
+    /// superseded a file.
+    abort_plan: Option<AbortPlan>,
 }
 
 impl StreamMutableState {
@@ -2785,6 +2790,7 @@ fn alloc_stream(
                 element_type,
                 inner,
                 components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<EgclVal>(), 0),
+                abort_plan: None,
             },
         ),
         input: OrderedExecutionMutex::new(
@@ -3127,6 +3133,116 @@ fn missing_file_policy(if_does_not_exist: EgclVal, path_str: &str) -> Result<(),
     )))
 }
 
+/// CLHS CLOSE: "If stream performs output to a file that was created when the
+/// stream was created, the file is deleted and any previously existing file is
+/// not superseded." OPEN records the file it created and where it moved the
+/// file it superseded; CLOSE settles both.
+struct AbortPlan {
+    path: std::path::PathBuf,
+    /// Where OPEN moved the superseded file.
+    backup: Option<std::path::PathBuf>,
+    /// :RENAME keeps the old file under its new name after a normal close.
+    keep_backup: bool,
+}
+
+impl AbortPlan {
+    fn created(path: &std::path::Path) -> Self {
+        AbortPlan {
+            path: path.to_path_buf(),
+            backup: None,
+            keep_backup: false,
+        }
+    }
+
+    fn finish(mut self, abort: bool) -> Result<(), EgclError> {
+        if !abort {
+            return Ok(());
+        }
+        remove_if_present(&self.path)?;
+        if let Some(backup) = self.backup.take() {
+            std::fs::rename(&backup, &self.path).map_err(|e| {
+                EgclError::FileError(format!(
+                    "cannot restore {} from {}: {}",
+                    self.path.display(),
+                    backup.display(),
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AbortPlan {
+    /// A normal close, or a stream collected unclosed, discards the
+    /// superseded file unless :RENAME asked to keep it.
+    fn drop(&mut self) {
+        if let Some(backup) = self.backup.take()
+            && !self.keep_backup
+        {
+            let _ = remove_if_present(&backup);
+        }
+    }
+}
+
+fn remove_if_present(path: &std::path::Path) -> Result<(), EgclError> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(EgclError::FileError(format!(
+            "cannot delete {}: {}",
+            path.display(),
+            e
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Create a new file at PATH in place of the existing one. The old file is
+/// moved aside first, so an aborted CLOSE can put it back. A symbolic link is
+/// written through, and a file that cannot be moved (its directory refuses
+/// new entries) is truncated in place; neither can be restored.
+fn supersede_file(
+    path: &std::path::Path,
+    read: bool,
+    keep_backup: bool,
+) -> Result<(std::fs::File, Option<AbortPlan>), EgclError> {
+    static NEXT_BACKUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let backup_path = if keep_backup {
+        path.with_file_name(format!("{name}.bak"))
+    } else {
+        let n = NEXT_BACKUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        path.with_file_name(format!(".{name}.egcl-{}-{n}.bak", std::process::id()))
+    };
+    let movable = std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_symlink());
+    let backup = (movable && std::fs::rename(path, &backup_path).is_ok()).then_some(backup_path);
+    let opened = std::fs::OpenOptions::new()
+        .read(read)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) => {
+            if let Some(backup) = &backup {
+                let _ = std::fs::rename(backup, path);
+            }
+            return Err(EgclError::FileError(format!("cannot create file: {}", e)));
+        }
+    };
+    if let Some(backup) = &backup
+        && let Ok(meta) = std::fs::metadata(backup)
+    {
+        let _ = file.set_permissions(meta.permissions());
+    }
+    let plan = backup.is_some().then(|| AbortPlan {
+        path: path.to_path_buf(),
+        backup,
+        keep_backup,
+    });
+    Ok((file, plan))
+}
+
 pub fn open(
     pathname: EgclVal,
     direction: StreamDirection,
@@ -3273,6 +3389,7 @@ fn open_file(
             Ok(*stream)
         }
         StreamDirection::Output => {
+            let mut abort_plan = None;
             // Issue #8: Handle if_exists variants including :append.
             let file = if path.exists() {
                 if if_exists == NIL {
@@ -3299,19 +3416,23 @@ fn open_file(
                         path_str
                     )));
                 } else {
-                    // Default (:supersede / T / any other value) — truncate and create
-                    std::fs::File::create(path)
-                        .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                    // Default (:supersede / T / any other value) — a new file
+                    let (file, plan) =
+                        supersede_file(path, false, if_exists == IF_EXISTS_RENAME_VAL)?;
+                    abort_plan = plan;
+                    file
                 }
             } else {
                 if if_does_not_exist == NIL {
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                std::fs::File::create(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                let file = std::fs::File::create(path)
+                    .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?;
+                abort_plan = Some(AbortPlan::created(path));
+                file
             };
-            Ok(alloc_stream(
+            let stream = alloc_stream(
                 elt,
                 StreamInner::FileOutput {
                     file: StreamHandle::File(file),
@@ -3322,9 +3443,11 @@ fn open_file(
                 },
                 vec![],
                 Some(absolute_path),
-            ))
+            );
+            install_abort_plan(stream, abort_plan)
         }
         StreamDirection::Io => {
+            let mut abort_plan = None;
             let file = if path.exists() {
                 if if_exists == NIL {
                     return Ok(NIL);
@@ -3350,28 +3473,28 @@ fn open_file(
                         .open(path)
                         .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
                 } else {
-                    // Default (:supersede / T) — truncate
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(path)
-                        .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
+                    // Default (:supersede / T) — a new file
+                    let (file, plan) =
+                        supersede_file(path, true, if_exists == IF_EXISTS_RENAME_VAL)?;
+                    abort_plan = plan;
+                    file
                 }
             } else {
                 if if_does_not_exist == NIL {
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                std::fs::OpenOptions::new()
+                let file = std::fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .open(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
+                    .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?;
+                abort_plan = Some(AbortPlan::created(path));
+                file
             };
-            Ok(alloc_stream(
+            let stream = alloc_stream(
                 elt,
                 StreamInner::FileIo {
                     file: StreamHandle::File(file),
@@ -3386,13 +3509,14 @@ fn open_file(
                 },
                 vec![],
                 Some(absolute_path),
-            ))
+            );
+            install_abort_plan(stream, abort_plan)
         }
     }
 }
 
 pub fn close(stream: EgclVal, abort: bool) -> Result<(), EgclError> {
-    with_stream(stream, |guard| {
+    let abort_plan = with_stream(stream, |guard| {
         // Flush write buffers before closing (unless abort)
         if guard.open && !abort {
             match &mut guard.inner {
@@ -3414,8 +3538,29 @@ pub fn close(stream: EgclVal, abort: bool) -> Result<(), EgclError> {
             _ => {}
         }
         guard.open = false;
-        Ok(())
-    })
+        Ok(StreamCloseOutcome(guard.abort_plan.take()))
+    })?;
+    match abort_plan.0 {
+        Some(plan) => plan.finish(abort),
+        None => Ok(()),
+    }
+}
+
+/// The file work CLOSE leaves until the stream's lock is released.
+struct StreamCloseOutcome(Option<AbortPlan>);
+
+impl egcl_rt::gc::TraceHostRoots for StreamCloseOutcome {
+    fn trace_host_roots(&mut self, _visit: &mut dyn FnMut(*mut EgclVal)) {}
+}
+
+fn install_abort_plan(stream: EgclVal, plan: Option<AbortPlan>) -> Result<EgclVal, EgclError> {
+    if plan.is_some() {
+        with_stream(stream, |guard| {
+            guard.abort_plan = plan;
+            Ok(())
+        })?;
+    }
+    Ok(stream)
 }
 
 pub fn make_string_input_stream(
