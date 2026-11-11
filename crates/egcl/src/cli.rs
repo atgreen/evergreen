@@ -7585,6 +7585,14 @@ fn resolve_class_metaobject(env: &Env, class: EgclVal) -> Result<EgclVal, EgclEr
     if builtin_condition_definition(&name).is_some() {
         return ensure_condition_class_registered(env, &name);
     }
+    // RESTART is defined on first use by the restart machinery; FIND-CLASS and
+    // DEFMETHOD must see it before any restart exists (CLHS 4.3.7; ansi
+    // objects find-class.1; GitHub #917).
+    if sym_bare_name_rc(class).as_ref() == "RESTART"
+        && symbol_home_package_name(class) == "COMMON-LISP"
+    {
+        return ensure_restart_class(env);
+    }
     Ok(class)
 }
 
