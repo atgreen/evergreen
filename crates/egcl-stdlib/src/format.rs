@@ -3133,6 +3133,10 @@ pub struct LayoutDoc {
     // A direct FORMAT logical-block body is queried before it is wrapped in
     // its final Block event. Keep that context for speculative callback columns.
     logical_body: bool,
+    // The destination is not at the start of a line although `start_column`
+    // is 0: its column is unknown (a composite stream), or an enclosing
+    // directive has already written to the line.
+    mid_line: bool,
 }
 
 impl LayoutDoc {
@@ -3141,6 +3145,7 @@ impl LayoutDoc {
             events,
             start_column: 0,
             logical_body: false,
+            mid_line: false,
         }
     }
 
@@ -3195,6 +3200,16 @@ impl LayoutDoc {
 
     fn ends_with(&self, suffix: char) -> bool {
         self.flat_string().ends_with(suffix)
+    }
+
+    /// Whether ~& is at the start of a line, before anything this FORMAT
+    /// wrote as well as after it (CLHS 22.3.1.3).
+    fn at_line_start(&self) -> bool {
+        if self.is_empty() {
+            !self.mid_line && self.start_column == 0
+        } else {
+            self.ends_with('\n')
+        }
     }
 
     fn current_column(&self) -> usize {
@@ -3912,12 +3927,18 @@ pub fn format(
         return Ok(NIL);
     }
     let to_stream = target.to_stream;
-    let start_column = if to_stream {
-        crate::streams::stream_line_column(destination).unwrap_or(0) as usize
+    let column = if to_stream {
+        crate::streams::stream_output_line_column(destination)
     } else {
-        0
+        Some(0)
     };
-    let doc = format_to_layout_at_column(control_string, args, start_column)?;
+    let doc = format_to_layout_after(
+        control_string,
+        args,
+        column.unwrap_or(0) as usize,
+        column != Some(0),
+        false,
+    )?;
     write_layout_to_destination(destination, &doc, target)
 }
 
@@ -4046,6 +4067,18 @@ pub fn format_to_layout_in_context(
     start_column: usize,
     logical_body: bool,
 ) -> Result<LayoutDoc, EgclError> {
+    format_to_layout_after(control_string, args, start_column, false, logical_body)
+}
+
+/// FORMAT to a destination whose current line already holds output when
+/// `mid_line` is true, so that a leading ~& starts a new line.
+fn format_to_layout_after(
+    control_string: &str,
+    args: &[EgclVal],
+    start_column: usize,
+    mid_line: bool,
+    logical_body: bool,
+) -> Result<LayoutDoc, EgclError> {
     let _operation = FormatOperationScope::enter();
     let mut args = args.to_vec();
     egcl_rt::rooted_ref!(_args_root = &mut args);
@@ -4055,6 +4088,7 @@ pub fn format_to_layout_in_context(
         events: Vec::new(),
         start_column,
         logical_body,
+        mid_line,
     };
     let mut arg_idx = 0;
     take_escape();
@@ -5169,7 +5203,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                     1
                 };
                 // Fresh line: emit newline only if not at start of line
-                if !output.is_empty() && !output.ends_with('\n') {
+                if !output.at_line_start() {
                     output.character('\n');
                 }
                 for _ in 1..count {
@@ -5688,6 +5722,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                 i = skip_close_directive(&chars, body_end);
                 let mut inner = LayoutDoc {
                     logical_body: output.logical_body,
+                    mid_line: !output.at_line_start(),
                     ..LayoutDoc::default()
                 };
                 let result = format_arguments(&body, args, &mut inner);

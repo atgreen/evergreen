@@ -4059,6 +4059,37 @@ pub fn stream_line_column(stream: EgclVal) -> Option<u64> {
     with_stream(stream, |guard| Ok(guard.stream_line_column())).unwrap_or(None)
 }
 
+/// The column that output to STREAM continues from: a two-way or echo
+/// stream's output side, and for a broadcast stream the first component that
+/// knows its column, or 0 when none does (as SBCL answers). NIL when unknown.
+pub fn stream_output_line_column(stream: EgclVal) -> Option<u64> {
+    let stream = resolve_synonym_stream(stream, false).ok()?;
+    egcl_rt::rooted!(stream = stream);
+    let mut components = get_stream_alloc(*stream).ok()?.components.to_vec();
+    egcl_rt::rooted_ref!(_components_root = &mut components);
+    if components.is_empty() {
+        return with_stream(*stream, |guard| Ok(guard.stream_line_column())).unwrap_or(None);
+    }
+    let broadcast = with_stream(*stream, |guard| {
+        Ok(match guard.inner {
+            StreamInner::TwoWay | StreamInner::Echo { .. } => Some(false),
+            StreamInner::Broadcast => Some(true),
+            _ => None,
+        })
+    })
+    .ok()??;
+    if broadcast {
+        Some(
+            components
+                .iter()
+                .find_map(|&component| stream_output_line_column(component))
+                .unwrap_or(0),
+        )
+    } else {
+        stream_output_line_column(components[1])
+    }
+}
+
 // ── R5.113 additional Gray protocol free-function wrappers ────────
 
 pub fn stream_read_char_no_hang(stream: EgclVal) -> Result<EgclVal, EgclError> {
