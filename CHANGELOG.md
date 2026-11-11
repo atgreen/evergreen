@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `CLOSE :ABORT T`, and `WITH-OPEN-FILE` left by an error, delete the output
+  file and leave any file it superseded untouched, instead of leaving an empty
+  file in its place ([#1005](https://github.com/atgreen/evergreen/pull/1005)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).

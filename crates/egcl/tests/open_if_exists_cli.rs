@@ -111,3 +111,68 @@ fn evaluated_if_exists_modes_preserve_file_contents_across_tiers() {
         assert!(String::from_utf8_lossy(&output.stdout).contains("OPEN-MODES-PASS"));
     }
 }
+
+/// An aborted output file is deleted and the file it superseded survives,
+/// both from CLOSE :ABORT T and from WITH-OPEN-FILE left by an error (#1003).
+#[test]
+fn aborted_output_keeps_the_superseded_file_across_tiers() {
+    for tier in ["interp", "t0", "t1", "t2"] {
+        let root =
+            std::env::temp_dir().join(format!("egcl-open-abort-{}-{tier}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        let program = r#"
+          (defun put (path text)
+            (with-open-file (s path :direction :output :if-exists :supersede)
+              (write-string text s)))
+          (defun text (path)
+            (if (probe-file path)
+                (with-open-file (s path) (or (read-line s nil) :empty))
+                :no-file))
+          (defun abort-write (path if-exists)
+            (ignore-errors
+              (let ((s (open path :direction :output :if-exists if-exists)))
+                (unwind-protect (progn (write-string "new" s) (error "boom"))
+                  (close s :abort t)))))
+          (defun failing-write (path)
+            (ignore-errors
+              (with-open-file (s path :direction :output :if-exists :supersede)
+                (write-string "new" s)
+                (error "boom"))))
+          (abort-write "created.txt" :supersede)
+          (assert (eq :no-file (text "created.txt")))
+          (dolist (mode '(:supersede :rename-and-delete :new-version :rename))
+            (put "old.txt" "old")
+            (abort-write "old.txt" mode)
+            (assert (equal "old" (text "old.txt"))))
+          (failing-write "old.txt")
+          (assert (equal "old" (text "old.txt")))
+          (eval '(failing-write "old.txt"))
+          (assert (equal "old" (text "old.txt")))
+          (put "old.txt" "new")
+          (assert (equal "new" (text "old.txt")))
+          (format t "OPEN-ABORT-PASS~%")
+        "#;
+        let output = Command::new(env!("CARGO_BIN_EXE_egcl"))
+            .args(["--no-init", "--eval", program])
+            .current_dir(&root)
+            .env("EGCL_FORCE_TIER", tier)
+            .env_remove("EGCL_BACKEND")
+            .env_remove("EGCL_DISABLE_T2")
+            .output()
+            .expect("run aborted OPEN");
+        let mut left: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        left.sort();
+        let _ = std::fs::remove_dir_all(&root);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("OPEN-ABORT-PASS"),
+            "{tier}: {stdout}\n{stderr}"
+        );
+        assert_eq!(left, ["old.txt"], "{tier}: leftover files");
+    }
+}
