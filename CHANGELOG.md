@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- DEFMETHOD can specialize on `RESTART` in a fresh image, without a prior
+  `(find-class 'restart)` ([#1007](https://github.com/atgreen/evergreen/pull/1007)).
+
 - Functions that write packed double-float arrays can retain their ordinary
   native entry, preserving type and bounds recovery
   ([#1012](https://github.com/atgreen/evergreen/pull/1012)).
