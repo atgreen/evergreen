@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- In CL-USER the reader interns common names such as `X`, `KEY` and `OBJ` in
+  CL-USER instead of returning internal COMMON-LISP symbols
+  ([#1008](https://github.com/atgreen/evergreen/pull/1008)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
