@@ -9444,8 +9444,9 @@ fn is_standard_initialization_method(method: &MethodDef) -> bool {
     if method.qualifier != egcl_stdlib::MethodQualifier::Primary {
         return false;
     }
-    // DEFMETHOD stores the body as ((BLOCK name form...)).
-    let body = method.body;
+    // DEFMETHOD stores the body as ((BLOCK name form...)) inside its
+    // next-method helpers.
+    let body = method_continuations::unwrapped_body(method.body);
     if !body.is_cons() || !cp(body).1.is_nil() {
         return false;
     }
@@ -44170,12 +44171,19 @@ fn make_instance_plan_parts(
     let (kinds, forms): (Vec<PlanForm>, Vec<EgclVal>) = default_forms
         .iter()
         .copied()
-        .chain(
-            initform_indices
-                .iter()
-                .map(|&index| effective[index].initform.unwrap_or(NIL)),
-        )
         .map(|form| classify_plan_form(form, quote, funcall))
+        .chain(initform_indices.iter().map(|&index| {
+            // A constant initform has the same value in every lexical
+            // environment, so its initfunction need not be called (GH #957).
+            let slot = &effective[index];
+            match slot
+                .source_initform
+                .map(|form| classify_plan_form(form, quote, funcall))
+            {
+                Some(constant @ (PlanForm::Constant, _)) => constant,
+                _ => classify_plan_form(slot.initform.unwrap_or(NIL), quote, funcall),
+            }
+        }))
         .unzip();
     Some(MakeInstancePlan {
         generation,

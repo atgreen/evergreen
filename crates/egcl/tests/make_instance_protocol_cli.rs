@@ -493,3 +493,45 @@ fn make_instance_around_methods_and_change_class() {
         "RESULT (3 4 ((:MI-AROUND-CLASS (:X 3)) (:MI-AROUND-CLASS-DONE 3) (:MI-AROUND-CLASS (:X 4)) (:MI-AROUND-CLASS-DONE 4))) (5 6 ((:MI-AROUND-CLASS (:X 5)) (:MI-AROUND-STANDARD-CLASS 2) (:MI-AROUND-CLASS-DONE 5) (:MI-AROUND-CLASS (:X 6)) (:MI-AROUND-STANDARD-CLASS 2) (:MI-AROUND-CLASS-DONE 6))) (8 :Y-INITFORM ((:UIFDC-BEFORE 8 NIL) (:SI-AROUND (Y) NIL) :Y-INITFORM)) (1 ((:UIFDC-BEFORE 9 1) (:SI-AROUND (Y) 1)))",
     );
 }
+
+/// GH #957: the warmed path takes constant initforms as their values and
+/// recognizes boot's initialization methods inside DEFMETHOD's wrapper. The
+/// answers must not change, and a replacement primary defined after warm-up
+/// must still run.
+#[test]
+fn constant_initforms_and_standard_methods_after_warm_up() {
+    check_all_tiers(
+        r#"
+(progn
+  (defconstant +mic-k+ 42)
+  (defvar *mic-count* 0)
+  (defclass mic-c ()
+    ((n :initform 7 :initarg :n) (k :initform :kw) (z :initform nil)
+     (s :initform "str") (q :initform '(a b)) (c :initform +mic-k+)
+     (v :initform (incf *mic-count*))))
+  (defun mic-make (&rest args) (apply #'make-instance 'mic-c args))
+  (defun mic-row (o)
+    (mapcar (lambda (s) (slot-value o s)) '(n k z s q c v)))
+  (let ((first nil) (last nil))
+    (dotimes (i 3000)
+      (let ((o (if (evenp i) (mic-make) (mic-make :n i))))
+        (unless first (setq first o))
+        (setq last o)))
+    (let ((same-q (eq (slot-value first 'q) (slot-value last 'q)))
+          (r1 (mic-row (mic-make)))
+          (r2 (mic-row (mic-make :n -1))))
+      (let ((mic-local 5))
+        (defclass mic-d () ((a :initform 1) (b :initform mic-local))))
+      (let ((r3 (dotimes (i 3000 (let ((o (make-instance 'mic-d)))
+                                   (list (slot-value o 'a) (slot-value o 'b))))
+                  (make-instance 'mic-d))))
+        (defmethod initialize-instance ((o mic-c) &rest initargs)
+          (declare (ignore initargs))
+          (setf (slot-value o 'n) :replaced))
+        (let ((r4 (list (slot-value (mic-make) 'n) (slot-boundp (mic-make) 'k))))
+          (let ((*print-pretty* nil))
+            (format t "RESULT ~S ~S ~S ~S ~S~%" same-q r1 r2 r3 r4)))))))
+"#,
+        "RESULT T (7 :KW NIL \"str\" (A B) 42 3001) (-1 :KW NIL \"str\" (A B) 42 3002) (1 5) (:REPLACED NIL)",
+    );
+}

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `MAKE-INSTANCE` again uses its fast path when only the standard
+  initialization methods apply, and takes constant slot initforms as values
+  instead of calling their initfunctions. A 20-slot class with constant
+  initforms or initargs is made 40-50x faster
+  ([#1010](https://github.com/atgreen/evergreen/pull/1010)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
