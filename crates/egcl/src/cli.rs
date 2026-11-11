@@ -15408,11 +15408,16 @@ fn homeless_identity_is_shareable(env: &Env, pkg_name: &str, name: &str, idx: u3
     }
     let defined =
         |cell: Option<EgclVal>| cell.is_some_and(|v| v != egcl_rt::value::UNBOUND && !v.is_nil());
+    // CL-USER gets no exemption: it uses COMMON-LISP and so inherits only its
+    // externals, and boot.lisp's lambda-list names (X, A, KEY ...) are not
+    // among them (GitHub #924).
     pkg_name == "COMMON-LISP"
-        || pkg_name == "COMMON-LISP-USER"
         || is_builtin_function(name)
         || defined(egcl_rt::symbols::symbol_function(idx))
         || defined(global_value_cell(idx))
+        // A boot special (*TYPE-DEFINITIONS*) may hold NIL or nothing yet;
+        // being special is what separates it from a lambda-list name.
+        || is_special_var(EgclVal::from_symbol_index(idx))
         || env.macros.borrow().contains_key(name)
 }
 
