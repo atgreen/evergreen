@@ -2093,15 +2093,6 @@ fn resolve(name: &str) -> Option<Handler> {
             if let Some(class) = egcl_stdlib::find_class(*name) {
                 return Ok(class);
             }
-            // RESTART is defined on first use by the restart machinery;
-            // FIND-CLASS must see it before any restart exists (CLHS 4.3.7;
-            // ansi objects find-class.1).
-            if name.is_symbol()
-                && sym_bare_name_rc(*name).as_ref() == "RESTART"
-                && super::symbol_home_package_name(*name) == "COMMON-LISP"
-            {
-                return super::ensure_restart_class(env);
-            }
             if let Ok(class) = super::resolve_class_metaobject(env, *name)
                 && class != *name
             {
