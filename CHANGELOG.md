@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A readtable that gives `#` constituent syntax and rebuilds it with
+  `make-dispatch-macro-character` reads standard `#` syntax again, so
+  named-readtables' `(:merge :standard)` works
+  ([#1009](https://github.com/atgreen/evergreen/pull/1009)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
