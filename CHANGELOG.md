@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- DEFMETHOD can specialize on `RESTART` in a fresh image, without a prior
+  `(find-class 'restart)` ([#1007](https://github.com/atgreen/evergreen/pull/1007)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
