@@ -3871,8 +3871,8 @@ impl HeapCollector {
         }
 
         // Run finalizers for dead objects (R3.12).
-        for obj_val in &dead_object_vals {
-            run_finalizers_for(*obj_val);
+        if !dead_object_vals.is_empty() {
+            run_finalizers_for_keys(&dead_object_vals);
         }
 
         // Break weak pointers to dead objects (R3.13).
@@ -7569,7 +7569,27 @@ fn forwarded_side_key(key: EgclVal, heap_base: usize, heap_end: usize) -> Option
 fn relocate_side_tables(heap_base: usize, heap_end: usize) {
     {
         let mut reg = finalizer_registry().lock().unwrap();
-        for e in &mut reg.entries {
+        // Take every moved native entry out before reinserting any, so a new
+        // key never meets an entry that has yet to move.
+        let moved: Vec<u64> = reg
+            .native
+            .keys()
+            .copied()
+            .filter(|&key| {
+                forwarded_side_key(EgclVal::from_raw(key), heap_base, heap_end).is_some()
+            })
+            .collect();
+        let mut forwarded = Vec::with_capacity(moved.len());
+        for key in moved {
+            let mut entry = reg.native.remove(&key).expect("moved finalizer key");
+            entry.object =
+                forwarded_side_key(entry.object, heap_base, heap_end).expect("moved finalizer key");
+            forwarded.push(entry);
+        }
+        for entry in forwarded {
+            reg.native.insert(entry.object.to_raw(), entry);
+        }
+        for e in &mut reg.deferred_entries {
             if let Some(new_key) = forwarded_side_key(e.object, heap_base, heap_end) {
                 e.object = new_key;
             }
@@ -7596,22 +7616,31 @@ fn relocate_side_tables(heap_base: usize, heap_end: usize) {
 /// `relocate_side_tables`, so any finalizer key still inside a freed range
 /// belongs to a genuinely dead object (egcl-jtc.7f).
 fn fire_finalizers_in_ranges(ranges: &[(usize, usize)]) {
-    // Snapshot dead keys first; `run_finalizers_for` re-locks the registry.
+    let in_ranges = |key: EgclVal| {
+        let addr = key.to_raw() as usize;
+        ranges
+            .iter()
+            .any(|&(base, limit)| addr >= base && addr < limit)
+    };
+    // Snapshot dead keys first; `run_finalizers_for_keys` re-locks the registry.
     let dead: Vec<EgclVal> = {
         let reg = finalizer_registry().lock().unwrap();
-        reg.entries
-            .iter()
-            .filter(|e| {
-                let addr = e.object.to_raw() as usize;
-                ranges
-                    .iter()
-                    .any(|&(base, limit)| addr >= base && addr < limit)
-            })
-            .map(|e| e.object)
-            .collect()
+        let mut dead: Vec<EgclVal> = reg
+            .native
+            .keys()
+            .map(|&key| EgclVal::from_raw(key))
+            .filter(|&key| in_ranges(key))
+            .collect();
+        dead.extend(
+            reg.deferred_entries
+                .iter()
+                .map(|e| e.object)
+                .filter(|&key| in_ranges(key)),
+        );
+        dead
     };
-    for key in dead {
-        run_finalizers_for(key);
+    if !dead.is_empty() {
+        run_finalizers_for_keys(&dead);
     }
 }
 
@@ -7620,6 +7649,8 @@ fn fire_finalizers_in_ranges(ranges: &[(usize, usize)]) {
 /// Entry in the finalizer registry: maps an object to its finalizer callback.
 struct FinalizerEntry {
     object: EgclVal,
+    /// Registration order, which callbacks for several dead objects run in.
+    seq: u64,
     finalizer: EgclVal,
     /// Lisp callbacks must run after the collector has released the heap lock;
     /// native resource destructors must run immediately while their dead
@@ -7630,9 +7661,16 @@ struct FinalizerEntry {
     callback: Option<fn(EgclVal, EgclVal)>,
 }
 
+/// Native destructors are indexed by key: every stream registers one, so a
+/// linear registry made each stream creation, and each collection's removal
+/// of every dead stream, cost time proportional to all registrations.
 #[derive(Default)]
 struct FinalizerState {
-    entries: Vec<FinalizerEntry>,
+    /// At most one native destructor per object, keyed by its raw key.
+    native: HashMap<u64, FinalizerEntry, crate::fxhash::FxBuildHasher>,
+    /// Lisp callbacks, in registration order; several may share an object.
+    deferred_entries: Vec<FinalizerEntry>,
+    next_seq: u64,
     /// Lisp functions whose targets died during a collection.  These remain
     /// precise external roots until the evaluator takes and invokes them at a
     /// safe boundary outside the collector.
@@ -7657,7 +7695,10 @@ fn finalizer_registry() -> &'static OrderedMutex<FinalizerState> {
 /// finalization into a strong reference and the target could never die.
 fn scan_finalizer_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
     let mut state = finalizer_registry().lock().unwrap();
-    for entry in &mut state.entries {
+    for entry in state.native.values_mut() {
+        visit(&mut entry.finalizer);
+    }
+    for entry in &mut state.deferred_entries {
         visit(&mut entry.finalizer);
     }
     for finalizer in &mut state.deferred {
@@ -7869,20 +7910,23 @@ pub fn register_finalizer(object: EgclVal, finalizer: EgclVal) -> Result<(), Egc
     // Replace the subsystem destructor for the same object, but never replace
     // user callbacks registered through `register_deferred_finalizer`: both may
     // legitimately coexist on a Lisp-visible stream wrapper.
-    if let Some(entry) = state
-        .entries
-        .iter_mut()
-        .find(|e| e.object == object && !e.deferred)
-    {
-        entry.finalizer = finalizer;
-        entry.callback = dispatch;
-    } else {
-        state.entries.push(FinalizerEntry {
-            object,
-            finalizer,
-            deferred: false,
-            callback: dispatch,
-        });
+    let seq = state.next_seq;
+    match state.native.entry(object.to_raw()) {
+        std::collections::hash_map::Entry::Occupied(mut slot) => {
+            let entry = slot.get_mut();
+            entry.finalizer = finalizer;
+            entry.callback = dispatch;
+        }
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(FinalizerEntry {
+                object,
+                seq,
+                finalizer,
+                deferred: false,
+                callback: dispatch,
+            });
+            state.next_seq += 1;
+        }
     }
     Ok(())
 }
@@ -7923,16 +7967,16 @@ pub fn finalizer_key(object: EgclVal) -> Result<EgclVal, EgclError> {
 /// the callback; the evaluator invokes it later, outside collector locks.
 pub fn register_deferred_finalizer(object: EgclVal, finalizer: EgclVal) -> Result<(), EgclError> {
     install_finalizer_root_scanner();
-    finalizer_registry()
-        .lock()
-        .unwrap()
-        .entries
-        .push(FinalizerEntry {
-            object,
-            finalizer,
-            deferred: true,
-            callback: None,
-        });
+    let mut state = finalizer_registry().lock().unwrap();
+    let seq = state.next_seq;
+    state.next_seq += 1;
+    state.deferred_entries.push(FinalizerEntry {
+        object,
+        seq,
+        finalizer,
+        deferred: true,
+        callback: None,
+    });
     Ok(())
 }
 
@@ -7942,8 +7986,8 @@ pub fn cancel_deferred_finalizers(object: EgclVal) {
     finalizer_registry()
         .lock()
         .unwrap()
-        .entries
-        .retain(|entry| !entry.deferred || entry.object != object);
+        .deferred_entries
+        .retain(|entry| entry.object != object);
 }
 
 /// Take the Lisp callbacks queued by completed collections.  The returned
@@ -7959,17 +8003,29 @@ pub fn take_deferred_finalizers() -> Vec<EgclVal> {
 /// Per R3.16, finalizer errors must not corrupt GC state — any panic or error
 /// from a finalizer invocation is caught and silently discarded.
 pub fn run_finalizers_for(object: EgclVal) -> Vec<EgclVal> {
+    run_finalizers_for_keys(&[object])
+}
+
+/// [`run_finalizers_for`] for every object in `objects` at once: one pass over
+/// the deferred callbacks however many objects died.
+fn run_finalizers_for_keys(objects: &[EgclVal]) -> Vec<EgclVal> {
     let mut state = finalizer_registry().lock().unwrap();
     let mut matching = Vec::new();
-    let mut retained = Vec::with_capacity(state.entries.len());
-    for entry in state.entries.drain(..) {
-        if entry.object == object {
+    for object in objects {
+        if let Some(entry) = state.native.remove(&object.to_raw()) {
             matching.push(entry);
-        } else {
-            retained.push(entry);
         }
     }
-    state.entries = retained;
+    if !state.deferred_entries.is_empty() {
+        let dead: std::collections::HashSet<u64, crate::fxhash::FxBuildHasher> =
+            objects.iter().map(|object| object.to_raw()).collect();
+        let (dying, retained): (Vec<_>, Vec<_>) = std::mem::take(&mut state.deferred_entries)
+            .into_iter()
+            .partition(|entry| dead.contains(&entry.object.to_raw()));
+        state.deferred_entries = retained;
+        matching.extend(dying);
+    }
+    matching.sort_by_key(|entry| entry.seq);
 
     // Queue arbitrary Lisp before releasing the registry lock.  This performs
     // no Lisp allocation and the queue itself is traced as an external root.
@@ -7990,7 +8046,7 @@ pub fn run_finalizers_for(object: EgclVal) -> Vec<EgclVal> {
             if let Some(dispatch) = dispatch {
                 // R3.16: native destructor panics must not corrupt GC state.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    dispatch(entry.finalizer, object);
+                    dispatch(entry.finalizer, entry.object);
                 }));
             }
         }
@@ -8005,7 +8061,9 @@ pub fn run_finalizers_for(object: EgclVal) -> Vec<EgclVal> {
 /// happens to collect the associated objects first.
 pub fn run_pending_finalizers() -> Vec<(EgclVal, EgclVal)> {
     let mut state = finalizer_registry().lock().unwrap();
-    let entries: Vec<_> = state.entries.drain(..).collect();
+    let mut entries: Vec<_> = state.native.drain().map(|(_, entry)| entry).collect();
+    entries.append(&mut state.deferred_entries);
+    entries.sort_by_key(|entry| entry.seq);
     for entry in &entries {
         if entry.deferred {
             state.deferred.push(entry.finalizer);
