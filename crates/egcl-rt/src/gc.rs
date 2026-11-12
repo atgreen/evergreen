@@ -3738,7 +3738,6 @@ impl HeapCollector {
 
         // Compute live_bytes per region from mark results.
         // Also run finalizers for dead objects and break their weak pointers.
-        let mut dead_object_vals: Vec<EgclVal> = Vec::new();
         let mut dead_function_slots = Vec::new();
         let mut dead_closure_states = Vec::new();
         let mut dead_functions = std::collections::HashSet::new();
@@ -3825,10 +3824,6 @@ impl HeapCollector {
                             }
                             if object_map.is_marked(body_addr) {
                                 live += total_size as u32;
-                            } else {
-                                // Object is dead — queue for finalization.
-                                let obj_val = EgclVal::from_raw(body_addr as u64);
-                                dead_object_vals.push(obj_val);
                             }
                         }
                         cursor += total_size;
@@ -3870,21 +3865,35 @@ impl HeapCollector {
             }
         }
 
-        // Run finalizers for dead objects (R3.12).
-        if !dead_object_vals.is_empty() {
-            run_finalizers_for_keys(&dead_object_vals);
+        // An object found dead above: an unmarked object start in a swept
+        // region. The mark bitmap answers this directly, so no set of every
+        // dead object is built (a major collection of the host-2 node file
+        // spent ~0.5 s per cycle hashing them). Nursery regions indexed for a
+        // KeepNursery cycle are not swept: their deaths belong to the minor
+        // collection that follows.
+        let mut swept = vec![false; state.regions.len()];
+        for &idx in &marked_regions {
+            swept[idx] = true;
         }
+        let is_dead_object = |body: usize| {
+            object_map.contains(body)
+                && !object_map.is_marked(body)
+                && swept[object_map.region_of(body)]
+        };
+
+        // Run finalizers for dead objects (R3.12).
+        fire_finalizers_matching(&|key: EgclVal| is_dead_object(key.to_raw() as usize));
 
         // Break weak pointers to dead objects (R3.13).
         {
-            let mut dead_set: std::collections::HashSet<u64> =
-                dead_object_vals.iter().map(|v| v.to_raw()).collect();
-            dead_set.extend(
+            let dead_set: std::collections::HashSet<u64, crate::fxhash::FxBuildHasher> =
                 dead_symbols
                     .iter()
-                    .map(|(index, _)| EgclVal::from_symbol_index(*index).to_raw()),
-            );
-            break_dead_weak_pointers(&|val: EgclVal| dead_set.contains(&val.to_raw()));
+                    .map(|(index, _)| EgclVal::from_symbol_index(*index).to_raw())
+                    .collect();
+            break_dead_weak_pointers(&|val: EgclVal| {
+                dead_set.contains(&val.to_raw()) || is_dead_object(val.to_raw() as usize)
+            });
             // Weak containers drop entries for the same dead objects. Nothing has
             // moved yet at this point in a major cycle, so this pass only decides
             // liveness; the post-evacuation pass below does the relocating.
@@ -3896,12 +3905,11 @@ impl HeapCollector {
                 // reference before asking. Comparing the tagged word never
                 // matched, so no weak entry died in a major collection
                 // (bliss-4due).
-                let key = if is_heap_ref(value) {
-                    ref_body_addr(value) as u64
+                if is_heap_ref(value) {
+                    !is_dead_object(ref_body_addr(value))
                 } else {
-                    value.to_raw()
-                };
-                !dead_set.contains(&key)
+                    !dead_set.contains(&value.to_raw())
+                }
             });
         }
 
@@ -7616,28 +7624,33 @@ fn relocate_side_tables(heap_base: usize, heap_end: usize) {
 /// `relocate_side_tables`, so any finalizer key still inside a freed range
 /// belongs to a genuinely dead object (egcl-jtc.7f).
 fn fire_finalizers_in_ranges(ranges: &[(usize, usize)]) {
-    let in_ranges = |key: EgclVal| {
+    fire_finalizers_matching(&|key: EgclVal| {
         let addr = key.to_raw() as usize;
         ranges
             .iter()
             .any(|&(base, limit)| addr >= base && addr < limit)
-    };
+    });
+}
+
+/// Fire and remove the finalizers whose key `dead` says belongs to a dead
+/// object. Visits each registration once.
+fn fire_finalizers_matching(dead: &dyn Fn(EgclVal) -> bool) {
     // Snapshot dead keys first; `run_finalizers_for_keys` re-locks the registry.
     let dead: Vec<EgclVal> = {
         let reg = finalizer_registry().lock().unwrap();
-        let mut dead: Vec<EgclVal> = reg
+        let mut found: Vec<EgclVal> = reg
             .native
             .keys()
             .map(|&key| EgclVal::from_raw(key))
-            .filter(|&key| in_ranges(key))
+            .filter(|&key| dead(key))
             .collect();
-        dead.extend(
+        found.extend(
             reg.deferred_entries
                 .iter()
                 .map(|e| e.object)
-                .filter(|&key| in_ranges(key)),
+                .filter(|&key| dead(key)),
         );
-        dead
+        found
     };
     if !dead.is_empty() {
         run_finalizers_for_keys(&dead);
