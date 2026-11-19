@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Preserve lexical parameter bindings when a global symbol macro has the same
+  symbol, including interpreted reads, assignments and later defaults
+  ([#988](https://github.com/atgreen/evergreen/pull/988)).
+
 - FORMAT's `~&` at the start of a control string starts a new line when the
   stream already holds output on its current line, including through
   broadcast, two-way and echo streams. A zero repeat count (`~0&`) emits
