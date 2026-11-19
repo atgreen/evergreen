@@ -906,6 +906,29 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                         return Err(declined("guarded packed-double read shape"));
                     }
                 }
+                Opcode::PackedF64Set => {
+                    // Use the shared ordered type/layout/bounds recovery and
+                    // raw-word store. No call, allocation, or tagged write
+                    // barrier belongs between its guards and memory effect.
+                    if data.args.len() != 3
+                        || !data.results.is_empty()
+                        || data.args[..2]
+                            .iter()
+                            .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                        || f.value(data.args[2]).repr != ValueRepresentation::UnboxedF64
+                        || f.value(data.args[2]).ty.bits != TypeBits::DOUBLE_FLOAT
+                        || data.flags
+                            != (crate::t2::ir::InstFlags {
+                                guard: true,
+                                effectful: true,
+                                ..Default::default()
+                            })
+                        || data.frame_state.is_none()
+                        || !matches!(data.aux, AuxData::None)
+                    {
+                        return Err(declined("guarded packed-double store shape"));
+                    }
+                }
                 // Raw double operations. Their shapes, including the deopt
                 // states of sqrt and division (bliss-lhy89), are checked by
                 // the raw representation validator.

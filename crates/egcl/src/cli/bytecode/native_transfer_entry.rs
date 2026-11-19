@@ -6423,3 +6423,6 @@ mod ordinary_osr_companion_tests {
 
 #[cfg(test)]
 mod admission_reason_tests;
+
+#[cfg(test)]
+mod ordinary_packed_store_tests;

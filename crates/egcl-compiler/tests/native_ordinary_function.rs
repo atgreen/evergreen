@@ -1495,3 +1495,175 @@ fn ordinary_packed_u8_reads_and_stores_cover_small_large_and_checked_failures() 
         execute(&write, 3, &[invalid.0, 0, 0, 0, 0, 0, 0], cold);
     }
 }
+
+fn ordinary_packed_store(bits: u64) -> (Function, Inst) {
+    let mut f = Function::new("ordinary-packed-store");
+    let entry = f.entry();
+    let array = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let index = f.add_block_param(entry, IRType::TOP, ValueRepresentation::Tagged);
+    let raw = f
+        .push_inst(
+            entry,
+            instruction(Opcode::ConstDouble, vec![], AuxData::DoubleImm(bits)),
+            &[(
+                IRType::of(TypeBits::DOUBLE_FLOAT),
+                ValueRepresentation::UnboxedF64,
+            )],
+        )
+        .1[0];
+    let recovery = state(&mut f, array, &[array, index], 0);
+    let mut store = instruction(Opcode::PackedF64Set, vec![array, index, raw], AuxData::None);
+    store.flags = InstFlags {
+        guard: true,
+        effectful: true,
+        ..Default::default()
+    };
+    store.frame_state = Some(recovery);
+    let (store, _) = f.push_inst(entry, store, &[]);
+    f.set_terminator(
+        entry,
+        instruction(Opcode::Return, vec![array], AuxData::None),
+    );
+    egcl_compiler::t2::verify::verify(&f).unwrap();
+    (f, store)
+}
+
+#[test]
+fn ordinary_packed_double_store_executes_and_preserves_raw_bits() {
+    egcl_rt::rooted!(packed = egcl_rt::packed_f64::make(2, 91.0).unwrap());
+    for bits in [
+        0,
+        (-0.0f64).to_bits(),
+        1,
+        1.25f64.to_bits(),
+        f64::INFINITY.to_bits(),
+        0x7ff8_0000_0000_1234,
+        0xfff8_0000_0000_5678,
+    ] {
+        let (f, _) = ordinary_packed_store(bits);
+        execute(&f, 2, &[packed.0, 1 << 3, 0, 0, 0, 0, 0], packed.0);
+        assert_eq!(
+            egcl_rt::packed_f64::get(*packed, 1).unwrap().to_bits(),
+            bits
+        );
+        assert_eq!(
+            egcl_rt::packed_f64::get(*packed, 0).unwrap().to_bits(),
+            91.0f64.to_bits()
+        );
+    }
+    // The same emitter must honor the extended object header for large arrays.
+    egcl_rt::rooted!(large = egcl_rt::packed_f64::make(65536, 91.0).unwrap());
+    let (f, _) = ordinary_packed_store((-0.0f64).to_bits());
+    execute(&f, 2, &[large.0, 65535 << 3, 0, 0, 0, 0, 0], large.0);
+    assert_eq!(
+        egcl_rt::packed_f64::get(*large, 65535).unwrap().to_bits(),
+        (-0.0f64).to_bits()
+    );
+    assert_eq!(egcl_rt::packed_f64::get(*large, 0), Some(91.0));
+}
+
+#[test]
+fn ordinary_packed_double_store_guards_deopt_before_any_write() {
+    use egcl_rt::EgclVal;
+    let (f, _) = ordinary_packed_store(5.5f64.to_bits());
+    let cold = (-8i64) as u64; // Existing real ordinary guard veneer returns this sentinel.
+    egcl_rt::rooted!(packed = egcl_rt::packed_f64::make(2, 91.0).unwrap());
+    for index in [
+        EgclVal::from_fixnum(-1),
+        EgclVal::from_fixnum(2),
+        NIL,
+        EgclVal::from_char('x'),
+    ] {
+        execute(&f, 2, &[packed.0, index.0, 0, 0, 0, 0, 0], cold);
+        assert_eq!(egcl_rt::packed_f64::get(*packed, 0), Some(91.0));
+        assert_eq!(egcl_rt::packed_f64::get(*packed, 1), Some(91.0));
+    }
+    egcl_rt::rooted!(empty = egcl_rt::packed_f64::make(0, 0.0).unwrap());
+    execute(&f, 2, &[empty.0, 0, 0, 0, 0, 0, 0], cold);
+    egcl_rt::rooted!(bytes = egcl_rt::packed_u8::make(2, 23).unwrap());
+    execute(&f, 2, &[bytes.0, 0, 0, 0, 0, 0, 0], cold);
+    assert_eq!(egcl_rt::packed_u8::get(*bytes, 0), Some(23));
+    for invalid in [NIL, EgclVal::from_fixnum(0), EgclVal::from_char('x')] {
+        execute(&f, 2, &[invalid.0, 0, 0, 0, 0, 0, 0], cold);
+    }
+    // General vectors do not gain a packed-double store, even if their size fits.
+    egcl_rt::rooted!(
+        general = {
+            let body =
+                egcl_rt::gc::alloc_typed(16, egcl_rt::object::type_id::SIMPLE_VECTOR).unwrap();
+            unsafe {
+                body.cast::<u64>().write(1);
+                body.add(8)
+                    .cast::<EgclVal>()
+                    .write(EgclVal::from_fixnum(37));
+                EgclVal::from_heap_ptr(body.sub(egcl_rt::gc::body_header_offset(16)))
+            }
+        }
+    );
+    execute(&f, 2, &[general.0, 0, 0, 0, 0, 0, 0], cold);
+    let body = unsafe { general.as_ptr().add(egcl_rt::gc::body_header_offset(16)) };
+    assert_eq!(
+        unsafe { body.add(8).cast::<EgclVal>().read() },
+        EgclVal::from_fixnum(37)
+    );
+}
+
+#[test]
+fn ordinary_packed_double_store_rejects_malformed_ir_before_emission() {
+    for malformed in 0..12 {
+        let (mut f, store) = ordinary_packed_store(5.5f64.to_bits());
+        let raw = f.inst(store).args[2];
+        match malformed {
+            0 => f.inst_mut(store).flags.guard = false,
+            1 => f.inst_mut(store).flags.effectful = false,
+            2 => f.inst_mut(store).flags.call = true,
+            3 => f.inst_mut(store).flags.safepoint = true,
+            4 => f.inst_mut(store).frame_state = None,
+            5 => f.inst_mut(store).aux = AuxData::FixnumImm(0),
+            6 => {
+                f.inst_mut(store).args.pop();
+            }
+            7 => f.set_repr(raw, ValueRepresentation::Tagged),
+            8 => f.refine_type(raw, IRType::of(TypeBits::SINGLE_FLOAT)),
+            9 => f.inst_mut(store).results.push(raw),
+            10 => {
+                let index = f.inst(store).args[1];
+                f.set_repr(index, ValueRepresentation::UnboxedFixnum);
+            }
+            11 => f.inst_mut(store).flags.terminator = true,
+            _ => unreachable!(),
+        }
+        let errors = egcl_compiler::t2::verify::verify(&f).expect_err("malformed store");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.check == "V8 packed-f64-contract")
+        );
+        let result = emit_framed_ordinary_function(
+            &f,
+            OrdinaryLispEntryOptions {
+                require_callable_home: false,
+                arity: 2,
+                arity_error_veneer: 1,
+                binding: None,
+            },
+            &[],
+            OrdinaryCallFlags {
+                gc_requested: 1,
+                sigusr1_pending: 1,
+                posted_signal: 1,
+                native_errors: 1,
+                signal_epoch: 1,
+            },
+            1,
+            OrdinaryGuardOptions {
+                veneer: 1,
+                multiple_values: 1,
+            },
+        );
+        assert!(
+            result.is_err(),
+            "ordinary emission must retain verifier rejection"
+        );
+    }
+}

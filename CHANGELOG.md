@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Functions that write packed double-float arrays can retain their ordinary
+  native entry, preserving type and bounds recovery
+  ([#1012](https://github.com/atgreen/evergreen/pull/1012)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
