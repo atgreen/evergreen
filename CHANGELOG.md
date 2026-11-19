@@ -4,7 +4,8 @@
 
 - FORMAT's `~&` at the start of a control string starts a new line when the
   stream already holds output on its current line, including through
-  broadcast, two-way and echo streams
+  broadcast, two-way and echo streams. A zero repeat count (`~0&`) emits
+  no newline
   ([#1006](https://github.com/atgreen/evergreen/pull/1006)).
 
 - A readtable that gives `#` constituent syntax and rebuilds it with

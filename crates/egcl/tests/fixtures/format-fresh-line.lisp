@@ -13,6 +13,8 @@
   (check "at start" (lambda (s) (format s "~&x")) "x")
   (check "mid-line" (lambda (s) (write-string "a" s) (format s "~&x"))
          (concatenate 'string "a" *nl* "x"))
+  (check "~0& mid-line" (lambda (s) (write-string "a" s) (format s "~0&x")) "ax")
+  (check "~0& within control" (lambda (s) (format s "a~0&x")) "ax")
   (check "~2& mid-line" (lambda (s) (write-string "a" s) (format s "~2&x"))
          (concatenate 'string "a" *nl* *nl* "x"))
   (check "~2& at start" (lambda (s) (format s "~2&x")) (concatenate 'string *nl* "x"))

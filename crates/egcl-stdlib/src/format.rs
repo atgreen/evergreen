@@ -5203,7 +5203,7 @@ fn format_arguments(control: &str, args: &Arguments, output: &mut LayoutDoc) -> 
                     1
                 };
                 // Fresh line: emit newline only if not at start of line
-                if !output.at_line_start() {
+                if count > 0 && !output.at_line_start() {
                     output.character('\n');
                 }
                 for _ in 1..count {
