@@ -26,7 +26,26 @@ pub(super) fn capture_slot_initfunctions(
             slots[i].initfunction = Some(eval_form(*source, env)?);
         }
         if let Some(function) = slots[i].initfunction {
-            slots[i].initform = Some(vec_to_list(&[*funcall, function]));
+            // Keep the real initfunction for the class protocol, but do not
+            // turn a generated, self-evaluating scalar into a call. DEFSTRUCT
+            // copies this executable form when constructing an :INCLUDE child.
+            // Explicit MOP initfunctions remain authoritative even when their
+            // advertised source form is a literal; computed/lexical forms must
+            // still execute in the captured definition environment.
+            let literal = supplied.is_none()
+                && slots[i].source_initform.is_some_and(|form| {
+                    form.is_nil()
+                        || form == T
+                        || form.is_fixnum()
+                        || (form.is_symbol()
+                            && !egcl_rt::symbols::is_uninterned(form.as_symbol_index())
+                            && is_keyword_arg(form))
+                });
+            slots[i].initform = if literal {
+                slots[i].source_initform
+            } else {
+                Some(vec_to_list(&[*funcall, function]))
+            };
         }
         i += 1;
     }
@@ -419,6 +438,56 @@ pub(super) fn ensure_finalized(mut class: EgclVal, env: &mut Env) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_scalar_slot_forms_keep_sources_and_real_initfunctions() {
+        let _lock = heap_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        egcl_rt::rooted!(env = Env::new(false));
+        struct RestoreBoot(bool);
+        impl Drop for RestoreBoot {
+            fn drop(&mut self) {
+                BOOT_COMPLETE.with(|flag| flag.set(self.0));
+            }
+        }
+        let _boot = RestoreBoot(BOOT_COMPLETE.with(|flag| flag.replace(false)));
+        read_eval_all_env(EMBEDDED_BOOT_LISP, &mut env).unwrap();
+        BOOT_COMPLETE.with(|flag| flag.set(true));
+        read_eval_all_env(
+            "(defclass scalar-slot-proof () ((a :initform nil) (b :initform t) \
+             (c :initform 17) (d :initform :node) (e :initform (+ 1 2))))",
+            &mut env,
+        )
+        .unwrap();
+        egcl_rt::rooted!(
+            class = read_eval_all_env("(find-class 'scalar-slot-proof)", &mut env).unwrap()
+        );
+        egcl_rt::rooted!(slots = runtime_class_definition(&env, *class).unwrap().slots);
+        for slot in &slots[..4] {
+            assert_eq!(slot.initform, slot.source_initform);
+            assert!(is_function_value(slot.initfunction.unwrap()));
+        }
+        assert!(slots[4].initform.unwrap().is_cons());
+        assert_ne!(slots[4].initform, slots[4].source_initform);
+        // A supplied function is authoritative even with a scalar source form.
+        egcl_rt::rooted!(function = read_eval_all_env("#'(lambda () 73)", &mut env).unwrap());
+        egcl_rt::rooted!(key = resolve_sym(":INITFUNCTION").unwrap());
+        slots[2].mop_options = vec![*key, *function];
+        capture_slot_initfunctions(&mut slots, &mut env).unwrap();
+        assert_eq!(slots[2].initfunction, Some(*function));
+        assert_eq!(slots[2].source_initform, Some(EgclVal::from_fixnum(17)));
+        // An uninterned symbol with keyword-like spelling is not a constant.
+        let fake_keyword = reader::make_uninterned_symbol("KEYWORD:NOT-A-KEYWORD");
+        slots[3].source_initform = Some(fake_keyword);
+        capture_slot_initfunctions(&mut slots, &mut env).unwrap();
+        assert_ne!(slots[3].initform, slots[3].source_initform);
+        let funcall = resolve_sym("FUNCALL").unwrap();
+        assert_eq!(cp(slots[2].initform.unwrap()).0, funcall);
+        assert_eq!(cp(cp(slots[2].initform.unwrap()).1).0, *function);
+        assert_eq!(
+            apply_function(*function, &[], &mut env).unwrap(),
+            EgclVal::from_fixnum(73)
+        );
+    }
 
     const PUBLICATION_CHILD: &str = "EGCL_MOP_PUBLICATION_ROOT_CHILD";
     const PUBLICATION_FILTER: &str =
