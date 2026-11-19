@@ -97,6 +97,7 @@ mod mapped_ordinary_parent_tests;
 #[cfg(test)]
 mod mapped_ordinary_tests;
 mod ordinary_t2;
+pub(super) mod rust_ordinary_root;
 mod typed_mapped_entry;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
@@ -436,6 +437,8 @@ pub(super) struct TransferCode {
     /// Cache state has no strong code edge. Dirty weak tokens cover current,
     /// retired and externally retained code without a registry ownership cycle.
     callable_cache: Rc<CallableIdentityCache>,
+    /// Immutable Rust-root entry capability, including a cached rejection.
+    rust_root_entry: std::cell::OnceCell<Option<usize>>,
     /// Lock-free symbol snapshots of `body.names`, built on the first captured
     /// variable access through the ordinary lexical leaf (bliss-gg3i1.7.3).
     leaf_names: std::cell::OnceCell<Box<[egcl_rt::symbols::ResolvedSymbolName]>>,
@@ -900,6 +903,11 @@ unsafe fn call_lean_target(
                     code.is_t2.then_some(cell),
                 )
             }
+        {
+            result
+        } else if !published_mapped
+            && let Some(result) =
+                rust_ordinary_root::try_run(&code, function, args, unsafe { &mut *env })
         {
             result
         } else if code.lean_root_entry() == Some(offset) {
