@@ -422,3 +422,72 @@ fn supersede_private_mode_is_preserved_without_privilege_bits() {
         assert_eq!(names(&dir), ["f"]);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn superseding_a_fifo_keeps_a_single_write_through_open() {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+    const CHILD: &str = "EGCL_TEST_ABORT_FIFO_DIR";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let dir = PathBuf::from(dir);
+        let path = dir.join("fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            std::fs::File::open(reader_path)
+                .unwrap()
+                .read_to_end(&mut bytes)
+                .unwrap();
+            bytes
+        });
+        write_new(
+            &path,
+            StreamDirection::Output,
+            IF_EXISTS_SUPERSEDE_VAL,
+            false,
+        );
+        assert_eq!(reader.join().unwrap(), b"new\n");
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_fifo()
+        );
+        assert_eq!(names(&dir), ["fifo"]);
+        return;
+    }
+    // Bound a FIFO regression in its own process, so a failed extra open
+    // reports an assertion instead of hanging the full integration target.
+    let dir = scratch_dir("fifo");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "superseding_a_fifo_keeps_a_single_write_through_open",
+        ])
+        .env(CHILD, &dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            let _ = child.wait();
+            panic!("FIFO output did not finish with its single reader");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

@@ -3338,6 +3338,18 @@ fn supersede_file(
     let path = absolute_path.as_path();
     let mut options = std::fs::OpenOptions::new();
     options.read(read).write(true);
+    let regular = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    if !regular {
+        // In particular, opening a FIFO twice can consume its reader on the
+        // preflight open and then block forever. Preserve one write-through
+        // open for symlinks/devices/FIFOs; directories still fail normally.
+        return options
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map(|file| (file, None))
+            .map_err(|e| EgclError::FileError(format!("cannot create file: {e}")));
+    }
     // Check the original access permissions before replacing its directory
     // entry: a writable directory must not bypass a read-only file's mode.
     let original = options
@@ -3346,19 +3358,14 @@ fn supersede_file(
     let original_metadata = original
         .metadata()
         .map_err(|e| EgclError::FileError(format!("cannot inspect original file: {e}")))?;
-    let regular = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
-    let backup = if regular {
-        match backup_file(path, keep_backup) {
-            Ok(backup) => Some(backup),
-            Err(e) if keep_backup => {
-                return Err(EgclError::FileError(format!(
-                    "cannot rename existing file: {e}"
-                )));
-            }
-            Err(_) => None,
+    let backup = match backup_file(path, keep_backup) {
+        Ok(backup) => Some(backup),
+        Err(e) if keep_backup => {
+            return Err(EgclError::FileError(format!(
+                "cannot rename existing file: {e}"
+            )));
         }
-    } else {
-        None
+        Err(_) => None,
     };
     let Some(backup) = backup else {
         drop(original);
