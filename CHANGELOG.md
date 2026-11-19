@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Standard `MAKE-INSTANCE` initialization recognizes wrapped standard methods
+  and avoids generated constant initfunction calls while preserving supplied
+  and computed MOP initfunctions
+  ([#1010](https://github.com/atgreen/evergreen/pull/1010)).
+
 - Preserve lexical parameter bindings when a global symbol macro has the same
   symbol, including interpreted reads, assignments and later defaults
   ([#988](https://github.com/atgreen/evergreen/pull/988)).
