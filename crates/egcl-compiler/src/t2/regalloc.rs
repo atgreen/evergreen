@@ -1046,25 +1046,45 @@ fn allocate_with_call_operand_policy(
     // writes/clobbers. Half-open allocation ranges include early uses whose
     // last use is this call, and exclude its late return definitions. Definition-
     // only ranges for unused block parameters are not runtime-live values.
-    let read_vregs = mf.read_vregs();
     for (index, instruction) in mf.insts.iter().enumerate() {
-        if !instruction.safepoint {
+        if instruction.safepoint {
+            mf.stack_maps.push(StackMap {
+                code_offset: index as u32,
+                values: Vec::new(),
+                frame_state: instruction.frame_state,
+            });
+        }
+    }
+    if mf.stack_maps.is_empty() {
+        return Ok(());
+    }
+
+    // Stack maps are in instruction order. Visit just the safepoints a range
+    // covers, retaining the allocator's ordering of copies within each map.
+    let before = |map: &StackMap| {
+        regalloc2::ProgPoint::before(Ra2Inst::new(map.code_offset as usize)).to_index()
+    };
+    let read_vregs = mf.read_vregs();
+    for range in &mf.value_locations {
+        if !read_vregs.contains(&range.vreg) {
             continue;
         }
-        let point = regalloc2::ProgPoint::before(Ra2Inst::new(index)).to_index();
-        let live = mf
-            .live_vregs_before(index, &read_vregs)
-            .expect("allocated instruction");
-        let mut values = Vec::new();
-        for range in &mf.value_locations {
-            if range.contains(point) && live.contains(&range.vreg) {
-                values.push(AllocatedValue {
-                    vreg: range.vreg,
-                    repr: mf.value_reprs[&range.vreg],
-                    location: range.location,
-                });
-            }
+        let first = mf
+            .stack_maps
+            .partition_point(|map| before(map) < range.start);
+        for map in mf.stack_maps[first..]
+            .iter_mut()
+            .take_while(|map| before(map) < range.end)
+        {
+            map.values.push(AllocatedValue {
+                vreg: range.vreg,
+                repr: mf.value_reprs[&range.vreg],
+                location: range.location,
+            });
         }
+    }
+    for map in &mut mf.stack_maps {
+        let index = map.code_offset as usize;
         // Operand allocations name required early copies. Late deopt uses
         // belong to a different phase and must not be mixed into this map.
         for (operand, allocation) in adapter.operands[index]
@@ -1079,16 +1099,11 @@ fn allocate_with_call_operand_policy(
                     location: to_location(*allocation)
                         .ok_or(AllocationError::MissingLocation(vreg))?,
                 };
-                if !values.contains(&value) {
-                    values.push(value);
+                if !map.values.contains(&value) {
+                    map.values.push(value);
                 }
             }
         }
-        mf.stack_maps.push(StackMap {
-            code_offset: index as u32,
-            values,
-            frame_state: instruction.frame_state,
-        });
     }
     Ok(())
 }
@@ -1305,6 +1320,49 @@ mod tests {
                 assert_eq!(preg.class, RegClass::Gpr);
             }
         }
+    }
+
+    #[test]
+    fn consecutive_safepoints_follow_value_lifetimes() {
+        use std::collections::HashSet;
+
+        let argument = vreg(RegClass::Gpr, 0);
+        let held = vreg(RegClass::Gpr, 1);
+        let result = vreg(RegClass::Gpr, 2);
+        let call = |defs, uses| MachInst {
+            safepoint: true,
+            ..inst(crate::t2::lower::op::CALL_RUNTIME, defs, uses)
+        };
+        let mut mf = MachFunc {
+            value_reprs: [argument, held, result]
+                .map(|v| (v, ValueRepresentation::Tagged))
+                .into(),
+            insts: vec![
+                inst(1, vec![argument], vec![]),
+                inst(1, vec![held], vec![]),
+                call(vec![result], vec![argument]),
+                call(vec![], vec![held]),
+                call(vec![], vec![result]),
+            ],
+            ..Default::default()
+        };
+        allocate(&mut mf).unwrap();
+        let roots: Vec<_> = mf
+            .stack_maps
+            .iter()
+            .map(|map| {
+                let vregs: HashSet<_> = map.live_refs().map(|entry| entry.vreg).collect();
+                (map.code_offset, vregs)
+            })
+            .collect();
+        assert_eq!(
+            roots,
+            vec![
+                (2, HashSet::from([argument, held])),
+                (3, HashSet::from([held, result])),
+                (4, HashSet::from([result])),
+            ]
+        );
     }
 
     #[test]
