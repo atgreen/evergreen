@@ -7,8 +7,57 @@
 
 use super::*;
 
+// The first three regressions deliberately exercise run_ordinary_root: its
+// lean-entry counter, retained root identity and managed callee backtrace.
+// Canonical RustOwned entry has separate physical-body/credit/frame tests.
+// Both route switches are read through process-wide OnceLocks, so an in-process
+// environment change could silently inherit another test's initialized policy.
+// As in raw_slot_reader_tests, execute one exact case in a fresh harness; the
+// child inherits the build owner's finite cgroup and wall-time controls.
+fn isolated_legacy_root_case(case: &str) -> bool {
+    const CHILD: &str = "EGCL_T0_T2_LEGACY_ROOT_TEST_CASE";
+    let module = module_path!().split_once("::").unwrap().1;
+    let filter = format!("{module}::{case}");
+    if std::env::var(CHILD).ok().as_deref() == Some(filter.as_str()) {
+        assert!(
+            matches!(std::env::var("EGCL_RUST_ORDINARY_ROOT").as_deref(), Ok("0")),
+            "legacy child must select the comparison route before initialization"
+        );
+        assert!(
+            !super::super::native_transfer_entry::rust_ordinary_root::enabled_for_test(),
+            "the child must really disable RustOwned root admission"
+        );
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &filter, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &filter)
+        .env("EGCL_RUST_ORDINARY_ROOT", "0")
+        .env("EGCL_LEAN_ROOT_ENTRY", "1")
+        .output()
+        .expect("launch exact legacy lean-root regression");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    assert!(
+        output.status.success(),
+        "legacy {filter} failed: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert!(
+        stdout.contains("running 1 test")
+            && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "exact legacy filter must execute one passing test: {filter}\n{stdout}\n{stderr}"
+    );
+    true
+}
+
 #[test]
 fn a_bytecode_caller_enters_an_installed_t2_leaf_directly() {
+    if isolated_legacy_root_case("a_bytecode_caller_enters_an_installed_t2_leaf_directly") {
+        return;
+    }
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -105,6 +154,9 @@ fn run_caller(name: &str, forms: &str, n: i64, env: &mut Env) -> Result<EgclVal,
 
 #[test]
 fn a_t2_leaf_calls_a_builtin_without_resolving_it() {
+    if isolated_legacy_root_case("a_t2_leaf_calls_a_builtin_without_resolving_it") {
+        return;
+    }
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -151,6 +203,9 @@ fn a_t2_leaf_calls_a_builtin_without_resolving_it() {
 
 #[test]
 fn a_lean_root_entry_deoptimizes_and_signals_like_the_interpreter() {
+    if isolated_legacy_root_case("a_lean_root_entry_deoptimizes_and_signals_like_the_interpreter") {
+        return;
+    }
     let _lock = super::super::super::heap_test_lock()
         .lock()
         .unwrap_or_else(|e| e.into_inner());

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Eligible canonical T1 calls avoid a callee VM frame while preserving
+  invocation accounting, multiple values and recovery
+  ([#1011](https://github.com/atgreen/evergreen/pull/1011)).
+
 - Eligible runtime calls into native functions avoid a callee VM frame while
   preserving captures, multiple values and recovery from failed guards
   ([#1001](https://github.com/atgreen/evergreen/pull/1001)).

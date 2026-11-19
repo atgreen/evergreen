@@ -11,16 +11,25 @@ fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("EGCL_RUST_ORDINARY_ROOT").as_deref() != Some("0".as_ref()))
 }
 
+fn t1_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("EGCL_RUST_T1_ORDINARY_ROOT").as_deref() != Some("0".as_ref())
+    })
+}
+
 /// The already selected code/function pair is retained by the caller. None
 /// leaves the original root route authoritative, with no invocation credit or
-/// execution-state mutation. T2 entries keep their existing no-credit policy.
-pub(super) fn try_run(
+/// execution-state mutation. T1 callers must already have performed canonical
+/// invocation credit and tier selection; this executor performs neither.
+pub(in crate::cli::bytecode) fn try_run(
     code: &Rc<TransferCode>,
     function: EgclVal,
     args: &[EgclVal],
     env: &mut Env,
 ) -> Option<Result<EgclVal, EgclError>> {
     if !enabled()
+        || (!code.is_t2 && !t1_enabled())
         || code.needs_recompile()
         || !env.locally_specials.is_empty()
         || args.len() != usize::from(code.body.arity)
@@ -31,8 +40,10 @@ pub(super) fn try_run(
     }
     // The body and installed entry never change within this retained owner.
     // Cache rejection too: no full bytecode/layout scan belongs on a hot call.
+    // A T1 ordinary primary can have an empty OSR map while its separate mapped
+    // companion owns the imports. Preserve run_callable's companion preference.
     let offset = *code.rust_root_entry.get_or_init(|| {
-        (code.is_t2
+        ((code.is_t2 || code.osr_companion.is_none())
             && ordinary_native_body(&code.body)
             && code.body.self_call_sites.is_empty()
             && code.osr_entries.is_empty()
@@ -54,6 +65,8 @@ pub(super) fn try_run(
     // Rewritten heap captures use the precise native callable home. Legacy
     // host frames and captured lexical control still require the old route.
     if !egcl_rt::function::is_interpreted_function(*function)
+        // Initially keep T1 heap captures on their existing root route.
+        || (!code.is_t2 && !egcl_rt::function::closure_env(*function).is_nil())
         || (!egcl_rt::function::closure_env(*function).is_nil()
             && (code.native_callable_slot.is_none() || !code.accepts_explicit_callable(*function)))
         || closure_captured_env(*function).is_some()
@@ -142,6 +155,14 @@ pub(in crate::cli::bytecode) fn take_entries_for_test() -> usize {
 #[cfg(test)]
 #[path = "rust_ordinary_root_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "t1_root_tests.rs"]
+mod t1_tests;
+
+#[cfg(test)]
+#[path = "rust_ordinary_root_companion_tests.rs"]
+mod companion_tests;
 
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn enabled_for_test() -> bool {
