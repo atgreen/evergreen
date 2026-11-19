@@ -97,6 +97,7 @@ mod mapped_ordinary_parent_tests;
 #[cfg(test)]
 mod mapped_ordinary_tests;
 mod ordinary_t2;
+mod typed_mapped_entry;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
 #[cfg(test)]
@@ -856,9 +857,14 @@ unsafe fn call_lean_target(
     record: *mut egcl_compiler::t2::native_transfer::MappedCallRecord,
 ) -> bool {
     let invocation = unsafe { &*(*record).context };
-    let Some((code, function, symbol, offset)) =
-        (unsafe { call_table::lean_native_target(cell, invocation.nargs) })
-    else {
+    let published_mapped = unsafe { generated_mapped_ingress(record) };
+    let target = if published_mapped {
+        unsafe { call_table::lean_native_target_for_ingress(cell, invocation.nargs, true) }
+    } else {
+        // The ordinary root intentionally retains its original untyped policy.
+        unsafe { call_table::lean_native_target(cell, invocation.nargs) }
+    };
+    let Some((code, function, symbol, offset)) = target else {
         return false;
     };
     let env = NATIVE_ENV.with(Cell::get);
@@ -883,7 +889,7 @@ unsafe fn call_lean_target(
             symbol
         };
         egcl_rt::rooted!(_active_callable_root = super::ActiveCallableRoot(instance));
-        if unsafe { generated_mapped_ingress(record) }
+        if published_mapped
             && let Some(result) = unsafe {
                 mapped_ordinary::call(
                     &code,
@@ -896,8 +902,13 @@ unsafe fn call_lean_target(
             }
         {
             result
-        } else {
+        } else if code.lean_root_entry() == Some(offset) {
             code.run_ordinary_root(offset, function, args, unsafe { &mut *env })
+        } else {
+            // A typed bridge can decline for poll/control/cache conditions.
+            // Its root fallback must validate declarations through the old
+            // general entry, never the lean root's untyped binding path.
+            code.run_callable(function, args, unsafe { &mut *env })
         }
     });
     let value = match result {
