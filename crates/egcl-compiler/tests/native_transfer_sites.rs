@@ -81,10 +81,16 @@ fn physical_recipes_cover_the_entire_map_before_capture() {
 
 #[test]
 fn snapshot_cannot_capture_another_sites_frame() {
+    use egcl_rt::gc::TraceHostRoots;
+    use egcl_rt::{Collector, HeapCollector};
+
     let table = SysvTransferTable::new(64, vec![site(12, 0), site(40, 1)]).unwrap();
     let site = table.lookup(0x1000, 0x100c).unwrap();
     let mut snapshot = site.reserve_snapshot().unwrap();
-    let words = [0, 0, NIL.to_raw(), NIL.to_raw()];
+    egcl_rt::rooted_ref!(_snapshot = &mut snapshot);
+    egcl_rt::rooted!(value = egcl_rt::gc::alloc_double_float(37.25));
+    let original_address = value.to_raw();
+    let words = [0, 0, value.to_raw(), NIL.to_raw()];
     let mut capture = SysvTransferCapture {
         request: std::ptr::null_mut(),
         value: NIL,
@@ -98,12 +104,24 @@ fn snapshot_cannot_capture_another_sites_frame() {
     unsafe {
         snapshot.capture(0x1000, &capture).unwrap();
     }
-    let frames = snapshot.reconstruct(|_| panic!("no floats")).unwrap();
-    assert_eq!(frames[0].locals, vec![NIL]);
+    assert_eq!(
+        snapshot.reconstruct(|_| panic!("no floats")).unwrap()[0].locals,
+        vec![*value]
+    );
     capture.return_pc = 0x1028 as *const u8;
     assert!(unsafe { snapshot.write_back(0x1000, &mut capture) }.is_err());
     assert!(unsafe { snapshot.capture(0x1000, &capture) }.is_err());
     assert!(snapshot.reconstruct(|_| panic!("no floats")).is_err());
+    // An invalidated snapshot still owns the earlier capture until its pool
+    // clears it. Its saved reference must move with a nursery collection.
+    HeapCollector::new().minor_gc().unwrap();
+    assert_ne!(value.to_raw(), original_address);
+    let mut roots = Vec::new();
+    snapshot.trace_host_roots(&mut |slot| roots.push(unsafe { *slot }));
+    assert_eq!(roots, [*value]);
+    snapshot.clear();
+    snapshot.clear();
+    snapshot.trace_host_roots(&mut |slot| assert_eq!(unsafe { *slot }, NIL));
 }
 
 #[test]

@@ -75,6 +75,14 @@ pub enum CaptureError {
     NotCaptured,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaptureState {
+    Empty,
+    // A failed recapture can leave tagged words from an earlier or partial copy.
+    Invalid,
+    Captured,
+}
+
 /// A per-execution buffer, not shared with another active invocation. The
 /// metadata and all input slots are allocated by `new`, before native entry.
 /// Register this buffer with `rooted_ref!` if it must survive allocating work
@@ -82,7 +90,7 @@ pub enum CaptureError {
 pub struct TransferSnapshot {
     lowered: LoweredDeopt,
     saved: Vec<SavedLocation>,
-    captured: bool,
+    state: CaptureState,
 }
 
 impl TransferSnapshot {
@@ -93,7 +101,9 @@ impl TransferSnapshot {
 
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     pub(crate) fn invalidate(&mut self) {
-        self.captured = false;
+        if self.state == CaptureState::Captured {
+            self.state = CaptureState::Invalid;
+        }
     }
 
     /// Ready this buffer for another activation of the same code: forget the
@@ -104,12 +114,15 @@ impl TransferSnapshot {
         allow(dead_code)
     )]
     pub(crate) fn clear(&mut self) {
-        self.captured = false;
+        if self.state == CaptureState::Empty {
+            return;
+        }
         for slot in &mut self.saved {
             if let SavedWord::Tagged(word) = &slot.word {
-                word.set(egcl_rt::value::NIL);
+                word.set(NIL);
             }
         }
+        self.state = CaptureState::Empty;
     }
 
     pub fn new(map: &TransferCaptureMap) -> Result<Self, CaptureError> {
@@ -138,7 +151,7 @@ impl TransferSnapshot {
                 scopes: map.frames.clone(),
             },
             saved,
-            captured: false,
+            state: CaptureState::Empty,
         })
     }
 
@@ -151,7 +164,7 @@ impl TransferSnapshot {
     /// Once captured, root this buffer before any allocating work. This copy
     /// alone does not authorize retiring Lisp cleanup or native root links.
     pub unsafe fn capture(&mut self, mut read: impl FnMut(Location) -> u64) {
-        self.captured = false;
+        self.state = CaptureState::Invalid;
         for slot in &mut self.saved {
             let raw = read(slot.location);
             match &mut slot.word {
@@ -159,7 +172,7 @@ impl TransferSnapshot {
                 SavedWord::Raw(value) => *value = raw,
             }
         }
-        self.captured = true;
+        self.state = CaptureState::Captured;
     }
 
     /// Copy saved words back in their native representation, including GC's
@@ -173,7 +186,7 @@ impl TransferSnapshot {
         &self,
         mut write: impl FnMut(Location, u64),
     ) -> Result<(), CaptureError> {
-        if !self.captured {
+        if self.state != CaptureState::Captured {
             return Err(CaptureError::NotCaptured);
         }
         for slot in &self.saved {
@@ -196,7 +209,7 @@ impl TransferSnapshot {
         &mut self,
         box_double: impl Fn(f64) -> EgclVal,
     ) -> Result<Vec<ReconstructedFrame>, CaptureError> {
-        if !self.captured {
+        if self.state != CaptureState::Captured {
             return Err(CaptureError::NotCaptured);
         }
         egcl_rt::rooted_ref!(_saved_roots = &mut *self);
