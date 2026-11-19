@@ -378,3 +378,47 @@ fn close_uses_the_opening_directory_after_cwd_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn supersede_private_mode_is_preserved_without_privilege_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("private-mode");
+    let path = dir.join("f");
+    for (mode, abort) in [
+        (0o600, false),
+        (0o600, true),
+        (0o4750, false),
+        (0o2750, true),
+    ] {
+        std::fs::write(&path, "old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let original_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        egcl_rt::rooted!(
+            stream = open(
+                lisp_path(&path),
+                StreamDirection::Output,
+                NIL,
+                IF_EXISTS_SUPERSEDE_VAL,
+                IF_DOES_NOT_EXIST_CREATE_VAL,
+                ExternalFormat::Utf8,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            mode & 0o777
+        );
+        stream_write_string(*stream, make_lisp_string("new\n"), 0, None).unwrap();
+        close(*stream, abort).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+            if abort { original_mode } else { mode & 0o777 }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            if abort { "old\n" } else { "new\n" }
+        );
+        assert_eq!(names(&dir), ["f"]);
+    }
+}

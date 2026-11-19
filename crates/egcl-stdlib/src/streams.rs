@@ -3343,6 +3343,9 @@ fn supersede_file(
     let original = options
         .open(path)
         .map_err(|e| EgclError::FileError(format!("cannot open file: {e}")))?;
+    let original_metadata = original
+        .metadata()
+        .map_err(|e| EgclError::FileError(format!("cannot inspect original file: {e}")))?;
     let regular = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
     let backup = if regular {
         match backup_file(path, keep_backup) {
@@ -3366,7 +3369,17 @@ fn supersede_file(
             .map(|file| (file, None))
             .map_err(|e| EgclError::FileError(format!("cannot create file: {e}")));
     };
-    let permissions = original.metadata().map(|meta| meta.permissions());
+    let permissions = original_metadata.permissions();
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Never create a private file with the default, potentially broader
+        // mode, even transiently. Copy rwx only: new output must not acquire
+        // the original's setuid/setgid/sticky bits.
+        let mode = permissions.mode() & 0o777;
+        options.mode(mode);
+        std::fs::Permissions::from_mode(mode)
+    };
     drop(original);
     if let Err(e) = std::fs::remove_file(path) {
         // PATH still names the original; discard only our extra link.
@@ -3390,20 +3403,32 @@ fn supersede_file(
             )));
         }
     };
-    if let Ok(permissions) = permissions {
-        let _ = file.set_permissions(permissions);
+    // Identity failure leaves the restricted replacement and original backup
+    // in place, and reports recovery information rather than discarding either.
+    let output_identity = output_identity(&file).map_err(|e| {
+        EgclError::FileError(format!(
+            "cannot inspect replacement: {e}; original retained at {}",
+            backup.display()
+        ))
+    })?;
+    let plan = AbortPlan {
+        path: path.to_path_buf(),
+        backup: Some(backup),
+        keep_backup,
+        output_identity,
+    };
+    if let Err(e) = file.set_permissions(permissions) {
+        drop(file);
+        let recovery = plan.finish(true);
+        return Err(EgclError::FileError(format!(
+            "cannot set replacement permissions: {e}; recovery: {}",
+            match recovery {
+                Ok(()) => "restored original".to_owned(),
+                Err(e) => format!("{e:?}"),
+            }
+        )));
     }
-    let output_identity =
-        output_identity(&file).map_err(|e| EgclError::FileError(e.to_string()))?;
-    Ok((
-        file,
-        Some(AbortPlan {
-            path: path.to_path_buf(),
-            backup: Some(backup),
-            keep_backup,
-            output_identity,
-        }),
-    ))
+    Ok((file, Some(plan)))
 }
 
 pub fn open(

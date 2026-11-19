@@ -4,7 +4,8 @@
 
 - Aborting file output removes newly created files and restores staged
   originals. Recovery errors retain the backup, and backup creation preserves
-  unrelated files ([#1005](https://github.com/atgreen/evergreen/pull/1005)).
+  unrelated files. Unix replacements retain rwx access without copying
+  privilege bits ([#1005](https://github.com/atgreen/evergreen/pull/1005)).
 
 - Compile bytecode closure creation in RV64 T1 while preserving captured
   locations and retained definitions
