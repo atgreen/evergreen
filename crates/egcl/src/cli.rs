@@ -9454,8 +9454,9 @@ fn is_standard_initialization_method(method: &MethodDef) -> bool {
     if method.qualifier != egcl_stdlib::MethodQualifier::Primary {
         return false;
     }
-    // DEFMETHOD stores the body as ((BLOCK name form...)).
-    let body = method.body;
+    // DEFMETHOD stores the body as ((BLOCK name form...)) inside its
+    // next-method helpers.
+    let body = method_continuations::unwrapped_body(method.body);
     if !body.is_cons() || !cp(body).1.is_nil() {
         return false;
     }
@@ -44163,6 +44164,22 @@ fn make_instance_plan_parts(
     {
         return None;
     }
+    // Source syntax is not authority for an effective MOP initfunction. Only
+    // bypass a function that is still the exact generated function belonging
+    // to a matching direct slot; an explicit or computed replacement must run.
+    let mut generated_slots: Vec<SlotDef> = egcl_stdlib::compute_class_precedence_list(class)
+        .ok()?
+        .into_iter()
+        .filter_map(|owner| runtime_class_definition(env, owner))
+        .flat_map(|definition| definition.slots)
+        .filter(|slot| {
+            !slot
+                .mop_options
+                .chunks_exact(2)
+                .any(|pair| sym_bare_name_rc(pair[0]).as_ref() == "INITFUNCTION")
+        })
+        .collect();
+    egcl_rt::rooted_ref!(_generated_slots_root = &mut generated_slots);
     let valid = valid_initarg_names(env, class, &MAKE_INSTANCE_INIT_GENERICS);
     let (default_names, default_forms): (Vec<String>, Vec<EgclVal>) =
         runtime_default_initargs(env, class).into_iter().unzip();
@@ -44197,12 +44214,26 @@ fn make_instance_plan_parts(
     let (kinds, forms): (Vec<PlanForm>, Vec<EgclVal>) = default_forms
         .iter()
         .copied()
-        .chain(
-            initform_indices
-                .iter()
-                .map(|&index| effective[index].initform.unwrap_or(NIL)),
-        )
         .map(|form| classify_plan_form(form, quote, funcall))
+        .chain(initform_indices.iter().map(|&index| {
+            // A constant initform has the same value in every lexical
+            // environment, so its initfunction need not be called (GH #957).
+            let slot = &effective[index];
+            let generated = slot.initfunction.is_some()
+                && generated_slots.iter().any(|source| {
+                    source.name == slot.name
+                        && source.source_initform == slot.source_initform
+                        && source.initfunction == slot.initfunction
+                });
+            match slot
+                .source_initform
+                .filter(|_| generated)
+                .map(|form| classify_plan_form(form, quote, funcall))
+            {
+                Some(constant @ (PlanForm::Constant, _)) => constant,
+                _ => classify_plan_form(slot.initform.unwrap_or(NIL), quote, funcall),
+            }
+        }))
         .unzip();
     Some(MakeInstancePlan {
         generation,
