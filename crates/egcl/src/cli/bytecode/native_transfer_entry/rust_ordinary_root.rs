@@ -40,8 +40,11 @@ pub(in crate::cli::bytecode) fn try_run(
     }
     // The body and installed entry never change within this retained owner.
     // Cache rejection too: no full bytecode/layout scan belongs on a hot call.
+    // A T1 ordinary primary can have an empty OSR map while its separate mapped
+    // companion owns the imports. Preserve run_callable's companion preference.
     let offset = *code.rust_root_entry.get_or_init(|| {
-        (ordinary_native_body(&code.body)
+        ((code.is_t2 || code.osr_companion.is_none())
+            && ordinary_native_body(&code.body)
             && code.body.self_call_sites.is_empty()
             && code.osr_entries.is_empty()
             && fixed_tagged_parameters(&code.body))
@@ -156,6 +159,10 @@ mod tests;
 #[cfg(test)]
 #[path = "t1_root_tests.rs"]
 mod t1_tests;
+
+#[cfg(test)]
+#[path = "rust_ordinary_root_companion_tests.rs"]
+mod companion_tests;
 
 #[cfg(test)]
 pub(in crate::cli::bytecode) fn enabled_for_test() -> bool {
