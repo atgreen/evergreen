@@ -30,17 +30,20 @@ fn lisp_path(path: &Path) -> EgclVal {
 }
 
 fn write_new(path: &Path, direction: StreamDirection, if_exists: EgclVal, abort: bool) {
-    let stream = open(
-        lisp_path(path),
-        direction,
-        NIL,
-        if_exists,
-        IF_DOES_NOT_EXIST_CREATE_VAL,
-        ExternalFormat::Utf8,
-    )
-    .unwrap();
-    stream_write_string(stream, make_lisp_string("new\n"), 0, None).unwrap();
-    close(stream, abort).unwrap();
+    egcl_rt::rooted!(
+        stream = open(
+            lisp_path(path),
+            direction,
+            NIL,
+            if_exists,
+            IF_DOES_NOT_EXIST_CREATE_VAL,
+            ExternalFormat::Utf8,
+        )
+        .unwrap()
+    );
+    egcl_rt::rooted!(text = make_lisp_string("new\n"));
+    stream_write_string(*stream, *text, 0, None).unwrap();
+    close(*stream, abort).unwrap();
 }
 
 /// Everything in DIR, so a leftover backup shows up as an extra name.
@@ -345,7 +348,8 @@ fn close_uses_the_opening_directory_after_cwd_changes() {
                 )
                 .unwrap()
             );
-            stream_write_string(*stream, make_lisp_string("new\n"), 0, None).unwrap();
+            egcl_rt::rooted!(text = make_lisp_string("new\n"));
+            stream_write_string(*stream, *text, 0, None).unwrap();
             std::env::set_current_dir(dir.join("changed")).unwrap();
             close(*stream, abort).unwrap();
             assert_eq!(
@@ -409,7 +413,8 @@ fn supersede_private_mode_is_preserved_without_privilege_bits() {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
             mode & 0o777
         );
-        stream_write_string(*stream, make_lisp_string("new\n"), 0, None).unwrap();
+        egcl_rt::rooted!(text = make_lisp_string("new\n"));
+        stream_write_string(*stream, *text, 0, None).unwrap();
         close(*stream, abort).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,

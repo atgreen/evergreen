@@ -2763,6 +2763,16 @@ fn alloc_stream(
     components: Vec<EgclVal>,
     file_namestring: Option<String>,
 ) -> EgclVal {
+    alloc_stream_with_abort_plan(element_type, inner, components, file_namestring, None)
+}
+
+fn alloc_stream_with_abort_plan(
+    element_type: StreamElementType,
+    inner: StreamInner,
+    components: Vec<EgclVal>,
+    file_namestring: Option<String>,
+    abort_plan: Option<AbortPlan>,
+) -> EgclVal {
     // Composite streams are constructed after their immutable components and
     // acquire the composite lock first. Descending keys therefore put every
     // newer composite before all of its older components.
@@ -2790,7 +2800,7 @@ fn alloc_stream(
                 element_type,
                 inner,
                 components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<EgclVal>(), 0),
-                abort_plan: None,
+                abort_plan,
             },
         ),
         input: OrderedExecutionMutex::new(
@@ -2818,6 +2828,11 @@ fn alloc_stream(
     // performed while it was being allocated before exposing the handle.
     for (component, root) in boxed.components.iter_mut().zip(component_roots.iter()) {
         *component = *root;
+    }
+    // Only a successfully allocated handle commits normal finalizer cleanup.
+    // Before this point, an allocation failure/unwind must retain old backups.
+    if let Some(plan) = boxed.state.get_mut().abort_plan.as_mut() {
+        plan.published = true;
     }
     let box_ptr = Box::into_raw(boxed) as u64;
     unsafe {
@@ -3225,6 +3240,8 @@ struct AbortPlan {
     /// :RENAME keeps the old file under its new name after a normal close.
     keep_backup: bool,
     output_identity: OutputIdentity,
+    /// A successfully allocated Lisp handle now owns normal cleanup.
+    published: bool,
 }
 
 impl AbortPlan {
@@ -3233,6 +3250,7 @@ impl AbortPlan {
             path: std::path::absolute(path).map_err(|e| EgclError::FileError(e.to_string()))?,
             backup: None,
             keep_backup: false,
+            published: false,
             output_identity: output_identity(file)
                 .map_err(|e| EgclError::FileError(e.to_string()))?,
         })
@@ -3270,11 +3288,13 @@ impl AbortPlan {
 }
 
 impl Drop for AbortPlan {
-    /// A normal close, or a stream collected unclosed, discards the
-    /// superseded file unless :RENAME asked to keep it.
+    /// A normal close, or a published stream collected unclosed, discards
+    /// the superseded file unless :RENAME asked to keep it. An unpublished
+    /// plan may be unwinding from allocation failure, so retain its backup.
     fn drop(&mut self) {
         if let Some(backup) = self.backup.take()
             && !self.keep_backup
+            && self.published
         {
             let _ = remove_if_present(&backup);
         }
@@ -3423,6 +3443,7 @@ fn supersede_file(
         backup: Some(backup),
         keep_backup,
         output_identity,
+        published: false,
     };
     if let Err(e) = file.set_permissions(permissions) {
         drop(file);
@@ -3627,7 +3648,7 @@ fn open_file(
                 abort_plan = Some(AbortPlan::created(path, &file)?);
                 file
             };
-            let stream = alloc_stream(
+            let stream = alloc_stream_with_abort_plan(
                 elt,
                 StreamInner::FileOutput {
                     file: StreamHandle::File(file),
@@ -3638,8 +3659,9 @@ fn open_file(
                 },
                 vec![],
                 Some(absolute_path),
+                abort_plan,
             );
-            install_abort_plan(stream, abort_plan)
+            Ok(stream)
         }
         StreamDirection::Io => {
             let mut abort_plan = None;
@@ -3689,7 +3711,7 @@ fn open_file(
                 abort_plan = Some(AbortPlan::created(path, &file)?);
                 file
             };
-            let stream = alloc_stream(
+            let stream = alloc_stream_with_abort_plan(
                 elt,
                 StreamInner::FileIo {
                     file: StreamHandle::File(file),
@@ -3704,8 +3726,9 @@ fn open_file(
                 },
                 vec![],
                 Some(absolute_path),
+                abort_plan,
             );
-            install_abort_plan(stream, abort_plan)
+            Ok(stream)
         }
     }
 }
@@ -3746,16 +3769,6 @@ struct StreamCloseOutcome(Option<AbortPlan>);
 
 impl egcl_rt::gc::TraceHostRoots for StreamCloseOutcome {
     fn trace_host_roots(&mut self, _visit: &mut dyn FnMut(*mut EgclVal)) {}
-}
-
-fn install_abort_plan(stream: EgclVal, plan: Option<AbortPlan>) -> Result<EgclVal, EgclError> {
-    if plan.is_some() {
-        with_stream(stream, |guard| {
-            guard.abort_plan = plan;
-            Ok(())
-        })?;
-    }
-    Ok(stream)
 }
 
 pub fn make_string_input_stream(
@@ -5636,6 +5649,77 @@ pub fn stream_raw_fd(_stream: EgclVal) -> Option<i32> {
 
 #[cfg(test)]
 mod abort_restore_tests {
+    #[test]
+    fn dropping_an_unpublished_plan_retains_the_original_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("egcl-abort-unpublished-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, "old").unwrap();
+        let (file, plan) = super::supersede_file(&path, false, false).unwrap();
+        let backup = plan.as_ref().unwrap().backup.as_ref().unwrap().clone();
+        drop(file);
+        drop(plan);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_abort_plan_survives_a_physically_relocated_handle() {
+        use egcl_rt::{Collector, HeapCollector};
+        const CHILD: &str = "EGCL_ABORT_PLAN_MOVING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "streams::abort_restore_tests::open_abort_plan_survives_a_physically_relocated_handle", "--nocapture"])
+                .env(CHILD, "1").env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_STRESS").env_remove("EGCL_GC_STRESS_AT")
+                .env_remove("EGCL_GC_STRESS_SKIP").env_remove("EGCL_GC_STRESS_AFTER_INIT")
+                .output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        super::install_gc_hooks();
+        let dir = std::env::temp_dir().join(format!("egcl-abort-moving-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        let name = path.to_str().unwrap();
+        for direction in [super::StreamDirection::Output, super::StreamDirection::Io] {
+            std::fs::write(&path, "old").unwrap();
+            egcl_rt::rooted!(pathname = super::make_lisp_string_fresh(name));
+            crate::pathnames::register_string(*pathname, name);
+            HeapCollector::new().minor_gc().unwrap();
+            egcl_rt::rooted!(
+                stream = super::open(
+                    *pathname,
+                    direction,
+                    super::NIL,
+                    super::IF_EXISTS_SUPERSEDE_VAL,
+                    super::IF_DOES_NOT_EXIST_CREATE_VAL,
+                    super::ExternalFormat::Utf8
+                )
+                .unwrap()
+            );
+            let before = stream.to_raw();
+            HeapCollector::new().minor_gc().unwrap();
+            assert_ne!(stream.to_raw(), before, "fresh handle must physically move");
+            egcl_rt::rooted!(text = super::make_lisp_string("new"));
+            super::stream_write_string(*stream, *text, 0, None).unwrap();
+            super::close(*stream, true).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn restore_never_replaces_an_intervening_path() {
         let dir = std::env::temp_dir().join(format!("egcl-abort-restore-{}", std::process::id()));
