@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Eligible runtime calls into native functions avoid a callee VM frame while
+  preserving captures, multiple values and recovery from failed guards
+  ([#1001](https://github.com/atgreen/evergreen/pull/1001)).
+
 - Fixed-arity native calls with declared argument types can reuse checking
   native entries from mapped callers while preserving type-error handling
   ([#1000](https://github.com/atgreen/evergreen/pull/1000)).

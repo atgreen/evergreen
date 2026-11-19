@@ -681,3 +681,6 @@ fn run_migration(entry: fn() -> EgclVal, tier: u8) {
         );
     }
 }
+
+#[path = "rust_owned_root_migration_tests.rs"]
+mod rust_owned_root;
