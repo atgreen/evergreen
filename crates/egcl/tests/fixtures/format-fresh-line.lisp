@@ -30,6 +30,10 @@
          (lambda (s) (let ((b (make-broadcast-stream s))) (write-string "a" b) (format b "~&x")))
          (concatenate 'string "a" *nl* "x"))
   (check "broadcast at start" (lambda (s) (format (make-broadcast-stream s) "~&x")) "x")
+  (check "nested empty broadcast at column zero"
+         (lambda (s) (write-string "a" s)
+           (format (make-broadcast-stream (make-broadcast-stream) s) "~&x"))
+         "ax")
   (check "two-way at start" (lambda (s) (format (two s) "~&x")) "x")
   (check "two-way mid-line" (lambda (s) (write-string "a" s) (format (two s) "~&x"))
          (concatenate 'string "a" *nl* "x"))

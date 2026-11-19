@@ -4068,7 +4068,13 @@ pub fn stream_output_line_column(stream: EgclVal) -> Option<u64> {
     let mut components = get_stream_alloc(*stream).ok()?.components.to_vec();
     egcl_rt::rooted_ref!(_components_root = &mut components);
     if components.is_empty() {
-        return with_stream(*stream, |guard| Ok(guard.stream_line_column())).unwrap_or(None);
+        return with_stream(*stream, |guard| {
+            Ok(match guard.inner {
+                StreamInner::Broadcast => Some(0),
+                _ => guard.stream_line_column(),
+            })
+        })
+        .unwrap_or(None);
     }
     let broadcast = with_stream(*stream, |guard| {
         Ok(match guard.inner {
