@@ -29740,6 +29740,14 @@ fn run_native_callable(
         // Nothing has allocated since the caller handed `function` over, and
         // the entry roots it before anything can.
         if !code.needs_recompile() {
+            // Canonical dispatch already credited any T1 invocation, polled
+            // completions and selected this exact body. Reuse only its entry
+            // protocol here; never restart apply or perform another credit.
+            if let Some(result) =
+                native_transfer_entry::rust_ordinary_root::try_run(code, function, args, env)
+            {
+                return result;
+            }
             return code.run_callable(function, args, env);
         }
     }
