@@ -723,7 +723,7 @@ fn run(
             if matches!(ingress, Ingress::PublishedMapped)
                 && env.locally_specials.is_empty()
                 && code.is_t2
-                && let Some(offset) = code.lean_root_entry()
+                && let Some(offset) = super::super::call_table::mapped_child_entry(&code, function)
                 && let Some(result) =
                     unsafe { mapped_ordinary::call(&code, offset, function, args, env, None) }
             {

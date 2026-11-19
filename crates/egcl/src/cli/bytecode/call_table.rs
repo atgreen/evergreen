@@ -827,7 +827,26 @@ pub(super) fn prefer_ordinary_child(code: &NativeCode, function: EgclVal, promot
     };
     !mapped.needs_recompile()
         && fixed_ordinary_child_shape(code)
-        && mapped.lean_root_entry().is_some()
+        && if code.is_t2 {
+            mapped_child_entry(mapped, function).is_some()
+        } else {
+            mapped.lean_root_entry().is_some()
+        }
+}
+
+/// An explicitly published mapped caller may enter an existing checking T2
+/// entry without relying on the lean root's untyped binding assumptions.
+/// This returns the public checking entry, never a self/bound-body shortcut.
+/// Root ingress must continue to use lean_root_entry/run_callable instead.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn mapped_child_entry(
+    code: &super::native_transfer_entry::TransferCode,
+    function: EgclVal,
+) -> Option<usize> {
+    if let Some(offset) = code.lean_root_entry() {
+        return Some(offset);
+    }
+    code.checked_typed_mapped_entry(function)
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -850,6 +869,25 @@ fn fixed_ordinary_child_shape(code: &NativeCode) -> bool {
 pub(super) unsafe fn lean_native_target(
     cell: u64,
     nargs: usize,
+) -> Option<(
+    Rc<super::native_transfer_entry::TransferCode>,
+    EgclVal,
+    u32,
+    usize,
+)> {
+    unsafe { lean_native_target_for_ingress(cell, nargs, false) }
+}
+
+/// Same selection with explicit authority from the current checked adapter's
+/// own generated request. A retained CAPTURE alone never grants this authority.
+///
+/// # Safety
+/// As for lean_native_target; published_mapped must describe this exact request.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) unsafe fn lean_native_target_for_ingress(
+    cell: u64,
+    nargs: usize,
+    published_mapped: bool,
 ) -> Option<(
     Rc<super::native_transfer_entry::TransferCode>,
     EgclVal,
@@ -911,7 +949,12 @@ pub(super) unsafe fn lean_native_target(
     }
     // This excludes optional/variadic binding and T1 loops that need a mapped
     // OSR companion. Every rejection above or here leaves warm's count intact.
-    let Some(offset) = mapped.lean_root_entry() else {
+    let offset = if code.is_t2 && published_mapped {
+        mapped_child_entry(mapped, *function)
+    } else {
+        mapped.lean_root_entry()
+    };
+    let Some(offset) = offset else {
         return decline(Reason::SelectorNoLeanEntry);
     };
     if !code.is_t2 && !profiling_disabled() {

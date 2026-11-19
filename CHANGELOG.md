@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed-arity native calls with declared argument types can reuse checking
+  native entries from mapped callers while preserving type-error handling
+  ([#1000](https://github.com/atgreen/evergreen/pull/1000)).
+
 - `TYPEP` and type declaration checks find DEFTYPE definitions through a
   symbol index instead of scanning every definition ever made
   ([#1004](https://github.com/atgreen/evergreen/pull/1004)).
