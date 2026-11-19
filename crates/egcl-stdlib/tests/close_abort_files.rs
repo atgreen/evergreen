@@ -141,3 +141,240 @@ fn superseding_keeps_the_mode_and_writes_through_a_symlink() {
     );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
 }
+
+#[test]
+fn rename_does_not_replace_an_existing_backup() {
+    let dir = scratch_dir("backup-collision");
+    let path = dir.join("f");
+    std::fs::write(&path, "old\n").unwrap();
+    std::fs::write(dir.join("f.bak"), "unrelated\n").unwrap();
+    write_new(&path, StreamDirection::Output, IF_EXISTS_RENAME_VAL, false);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.bak")).unwrap(),
+        "unrelated\n"
+    );
+    let old_copies: Vec<_> = names(&dir)
+        .into_iter()
+        .filter(|name| {
+            name != "f"
+                && name != "f.bak"
+                && std::fs::read_to_string(dir.join(name)).unwrap() == "old\n"
+        })
+        .collect();
+    assert_eq!(old_copies.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_does_not_replace_a_dangling_backup_symlink() {
+    let dir = scratch_dir("backup-symlink");
+    let path = dir.join("f");
+    std::fs::write(&path, "old\n").unwrap();
+    std::os::unix::fs::symlink("missing", dir.join("f.bak")).unwrap();
+    write_new(&path, StreamDirection::Output, IF_EXISTS_RENAME_VAL, true);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+    assert_eq!(
+        std::fs::read_link(dir.join("f.bak")).unwrap(),
+        Path::new("missing")
+    );
+    assert_eq!(names(&dir), ["f", "f.bak"]);
+}
+
+#[test]
+fn failed_abort_preserves_backup_and_independent_replacement() {
+    let dir = scratch_dir("failed-abort");
+    let path = dir.join("f");
+    for directory in [true, false] {
+        std::fs::write(&path, "old\n").unwrap();
+        egcl_rt::rooted!(
+            stream = open(
+                lisp_path(&path),
+                StreamDirection::Output,
+                NIL,
+                IF_EXISTS_SUPERSEDE_VAL,
+                IF_DOES_NOT_EXIST_CREATE_VAL,
+                ExternalFormat::Utf8,
+            )
+            .unwrap()
+        );
+        // Keep the actual output alive under another name so inode reuse
+        // cannot make the independent replacement look like the opened file.
+        std::fs::rename(&path, dir.join("output")).unwrap();
+        if directory {
+            std::fs::create_dir(&path).unwrap();
+        } else {
+            std::fs::write(&path, "independent\n").unwrap();
+        }
+        assert!(close(*stream, true).is_err());
+        if directory {
+            assert!(path.is_dir());
+            std::fs::remove_dir(&path).unwrap();
+        } else {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "independent\n");
+            std::fs::remove_file(&path).unwrap();
+        }
+        let backups: Vec<_> = names(&dir)
+            .into_iter()
+            .filter(|name| name != "output")
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&backups[0])).unwrap(),
+            "old\n"
+        );
+        std::fs::remove_file(dir.join(&backups[0])).unwrap();
+        std::fs::remove_file(dir.join("output")).unwrap();
+    }
+}
+
+#[test]
+fn superseding_a_directory_does_not_move_it_aside() {
+    let dir = scratch_dir("directory");
+    let path = dir.join("f");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("keep"), "old\n").unwrap();
+    assert!(
+        open(
+            lisp_path(&path),
+            StreamDirection::Output,
+            NIL,
+            IF_EXISTS_SUPERSEDE_VAL,
+            IF_DOES_NOT_EXIST_CREATE_VAL,
+            ExternalFormat::Utf8,
+        )
+        .is_err()
+    );
+    assert_eq!(names(&dir), ["f"]);
+    assert_eq!(std::fs::read_to_string(path.join("keep")).unwrap(), "old\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_without_directory_write_permission_never_truncates() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("directory-permission");
+    let path = dir.join("f");
+    std::fs::write(&path, "old\n").unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = open(
+        lisp_path(&path),
+        StreamDirection::Output,
+        NIL,
+        IF_EXISTS_RENAME_VAL,
+        IF_DOES_NOT_EXIST_CREATE_VAL,
+        ExternalFormat::Utf8,
+    );
+    // Restore before assertions so a failed regression does not leave an
+    // unwritable test directory. This runs as an unprivileged test user.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+    assert_eq!(names(&dir), ["f"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn superseding_a_read_only_file_does_not_bypass_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("file-permission");
+    let path = dir.join("f");
+    std::fs::write(&path, "old\n").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let result = open(
+        lisp_path(&path),
+        StreamDirection::Output,
+        NIL,
+        IF_EXISTS_SUPERSEDE_VAL,
+        IF_DOES_NOT_EXIST_CREATE_VAL,
+        ExternalFormat::Utf8,
+    );
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+    assert_eq!(names(&dir), ["f"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_abort_deletion_keeps_the_only_backup() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("abort-permission");
+    let path = dir.join("f");
+    std::fs::write(&path, "old\n").unwrap();
+    egcl_rt::rooted!(
+        stream = open(
+            lisp_path(&path),
+            StreamDirection::Output,
+            NIL,
+            IF_EXISTS_SUPERSEDE_VAL,
+            IF_DOES_NOT_EXIST_CREATE_VAL,
+            ExternalFormat::Utf8,
+        )
+        .unwrap()
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = close(*stream, true);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    assert!(path.is_file());
+    let backups: Vec<_> = names(&dir).into_iter().filter(|name| name != "f").collect();
+    assert_eq!(backups.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.join(&backups[0])).unwrap(),
+        "old\n"
+    );
+}
+
+#[test]
+fn close_uses_the_opening_directory_after_cwd_changes() {
+    const CHILD: &str = "EGCL_TEST_ABORT_CWD_DIR";
+    if let Some(dir) = std::env::var_os(CHILD) {
+        let dir = PathBuf::from(dir);
+        for abort in [true, false] {
+            std::env::set_current_dir(&dir).unwrap();
+            std::fs::write("f", "old\n").unwrap();
+            egcl_rt::rooted!(
+                stream = open(
+                    lisp_path(Path::new("f")),
+                    StreamDirection::Output,
+                    NIL,
+                    IF_EXISTS_SUPERSEDE_VAL,
+                    IF_DOES_NOT_EXIST_CREATE_VAL,
+                    ExternalFormat::Utf8,
+                )
+                .unwrap()
+            );
+            stream_write_string(*stream, make_lisp_string("new\n"), 0, None).unwrap();
+            std::env::set_current_dir(dir.join("changed")).unwrap();
+            close(*stream, abort).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.join("f")).unwrap(),
+                if abort { "old\n" } else { "new\n" }
+            );
+            assert_eq!(names(&dir), ["changed", "f"]);
+            assert!(names(&dir.join("changed")).is_empty());
+        }
+        return;
+    }
+    // Change cwd only in a fresh process; sibling tests keep their cwd.
+    let dir = scratch_dir("cwd");
+    std::fs::create_dir(dir.join("changed")).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "close_uses_the_opening_directory_after_cwd_changes",
+            "--nocapture",
+        ])
+        .env(CHILD, &dir)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
