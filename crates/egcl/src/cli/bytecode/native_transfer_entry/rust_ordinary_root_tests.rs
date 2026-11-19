@@ -814,3 +814,6 @@ fn rust_owned_entry_poll_error_restores_rust_scope_before_native_retry() {
 
 #[path = "rust_ordinary_root_child_deopt_tests.rs"]
 mod child_deopt;
+
+#[path = "rust_ordinary_root_retained_tests.rs"]
+mod retained_tests;
