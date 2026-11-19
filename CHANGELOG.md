@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- A readtable that gives `#` constituent syntax and rebuilds it with
+  `make-dispatch-macro-character` reads standard `#` syntax again, so
+  named-readtables' `(:merge :standard)` works
+  ([#1009](https://github.com/atgreen/evergreen/pull/1009)).
+
 - In CL-USER the reader interns common names such as `X`, `KEY` and `OBJ` in
   CL-USER instead of returning internal COMMON-LISP symbols
   ([#1008](https://github.com/atgreen/evergreen/pull/1008)).
