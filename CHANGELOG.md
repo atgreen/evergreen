@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- In CL-USER the reader interns common names such as `X`, `KEY` and `OBJ` in
+  CL-USER instead of returning internal COMMON-LISP symbols
+  ([#1008](https://github.com/atgreen/evergreen/pull/1008)).
+
 - DEFMETHOD can specialize on `RESTART` in a fresh image, without a prior
   `(find-class 'restart)` ([#1007](https://github.com/atgreen/evergreen/pull/1007)).
 

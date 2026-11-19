@@ -69,11 +69,12 @@ fn child_has_native_t2(snapshot: &str, capturing: bool) -> bool {
                 "0: LoadLocal(0)\\n     1: LoadEnvVar(0)\\n     2: CallNamed { sym: +, nargs: 2 }",
             )
             && record.contains("\\n     3: Return\\n");
+        // J is read in CL-USER, so the listing names it COMMON-LISP-USER::J.
         let heap_capture = record.starts_with("; CLOSURE — 1 arg(s), 2 local(s),")
             && record.contains(
                 "0: ClosureEnv\\n     1: StoreLocal(1)\\n     2: LoadLocal(0)\\n     \
-                 3: LoadLocal(1)\\n     4: EnvRef { depth: 0, idx: 0, name: 0 }    ; J\\n     \
-                 5: CallNamed { sym: +, nargs: 2 }",
+                 3: LoadLocal(1)\\n     4: EnvRef { depth: 0, idx: 0, name: 0 }    \
+                 ; COMMON-LISP-USER::J\\n     5: CallNamed { sym: +, nargs: 2 }",
             )
             && record.contains("\\n     6: Return\\n");
         let body_matches = if capturing {
