@@ -2851,6 +2851,30 @@ pub struct StructAccessHelpers {
     pub reference: u64,
     pub set: u64,
     pub typep: u64,
+    /// The current layout of a structure, for answering `StructRef` and
+    /// `StructTypeP` inline: `(name symbol, slot symbol, hint)`, with no slot
+    /// for a predicate. `None` keeps the helper call alone.
+    pub layout: Option<StructLayoutResolver>,
+}
+
+/// `(name symbol, slot symbol or None, hint)` to the structure's current
+/// inline layout; see [`StructAccessHelpers::layout`].
+pub type StructLayoutResolver = fn(u32, Option<u32>, u16) -> Option<StructInlineLayout>;
+
+/// Where native code finds what it compares and loads for an inline structure
+/// access. An instance is a tagged heap object whose header byte 7 is the
+/// STANDARD-OBJECT type, whose shell word at +8 is `wrapper` and whose slot
+/// storage (a small simple vector) is the shell word at `storage_offset`.
+/// The access hits only while the byte at `wrapper + state_offset` is
+/// `current`, so a redefined structure falls back to the helper.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructInlineLayout {
+    pub wrapper: u64,
+    pub state_offset: u8,
+    pub current: u8,
+    pub storage_offset: u8,
+    /// The slot's element index; `None` for a predicate.
+    pub index: Option<u32>,
 }
 
 static STRUCT_ACCESS: std::sync::OnceLock<StructAccessHelpers> = std::sync::OnceLock::new();
@@ -2884,6 +2908,7 @@ fn emit_struct_access(
     let AuxData::StructSlot { name, slot, hint } = data.aux else {
         return Err(unsupported());
     };
+    let name_symbol = name;
     let name = egcl_rt::value::EgclVal::from_symbol_index(name).0;
     let slot_hint = (u64::from(slot) << 16) | u64::from(hint);
     // Load `value` into `dst` from its register or constant. RAX and RDX are
@@ -2898,9 +2923,34 @@ fn emit_struct_access(
         }
         Ok(())
     };
+    let inline = match data.opcode {
+        Opcode::StructRef | Opcode::StructSet => helpers
+            .layout
+            .and_then(|layout| layout(name_symbol, Some(slot), hint))
+            .filter(|layout| layout.index.is_some()),
+        Opcode::StructTypeP => helpers
+            .layout
+            .and_then(|layout| layout(name_symbol, None, 0)),
+        _ => None,
+    };
+    let done = a.label();
     let helper = match data.opcode {
         Opcode::StructRef => {
             load(a, 7, *data.args.first().ok_or_else(unsupported)?)?; // rdi = object
+            if let Some(layout) = inline {
+                let miss = a.label();
+                emit_struct_inline(a, &layout, miss, miss)?;
+                // The slot vector's elements start 16 bytes past its header.
+                load_mem64_disp(a, SCRATCH, SCRATCH, i32::from(layout.storage_offset));
+                alu_r_imm(a, 4, SCRATCH, -8);
+                let index = layout.index.ok_or_else(unsupported)?;
+                let disp = i32::try_from(16 + 8 * u64::from(index)).map_err(|_| unsupported())?;
+                load_mem64_disp(a, RAX, SCRATCH, disp);
+                mov_imm64(a, SCRATCH, egcl_rt::value::UNBOUND.0 as i64);
+                cmp_rr(a, RAX, SCRATCH);
+                a.jcc(egcl_rt::asm::Cc::Ne, done);
+                a.bind(miss);
+            }
             mov_imm64(a, 6, name as i64); // rsi = name
             mov_imm64(a, 2, slot_hint as i64); // rdx = slot << 16 | hint
             helpers.reference
@@ -2913,12 +2963,56 @@ fn emit_struct_access(
             load(a, RAX, value)?;
             load(a, 7, object)?; // rdi = object
             mov_rr(a, 6, RAX); // rsi = value
+            if let Some(layout) = inline {
+                let miss = a.label();
+                let barrier = a.label();
+                emit_struct_inline(a, &layout, miss, miss)?;
+                // rdx = the slot's address in the instance's slot vector.
+                load_mem64_disp(a, SCRATCH, SCRATCH, i32::from(layout.storage_offset));
+                alu_r_imm(a, 4, SCRATCH, -8);
+                let index = layout.index.ok_or_else(unsupported)?;
+                let disp = i32::try_from(16 + 8 * u64::from(index)).map_err(|_| unsupported())?;
+                alu_r_imm(a, 0, SCRATCH, disp);
+                // Replacing one immediate by another needs no barrier: neither
+                // is a reference the collector or the SATB log could need.
+                guard_fixnum(a, 6, barrier);
+                load_mem64_disp(a, RAX, SCRATCH, 0);
+                guard_fixnum(a, RAX, barrier);
+                store_mem64_disp(a, SCRATCH, 0, 6);
+                mov_rr(a, RAX, 6);
+                a.jmp(done);
+                // Anything else stores through the noncollecting barrier leaf.
+                // It is a C call like the helper's; keep the value for the
+                // result, and rsp 16-aligned at the call.
+                a.bind(barrier);
+                push_reg(a, 6);
+                a.extend_from_slice(&[0x48, 0x83, 0xec, 8]); // sub rsp, 8
+                mov_rr(a, 7, SCRATCH);
+                mov_imm64(a, RAX, store_vector_element as *const () as i64);
+                a.extend_from_slice(&[0xFF, 0xD0]); // call rax
+                a.extend_from_slice(&[0x48, 0x83, 0xc4, 8]); // add rsp, 8
+                pop_reg(a, RAX);
+                a.jmp(done);
+                a.bind(miss);
+            }
             mov_imm64(a, 2, name as i64); // rdx = name
             mov_imm64(a, 1, slot_hint as i64); // rcx = slot << 16 | hint
             helpers.set
         }
         Opcode::StructTypeP => {
             load(a, 7, *data.args.first().ok_or_else(unsupported)?)?; // rdi = object
+            if let Some(layout) = inline {
+                let miss = a.label();
+                let not_instance = a.label();
+                emit_struct_inline(a, &layout, not_instance, miss)?;
+                mov_imm64(a, RAX, egcl_rt::value::T.0 as i64);
+                a.jmp(done);
+                // Not a STANDARD-OBJECT at all: no structure type includes it.
+                a.bind(not_instance);
+                mov_imm64(a, RAX, egcl_rt::value::NIL.0 as i64);
+                a.jmp(done);
+                a.bind(miss);
+            }
             mov_imm64(a, 6, name as i64); // rsi = name
             helpers.typep
         }
@@ -2932,9 +3026,48 @@ fn emit_struct_access(
     mov_imm64(a, SCRATCH, egcl_rt::value::UNBOUND.0 as i64);
     cmp_rr(a, RAX, SCRATCH);
     a.jcc(egcl_rt::asm::Cc::E, deopt);
+    a.bind(done);
     let result = *data.results.first().ok_or_else(unsupported)?;
     let dst = *reg.get(&result).ok_or(EmitError::UnsupportedOp(0xF2))?;
     mov_rr(a, dst, RAX);
+    Ok(())
+}
+
+/// With the object in rdi, branch to `not_instance` unless it is a
+/// STANDARD-OBJECT and to `miss` unless it is an unforwarded instance whose
+/// wrapper is `layout`'s and still current. Falls through with the object's
+/// header address in rdx. Clobbers rax and rdx only.
+#[cfg(not(windows))]
+fn emit_struct_inline(
+    a: &mut Asm,
+    layout: &StructInlineLayout,
+    not_instance: egcl_rt::asm::Label,
+    miss: egcl_rt::asm::Label,
+) -> Result<(), EmitError> {
+    use egcl_rt::asm::Cc;
+    mov_rr(a, SCRATCH, 7);
+    alu_r_imm(a, 4, SCRATCH, 7);
+    alu_r_imm(a, 7, SCRATCH, egcl_rt::value::TAG_HEAP_OBJECT as i32);
+    a.jcc(Cc::Ne, not_instance);
+    mov_rr(a, SCRATCH, 7);
+    alu_r_imm(a, 4, SCRATCH, -8);
+    // cmp byte [rdx+7], STANDARD-OBJECT
+    a.extend_from_slice(&[0x80, 0x7a, 0x07, egcl_rt::object::type_id::STANDARD_OBJECT]);
+    a.jcc(Cc::Ne, not_instance);
+    // test byte [rdx+6], FORWARDED: CHANGE-CLASS left a stub here.
+    a.extend_from_slice(&[0xF6, 0x42, 0x06, 1 << egcl_rt::object::gc_bit::FORWARDED]);
+    a.jcc(Cc::Ne, miss);
+    mov_imm64(a, RAX, layout.wrapper as i64);
+    cmp_mem64_disp8(a, RAX, SCRATCH, 8);
+    a.jcc(Cc::Ne, miss);
+    // cmp byte [rax+state_offset], current
+    if layout.state_offset > 127 {
+        return Err(EmitError::UnsupportedOp(op_tag(
+            crate::t2::ir::Opcode::StructRef,
+        )));
+    }
+    a.extend_from_slice(&[0x80, 0x78, layout.state_offset, layout.current]);
+    a.jcc(Cc::Ne, miss);
     Ok(())
 }
 
@@ -6771,6 +6904,7 @@ fn emit_transfer_function_with_storage(
                     | Opcode::EnvSlotRef
                     | Opcode::EnvSlotSet
                     | Opcode::CallableClosureEnv
+                    | Opcode::GlobalCell
                     | Opcode::StringCharOrNil
                     | Opcode::VecRef
                     | Opcode::VecSet
@@ -8322,6 +8456,7 @@ fn emit_framed_inner(
                             | Opcode::StringByteLength
                             | Opcode::StringCharOrNil
                             | Opcode::SymbolValue
+                            | Opcode::GlobalCell
                             | Opcode::SymbolFunction
                             | Opcode::SetSymbolValue
                             | Opcode::EnvironmentValue
@@ -9450,6 +9585,18 @@ fn emit_framed_inner(
                         a.bind(done);
                     }
                 }
+            } else if d.opcode == Opcode::GlobalCell {
+                let crate::t2::ir::AuxData::FixnumImm(address) = d.aux else {
+                    return Err(EmitError::UnsupportedOp(op_tag(d.opcode)));
+                };
+                let result = *d.results.first().ok_or(EmitError::UnsupportedOp(0xF2))?;
+                let dst = *inst_reg
+                    .get(&result)
+                    .ok_or(EmitError::UnsupportedOp(0xF2))?;
+                // Address through RAX (reserved scratch): the result register
+                // may be r12, which cannot be a plain ModRM base.
+                mov_imm64(&mut a, RAX, address);
+                load_mem64_disp(&mut a, dst, RAX, 0);
             } else if d.opcode == Opcode::CurrentCallable {
                 let slot =
                     native_callable_slot.ok_or(EmitError::UnsupportedOp(op_tag(d.opcode)))?;

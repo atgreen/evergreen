@@ -4184,6 +4184,57 @@ fn struct_slot_index(wrapper: &ClassWrapper, slot: EgclVal, hint: usize) -> Opti
     order.iter().position(|&s| s == slot)
 }
 
+/// What native code needs to answer a structure access inline: the current
+/// wrapper of the structure named `name`, where its state byte lives and the
+/// value that means current, where an instance keeps its slot storage, and
+/// `slot`'s index in that storage. An instance whose shell holds exactly this
+/// wrapper while the wrapper is still current is laid out this way; anything
+/// else (a subtype, an obsolete or forwarded instance) takes
+/// [`struct_ref_fast`] or [`struct_typep_fast`]. Reads only; never finalizes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructInlineLayout {
+    pub wrapper: usize,
+    pub state_offset: usize,
+    pub current: u8,
+    pub storage_offset: usize,
+    pub index: Option<usize>,
+}
+
+pub fn struct_inline_layout(
+    name: EgclVal,
+    slot: Option<EgclVal>,
+    hint: usize,
+) -> Option<StructInlineLayout> {
+    let wrapper = with_state(|st| {
+        let class = *st.class_registry.get(&name)?;
+        if !st.structure_classes.contains(&class) {
+            return None;
+        }
+        st.class_meta
+            .get(&class)?
+            .wrapper
+            .map(|w| w as *const ClassWrapper)
+    })?;
+    // Wrappers are never freed, so the pointer stays valid after the lock.
+    let wrapper = unsafe { &*wrapper };
+    if wrapper.state.load(Ordering::Acquire) != WRAPPER_CURRENT
+        || wrapper.struct_info.load(Ordering::Acquire).is_null()
+    {
+        return None;
+    }
+    let index = match slot {
+        Some(slot) => Some(struct_slot_index(wrapper, slot, hint)?),
+        None => None,
+    };
+    Some(StructInlineLayout {
+        wrapper: wrapper as *const ClassWrapper as usize,
+        state_offset: std::mem::offset_of!(ClassWrapper, state),
+        current: WRAPPER_CURRENT,
+        storage_offset: SLOT_STORAGE_OFFSET,
+        index,
+    })
+}
+
 /// Lock-free `(name-slot object)` for a structure accessor: `object` is a
 /// current instance of the structure named `name` or of one that includes it,
 /// and its bound `slot` (expected at `hint`) is returned. None sends the caller
