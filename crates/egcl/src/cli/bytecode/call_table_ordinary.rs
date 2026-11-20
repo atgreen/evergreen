@@ -116,6 +116,9 @@ struct RetainedEntries<C> {
     // while indexed. Preserve insertion order among aliases of one owner.
     by_owner: HashMap<usize, OwnerEntries>,
     by_pc: BTreeMap<usize, PcRange>,
+    // Only the executing lexical leaf consults this hint. Foreign stack walks
+    // use the read-only index. The hinted descriptor covers a uniform group.
+    last_leaf_owner: std::cell::Cell<Option<usize>>,
     #[cfg(test)]
     lookup_candidates: std::cell::Cell<usize>,
     #[cfg(test)]
@@ -138,6 +141,7 @@ impl<C> Default for RetainedEntries<C> {
             by_descriptor: HashMap::new(),
             by_owner: HashMap::new(),
             by_pc: BTreeMap::new(),
+            last_leaf_owner: std::cell::Cell::new(None),
             #[cfg(test)]
             lookup_candidates: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -246,6 +250,7 @@ impl<C> RetainedEntries<C> {
     }
 
     fn index_entry(&mut self, index: usize) {
+        self.last_leaf_owner.set(None);
         let entry = &self.entries[index];
         let d = entry.descriptor;
         self.by_descriptor.insert(entry.lease.key(d), index);
@@ -313,6 +318,10 @@ impl<C> RetainedEntries<C> {
     }
 
     fn first_index_for_pc(&self, pc: usize) -> Option<usize> {
+        self.pc_match(pc).map(|(index, _)| index)
+    }
+
+    fn pc_match(&self, pc: usize) -> Option<(usize, &PcRange)> {
         let (_, group) = self.by_pc.range(..=pc).next_back()?;
         if pc >= group.end {
             return None;
@@ -320,19 +329,35 @@ impl<C> RetainedEntries<C> {
         if group.uniform {
             #[cfg(test)]
             self.lookup_candidates.set(self.lookup_candidates.get() + 1);
-            return group.members.first().copied();
+            return Some((*group.members.first()?, group));
         }
-        group.members.iter().copied().find(|&index| {
+        let index = group.members.iter().copied().find(|&index| {
             #[cfg(test)]
             self.lookup_candidates.set(self.lookup_candidates.get() + 1);
             self.entries[index].descriptor.contains_pc(pc)
-        })
+        })?;
+        Some((index, group))
+    }
+
+    fn leaf_code_for_pc(&self, pc: usize) -> Option<Rc<C>> {
+        if let Some(index) = self.last_leaf_owner.get() {
+            let entry = &self.entries[index];
+            if entry.descriptor.contains_pc(pc) {
+                return Some(Rc::clone(&entry.code));
+            }
+        }
+        let (index, group) = self.pc_match(pc)?;
+        if group.uniform {
+            self.last_leaf_owner.set(Some(index));
+        }
+        Some(Rc::clone(&self.entries[index].code))
     }
 
     fn sweep(&mut self) {
         if self.segments != 0 {
             return;
         }
+        self.last_leaf_owner.set(None);
         let epoch = linkage::ordinary_epoch();
         let before = self.entries.len();
         let mut retired = false;
@@ -527,6 +552,10 @@ impl OrdinaryCodeDirectory {
 
     pub(in crate::cli::bytecode) fn code_for_pc(&self, pc: usize) -> Option<Rc<TransferCode>> {
         self.retained.borrow().code_for_pc(pc)
+    }
+
+    pub(in crate::cli::bytecode) fn leaf_code_for_pc(&self, pc: usize) -> Option<Rc<TransferCode>> {
+        self.retained.borrow().leaf_code_for_pc(pc)
     }
 }
 
@@ -1131,6 +1160,53 @@ mod tests {
         let before = retained.lookup_candidates.get();
         assert_eq!(retained.first_index_for_pc(0x2010), Some(3));
         assert_eq!(retained.lookup_candidates.get() - before, 1);
+    }
+
+    #[test]
+    fn lexical_leaf_owner_lookup_preserves_overlaps_and_swept_indices() {
+        let mut retained = RetainedEntries::default();
+        let first = Rc::new(1);
+        let second = Rc::new(2);
+        let first_cell = Arc::new(CallCell::new(0, 11, 12));
+        let second_cell = Arc::new(CallCell::new(1, 11, 12));
+        retained
+            .retain(first_cell, descriptor(&first, 1, 0x1000), first)
+            .unwrap();
+        let alias = Rc::new(3);
+        retained
+            .retain(
+                Arc::new(CallCell::new(2, 11, 12)),
+                descriptor(&alias, 3, 0x1000),
+                alias,
+            )
+            .unwrap();
+        assert_eq!(retained.code_for_pc(0x1000).as_deref(), Some(&1));
+        assert!(retained.last_leaf_owner.get().is_none());
+        assert_eq!(retained.leaf_code_for_pc(0x1000).as_deref(), Some(&1));
+        let comparisons = retained.lookup_candidates.get();
+        assert_eq!(retained.leaf_code_for_pc(0x103f).as_deref(), Some(&1));
+        assert_eq!(retained.lookup_candidates.get(), comparisons);
+        assert!(retained.leaf_code_for_pc(0x1040).is_none());
+
+        let address = retained
+            .retain(
+                Arc::clone(&second_cell),
+                descriptor(&second, 2, 0x1020),
+                second,
+            )
+            .unwrap();
+        unsafe { &*second_cell.ordinary_entry_address() }
+            .store(address as usize, Ordering::Release);
+        assert_eq!(retained.leaf_code_for_pc(0x1040).as_deref(), Some(&2));
+        assert_eq!(retained.leaf_code_for_pc(0x1020).as_deref(), Some(&1));
+        assert!(retained.last_leaf_owner.get().is_none());
+
+        retained.sweep();
+        assert!(retained.leaf_code_for_pc(0x101f).is_none());
+        assert_eq!(retained.leaf_code_for_pc(0x1020).as_deref(), Some(&2));
+        unsafe { &*second_cell.ordinary_entry_address() }.store(0, Ordering::Release);
+        retained.sweep();
+        assert!(retained.leaf_code_for_pc(0x1020).is_none());
     }
 
     #[test]

@@ -1013,15 +1013,17 @@ pub(super) unsafe fn with_leaf_callable<R>(
     {
         None
     } else {
-        Some(directory.code_for_pc(cursor.pc)?)
+        Some(directory.leaf_code_for_pc(cursor.pc)?)
     };
     let code = retained.as_deref().unwrap_or(root);
     let offset = cursor.pc.checked_sub(code.code.as_ptr() as usize)?;
-    if offset >= code.code_len || code._native_calls.value_map(offset).is_none() {
+    if offset >= code.code_len {
         return None;
     }
     let stack = egcl_rt::current_stack();
     let walk = Walk::new(bounds, stack);
+    // Unwind itself requires an exact recorded return offset. This leaf only
+    // needs the physical callable slot, so it can skip a second table search.
     let step = code._native_calls.unwind(
         code.code.as_ptr() as usize,
         &cursor,
