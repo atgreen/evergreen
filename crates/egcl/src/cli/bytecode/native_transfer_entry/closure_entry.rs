@@ -177,7 +177,9 @@ pub(in crate::cli::bytecode) fn teach(function: EgclVal, nargs: usize) {
     let Some((_, code, selected, native)) = funcall_fast::native_target(function, nargs) else {
         return;
     };
-    if selected != function || code.native_callable_slot.is_none() {
+    // Code with no explicit-callable slot is usable only when it never reads
+    // its receiver: then every instance may enter it (bliss-gg3i1.7.27).
+    if selected != function || (code.native_callable_slot.is_none() && !code.receiver_free()) {
         return;
     }
     let Some(entry) = code.ordinary_lean_entry_address() else {
@@ -199,7 +201,15 @@ pub(in crate::cli::bytecode) fn teach(function: EgclVal, nargs: usize) {
         return;
     };
     let owner = unsafe { &*execution }.code_owner();
-    let Some(record) = record_for(prototype, code.accepts_explicit_callable(prototype)) else {
+    // Receiver-free code accepts the prototype itself as readily as any
+    // instance; slot code checks the receiver it would read.
+    let callable = if code.native_callable_slot.is_some() {
+        code.accepts_explicit_callable(prototype)
+    } else {
+        registry_get(egcl_rt::function::definition_index(prototype))
+            .is_some_and(|body| Arc::ptr_eq(&body, &code.body))
+    };
+    let Some(record) = record_for(prototype, callable) else {
         return;
     };
     if record
