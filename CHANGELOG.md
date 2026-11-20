@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Instances of a metaclass that inherits from `STANDARD-CLASS` get direct
+  slot access again: a read no longer searches `CLASS-SLOTS`, and costs about
+  5 µs instead of 186–920 µs
+  ([#1021](https://github.com/atgreen/evergreen/pull/1021)).
+
 - Creating many streams no longer slows down with each one made: finalizers
   are indexed by object, and major collections find dead objects from the mark
   bitmap instead of hashing every one
