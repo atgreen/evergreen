@@ -1148,6 +1148,12 @@ impl TransferCode {
 
     /// Shared code is safe for distinct closures only when every native frame
     /// carries its own precise callable word and this object owns that body.
+    /// Whether this code never reads its receiver: no explicit-callable slot
+    /// and no captured environment, so any callable may enter its entry.
+    pub(in crate::cli::bytecode) fn receiver_free(&self) -> bool {
+        self.native_callable_slot.is_none() && !self.body.has_env
+    }
+
     pub(super) fn accepts_explicit_callable(&self, function: EgclVal) -> bool {
         self.native_callable_slot.is_some()
             && egcl_rt::function::is_interpreted_function(function)
