@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- The x86-64 JIT assembler spends less CPU time compiling branch-heavy
+  functions. In a cross-compile of SBCL’s `sset`, EGCL executed about 5.5%
+  fewer instructions and generated identical output
+  ([#1015](https://github.com/atgreen/evergreen/pull/1015)).
+
 - Aborting file output restores verified staged originals and deletes
   exclusively created output paths. Missing or replaced backups preserve the
   output, and cleanup keeps unrelated files. Unix replacements retain rwx
