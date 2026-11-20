@@ -247,6 +247,15 @@ pub fn lower_ordinary_primitives(
     f: &mut Function,
     resolve: impl FnMut(OrdinaryPrimitive) -> Option<u32>,
 ) -> Result<usize, EmitError> {
+    if has_values_to_list(f) {
+        // This proof applies only to the independent ordinary candidate. Keep
+        // the mapped input intact if any consumer or subsequent lowering fails.
+        let mut candidate = f.clone();
+        lower_singleton_values_to_list(&mut candidate)?;
+        let count = lower_ordinary_primitives(&mut candidate, resolve)?;
+        *f = candidate;
+        return Ok(count);
+    }
     if !has_closure_environment(f) {
         return lower_ordinary_primitives_body(f, resolve);
     }
@@ -256,6 +265,91 @@ pub fn lower_ordinary_primitives(
     let count = count + lower_ordinary_primitives_body(&mut candidate, resolve)?;
     *f = candidate;
     Ok(count)
+}
+
+fn has_values_to_list(f: &Function) -> bool {
+    f.block_order().iter().any(|&block| {
+        f.block(block)
+            .insts
+            .iter()
+            .any(|&inst| matches!(f.inst(inst).aux, AuxData::ValuesToList))
+    })
+}
+
+/// A list of a proven single primary is exactly CONS(primary, NIL). This
+/// never inspects an Env tuple or borrowed native-return payload. Inactive
+/// single NIL becomes (NIL); zero/many/unknown state must keep the mapped path.
+fn lower_singleton_values_to_list(f: &mut Function) -> Result<(), EmitError> {
+    let bad = || EmitError::Declined("unproven singleton ValuesToList");
+    if crate::t2::verify::verify(f).is_err() {
+        return Err(bad());
+    }
+    // No ABI entry precondition: even an entry consumer needs an explicit
+    // proof. OSR blocks are unknown, and every Call/Invoke kills the fact
+    // regardless of its result type or whether its call flag is malformed.
+    let single = crate::t2::opt_clear_mv::single_value_state(f, false);
+    let mut sites = Vec::new();
+    for &block in f.block_order() {
+        for &inst in &f.block(block).insts {
+            let data = f.inst(inst);
+            if !matches!(data.aux, AuxData::ValuesToList) {
+                continue;
+            }
+            if data.opcode != Opcode::Call
+                || data.args.len() != 1
+                || data.results.len() != 1
+                || !data.targets.is_empty()
+                || data.flags
+                    != (InstFlags {
+                        call: true,
+                        safepoint: true,
+                        effectful: true,
+                        ..Default::default()
+                    })
+                || data.frame_state.is_none_or(|id| {
+                    id.0 as usize >= f.frame_states.len()
+                        || f.frame_states.get(id).scopes.len() != 1
+                })
+                || !single.contains(&inst)
+                || data
+                    .args
+                    .iter()
+                    .chain(&data.results)
+                    .any(|&value| f.value(value).repr != ValueRepresentation::Tagged)
+                || f.value(data.results[0]).ty != IRType::TOP
+            {
+                return Err(bad());
+            }
+            sites.push((block, inst));
+        }
+    }
+    // Validate ALL sites before touching any instruction/result/FrameState.
+    for (block, inst) in sites {
+        let source_pos = f.inst(inst).source_pos;
+        let nil = insert_before(
+            f,
+            block,
+            inst,
+            InstData {
+                opcode: Opcode::ConstNil,
+                args: vec![],
+                results: vec![],
+                aux: AuxData::None,
+                flags: InstFlags::default(),
+                targets: vec![],
+                frame_state: None,
+                source_pos,
+            },
+            &[(IRType::of(TypeBits::NULL), ValueRepresentation::Tagged)],
+        )[0];
+        let data = f.inst_mut(inst);
+        data.opcode = Opcode::AllocCons;
+        data.aux = AuxData::None;
+        data.args.push(nil);
+        // Existing result SSA, before-consumption recovery, source PC and
+        // allocation/call/root-publication flags survive Cons lowering intact.
+    }
+    Ok(())
 }
 
 fn has_closure_environment(f: &Function) -> bool {

@@ -7,6 +7,10 @@
   fewer instructions and generated identical output
   ([#1015](https://github.com/atgreen/evergreen/pull/1015)).
 
+- Functions with provably single-valued `MULTIPLE-VALUE-LIST` forms can retain
+  their ordinary native entry, including singleton NIL lists and local block exits
+  ([#1013](https://github.com/atgreen/evergreen/pull/1013)).
+
 - Aborting file output restores verified staged originals and deletes
   exclusively created output paths. Missing or replaced backups preserve the
   output, and cleanup keeps unrelated files. Unix replacements retain rwx
