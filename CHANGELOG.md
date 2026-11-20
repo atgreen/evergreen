@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Natively compiled `CONSP`, `ENDP`, `CAR` and `CDR` no longer treat an
+  interpreted closure as a cons. A warm caller's `CONSP` answered T for one,
+  which made SBCL's cross-compiler fail on `src/code/array`
+  ([#1018](https://github.com/atgreen/evergreen/pull/1018)).
+
 - Native closures use fewer instructions to read and update captured lexical
   variables ([#1016](https://github.com/atgreen/evergreen/pull/1016)).
 
