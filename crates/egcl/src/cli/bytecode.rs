@@ -187,6 +187,7 @@ mod heap_env_tests;
 mod mapping_transforms;
 mod method_context_use;
 mod quoted_funcall;
+mod restart_clause_frame;
 use super::control_payload::ControlPayload;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use super::control_payload::reserve_control_values;
@@ -10799,7 +10800,7 @@ fn compile_restart_clause(
     lower_body(&mut lo, body).ok()?;
     lo.leave_body_declarations(declarations);
     lo.emit(Instr::Return);
-    Some(BytecodeFunction {
+    let mut function = BytecodeFunction {
         self_call_sites: Vec::new(),
         notinline_sites: lo.notinline_sites,
         code: lo.code,
@@ -10823,7 +10824,9 @@ fn compile_restart_clause(
         variadic,
         binder_cache: Default::default(),
         closure_template: Default::default(),
-    })
+    };
+    restart_clause_frame::elide_unused_literal_frame(&mut function);
+    Some(function)
 }
 
 /// Whether the LOOP `for` clause at `span` (a `forms` index range starting at
