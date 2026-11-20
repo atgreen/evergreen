@@ -102,6 +102,8 @@ mod ordinary_t2;
 pub(super) use ordinary_t2::{PreparedT2, install_ordinary_t2, prepare_ordinary_t2};
 mod nested;
 #[cfg(test)]
+mod singleton_values_list_tests;
+#[cfg(test)]
 pub(super) use nested::pending_argument_count;
 use nested::{SegmentActivations, finish_nested, prepare_nested, resume_nested};
 pub(super) use nested::{
@@ -2893,7 +2895,12 @@ fn ordinary_native_op(op: &Instr) -> bool {
         || (matches!(op, Instr::MakeEnvClosure { .. }) && ordinary_heap_creators_enabled())
         // VALUES publishes its tuple through a noncollecting leaf and the
         // ordinary return descriptor (bliss-gg3i1.7.15.10.4).
-        || (matches!(op, Instr::SetValues(_) | Instr::TakeValuesToLocals { .. })
+        // ValuesToList must still be consumed by the ordinary IR's proven
+        // singleton lowering; an unproved consumer declines that candidate.
+        || (matches!(
+            op,
+            Instr::SetValues(_) | Instr::TakeValuesToLocals { .. } | Instr::ValuesToList
+        )
             && ordinary_values_enabled())
         || (matches!(op, Instr::LoadFunction(_)) && ordinary_function_designators_enabled())
         || (matches!(op, Instr::BindSpecial(_) | Instr::UnbindSpecial(_))
