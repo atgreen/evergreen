@@ -137,6 +137,98 @@ mod ordinary_bounded_poll_tests;
 #[path = "bounded_poll_coalescing_tests.rs"]
 mod bounded_poll_coalescing_tests;
 
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+#[path = "emit_cycle_membership_tests.rs"]
+mod emit_cycle_membership_tests;
+
+/// All vertices on a directed cycle in the emitted layout. A target absent
+/// from `successors` is a dead end, including a block removed from the layout.
+/// Iterative Tarjan traversal visits every vertex and edge once; using dense
+/// indices avoids allocating by the largest (possibly sparse) IR block ID.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn native_cycle_vertices(
+    successors: &std::collections::HashMap<crate::t2::ir::Block, Vec<crate::t2::ir::Block>>,
+) -> std::collections::HashSet<crate::t2::ir::Block> {
+    use std::collections::HashMap;
+    let blocks: Vec<_> = successors.keys().copied().collect();
+    let indices: HashMap<_, _> = blocks.iter().enumerate().map(|(i, &b)| (b, i)).collect();
+    let mut offsets = Vec::with_capacity(blocks.len() + 1);
+    let mut edges = Vec::new();
+    let mut cyclic = vec![false; blocks.len()];
+    for (i, block) in blocks.iter().enumerate() {
+        offsets.push(edges.len());
+        for target in &successors[block] {
+            if let Some(&next) = indices.get(target) {
+                edges.push(next);
+                cyclic[i] |= next == i;
+            }
+        }
+    }
+    offsets.push(edges.len());
+
+    let mut discovery = vec![usize::MAX; blocks.len()];
+    let mut low = vec![0; blocks.len()];
+    let mut on_stack = vec![false; blocks.len()];
+    let mut component = Vec::new();
+    // Each DFS frame holds its vertex and the next edge to visit. Keeping
+    // this stack explicit also bounds the host stack on long straight CFGs.
+    let mut pending = Vec::new();
+    let mut clock = 0;
+    for start in 0..blocks.len() {
+        if discovery[start] != usize::MAX {
+            continue;
+        }
+        discovery[start] = clock;
+        low[start] = clock;
+        clock += 1;
+        component.push(start);
+        on_stack[start] = true;
+        pending.push((start, offsets[start]));
+        while let Some((vertex, edge)) = pending.last_mut() {
+            let vertex = *vertex;
+            if *edge < offsets[vertex + 1] {
+                let next = edges[*edge];
+                *edge += 1;
+                if discovery[next] == usize::MAX {
+                    discovery[next] = clock;
+                    low[next] = clock;
+                    clock += 1;
+                    component.push(next);
+                    on_stack[next] = true;
+                    pending.push((next, offsets[next]));
+                } else if on_stack[next] {
+                    low[vertex] = low[vertex].min(discovery[next]);
+                }
+                continue;
+            }
+            pending.pop();
+            if low[vertex] == discovery[vertex] {
+                let first = component.pop().expect("active SCC root");
+                on_stack[first] = false;
+                if first != vertex {
+                    cyclic[first] = true;
+                    loop {
+                        let member = component.pop().expect("active SCC member");
+                        on_stack[member] = false;
+                        cyclic[member] = true;
+                        if member == vertex {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(&(parent, _)) = pending.last() {
+                low[parent] = low[parent].min(low[vertex]);
+            }
+        }
+    }
+    blocks
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, block)| cyclic[i].then_some(block))
+        .collect()
+}
+
 /// Remove only implicit entry polls inside an already bounded poll envelope.
 /// This is deliberately not a general loop poll placement pass. The original
 /// scalar loop, explicit boundaries, heat and OSR transfer points remain.
@@ -7517,33 +7609,7 @@ fn emit_framed_inner(
                     .unwrap_or_default(),
             );
         }
-        let reaches = |start, goal| {
-            let mut pending = vec![start];
-            let mut seen = HashSet::new();
-            while let Some(block) = pending.pop() {
-                if block == goal {
-                    return true;
-                }
-                if !seen.insert(block) {
-                    continue;
-                }
-                if let Some(next) = successors.get(&block) {
-                    pending.extend(next.iter().copied());
-                }
-            }
-            false
-        };
-        let mut headers = HashSet::new();
-        for &block in &blocks {
-            let Some(terminator) = f.terminator(block) else {
-                continue;
-            };
-            for target in &f.inst(terminator).targets {
-                if reaches(target.block, block) {
-                    headers.insert(target.block);
-                }
-            }
-        }
+        let mut headers = native_cycle_vertices(&successors);
         headers.extend(bounded_polls.keys().copied());
         // A parameter-free jump to the next block emits no edge moves or
         // branch. Its poll is redundant when that next block still polls.
