@@ -43,9 +43,15 @@ fn set_test_root(value: EgclVal) {
     *ROOT.lock().unwrap_or_else(|e| e.into_inner()) = value;
 }
 
+/// The process's one finalizer dispatch (`set_finalizer_dispatch` keeps the
+/// first function installed), shared by every test here.
 fn dispatch(_finalizer: EgclVal, object: EgclVal) {
     FIRED.fetch_add(1, Ordering::SeqCst);
     LAST_OBJECT.store(object.to_raw() as usize, Ordering::SeqCst);
+    FIRED_OBJECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(object.to_raw() as usize);
 }
 
 fn cfg() -> GcConfig {
@@ -166,4 +172,92 @@ fn weak_pointer_forwards_across_evacuation_then_breaks_on_death() {
     collector.major_gc().expect("major_gc");
     let (_, broken_after) = weak.value();
     assert!(broken_after, "weak pointer must break once the object dies");
+}
+
+static MANY_ROOTS: Mutex<Vec<EgclVal>> = Mutex::new(Vec::new());
+static FIRED_OBJECTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static INSTALL_MANY_SCANNER: Once = Once::new();
+
+fn scan_many_roots(visit: &mut dyn FnMut(*mut EgclVal)) {
+    let mut roots = MANY_ROOTS.lock().unwrap_or_else(|e| e.into_inner());
+    for root in roots.iter_mut() {
+        visit(root);
+    }
+}
+
+/// Every probe body that is still live, by address.
+fn live_probes() -> Vec<usize> {
+    let mut found = Vec::new();
+    walk_heap(|ptr, type_id, _size| {
+        if type_id == PROBE_TID {
+            found.push(ptr as usize);
+        }
+        true
+    })
+    .expect("walk_heap");
+    found.sort_unstable();
+    found
+}
+
+/// Many registrations at once (bliss-gg3i1.7.22): one collection retires
+/// every dead object's finalizer exactly once, survivors keep theirs under
+/// their forwarded keys, and registering a destructor again replaces it.
+#[test]
+fn many_finalizers_forward_and_fire_once_each() {
+    let _g = lock().lock().unwrap_or_else(|e| e.into_inner());
+    init_heap(&cfg()).expect("init_heap");
+    set_finalizer_dispatch(dispatch);
+    INSTALL_MANY_SCANNER.call_once(|| register_root_scanner(scan_many_roots));
+    FIRED_OBJECTS.lock().unwrap().clear();
+    set_test_root(NIL);
+
+    const COUNT: usize = 200;
+    let mut kept = Vec::new();
+    for i in 0..COUNT {
+        let body = alloc_typed(16, PROBE_TID).expect("alloc_typed");
+        let key = EgclVal::from_raw(body as u64);
+        register_finalizer(key, EgclVal::from_fixnum(i as i64)).expect("register");
+        // A second registration replaces the destructor, never adds one.
+        register_finalizer(key, EgclVal::from_fixnum(-(i as i64))).expect("re-register");
+        if i % 2 == 0 {
+            kept.push(unsafe { EgclVal::from_heap_ptr(body.sub(8)) });
+        }
+    }
+    *MANY_ROOTS.lock().unwrap() = kept;
+
+    // The minor collection evacuates the survivors; the major one retires
+    // every dead object.
+    let mut collector = HeapCollector::new();
+    collector.minor_gc().expect("minor_gc");
+    collector
+        .major_gc()
+        .expect("major_gc with survivors rooted");
+    let survivors = live_probes();
+    assert_eq!(survivors.len(), COUNT / 2);
+    let mut fired = std::mem::take(&mut *FIRED_OBJECTS.lock().unwrap());
+    assert_eq!(
+        fired.len(),
+        COUNT / 2,
+        "each dead object fires exactly once"
+    );
+    fired.sort_unstable();
+    fired.dedup();
+    assert_eq!(fired.len(), COUNT / 2, "no object fires twice");
+    assert!(
+        fired
+            .iter()
+            .all(|addr| survivors.binary_search(addr).is_err()),
+        "no survivor's finalizer fires"
+    );
+
+    // Survivors die: each fires once, at its forwarded address.
+    MANY_ROOTS.lock().unwrap().clear();
+    collector.major_gc().expect("major_gc");
+    let mut fired = std::mem::take(&mut *FIRED_OBJECTS.lock().unwrap());
+    fired.sort_unstable();
+    assert_eq!(fired, survivors);
+    assert!(live_probes().is_empty());
+
+    collector.major_gc().expect("major_gc again");
+    assert!(FIRED_OBJECTS.lock().unwrap().is_empty(), "nothing re-fires");
 }
