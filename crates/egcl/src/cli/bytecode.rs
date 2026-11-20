@@ -22232,6 +22232,7 @@ fn run_with_binding(
     macro_lambda_list: bool,
     context: MacroCallContext<'_>,
 ) -> Result<EgclVal, EgclError> {
+    let _decline_census = decline_census::enter_t0(entry_sym);
     // Consumed first, so no nested activation can see it.
     let inherit_scope = INHERIT_CONTROL_SCOPE.with(|flag| flag.replace(false));
     let MacroCallContext {
@@ -26036,6 +26037,7 @@ pub fn deopt_count() -> u64 {
     DEOPT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+pub(in crate::cli) mod decline_census;
 mod perf_map;
 
 /// Append a Linux `perf` symbol-map entry for freshly installed native code
