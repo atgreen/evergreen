@@ -3908,13 +3908,17 @@ impl HeapCollector {
         // Captures, finalizers and weak references have now observed the old
         // identity. Erase dead pinned object fields before reusing their storage;
         // type-zero fillers preserve heap walking without retaining references.
-        for &(address, size) in &dead_function_slots {
+        for (address, size) in dead_function_slots {
             unsafe {
                 std::ptr::write_bytes(address as *mut u8, 0, object_footprint(size).0);
                 write_object_header(address as *mut u8, 0, size as u32);
             }
+            state
+                .free_pinned_slots
+                .entry(size)
+                .or_default()
+                .push(address);
         }
-        state.free_pinned_slots.extend(dead_function_slots);
 
         // Phase 2: Region selection — find old-gen regions with high garbage ratio.
         // Measure density against capacity, not the allocation high-water mark:
@@ -4215,10 +4219,13 @@ impl HeapCollector {
                     region_has_pinned(region.base as usize, region.header.alloc_top as usize)
                 }
         });
-        state.free_pinned_slots.retain(|&(address, _)| {
-            let index = (address - heap_base_addr) / region_size;
-            state.pinned_hosts.contains(&index)
-                && address < state.regions[index].header.alloc_top as usize
+        state.free_pinned_slots.retain(|_, addresses| {
+            addresses.retain(|&address| {
+                let index = (address - heap_base_addr) / region_size;
+                state.pinned_hosts.contains(&index)
+                    && address < state.regions[index].header.alloc_top as usize
+            });
+            !addresses.is_empty()
         });
 
         state.stats.major_gc_count += 1;
@@ -7206,12 +7213,11 @@ pub fn alloc_pinned_typed(body_size: usize, type_id: u8) -> Option<*mut u8> {
         type_id,
         crate::object::type_id::FUNCTION_INTERPRETED | crate::object::type_id::SYMBOL
     ) {
-        if let Some(index) = state
+        if let Some(address) = state
             .free_pinned_slots
-            .iter()
-            .rposition(|&(_, size)| size == body_size)
+            .get_mut(&body_size)
+            .and_then(Vec::pop)
         {
-            let (address, _) = state.free_pinned_slots.swap_remove(index);
             let ptr = address as *mut u8;
             let body_off = unsafe { write_object_header(ptr, type_id, header_body_size) };
             unsafe { (*(ptr as *mut ObjectHeader)).set_pinned() };
@@ -8152,9 +8158,9 @@ struct HeapState {
     /// scanning `pinned_hosts`, whose full regions a pinned-allocation-heavy
     /// workload (closure instances) would otherwise rescan on every object.
     pinned_alloc_hint: Option<usize>,
-    /// Dead pinned function/symbol slots, recorded after major-GC reachability.
-    /// Each slot remains a walkable filler until reused; live objects never move.
-    free_pinned_slots: Vec<(usize, usize)>,
+    /// Dead pinned function/symbol addresses grouped by exact body size. Each
+    /// slot remains a walkable filler until an allocation of that size reuses it.
+    free_pinned_slots: HashMap<usize, Vec<usize>>,
     /// Nursery regions an object has been pinned in since the last minor
     /// collection (bliss-xyt4l). That collection walks only these regions to
     /// find the pinned ones it must retain in place, instead of every nursery
@@ -8305,7 +8311,7 @@ fn allocate_heap_state(config: &GcConfig) -> Result<HeapState, EgclError> {
     let state = HeapState {
         pinned_hosts: std::collections::HashSet::new(),
         pinned_alloc_hint: None,
-        free_pinned_slots: Vec::new(),
+        free_pinned_slots: HashMap::new(),
         nursery_pin_candidates: std::collections::HashSet::new(),
         config: config.clone(),
         stats,
