@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Creating many streams no longer slows down with each one made: finalizers
+  are indexed by object, and major collections find dead objects from the mark
+  bitmap instead of hashing every one
+  ([#1019](https://github.com/atgreen/evergreen/pull/1019)).
+
 - Natively compiled `CONSP`, `ENDP`, `CAR` and `CDR` no longer treat an
   interpreted closure as a cons. A warm caller's `CONSP` answered T for one,
   which made SBCL's cross-compiler fail on `src/code/array`
