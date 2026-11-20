@@ -90,7 +90,12 @@ pub(super) fn enter_t0(symbol: u32) -> Frame {
     Frame(Some(previous))
 }
 
-/// A native activation of `symbol` begins.
+/// A native activation of `symbol` begins. Native activations exist only
+/// where the mapped transfer does.
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
 #[inline]
 pub(super) fn enter_native(symbol: Option<u32>) -> Frame {
     if !enabled() {
