@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Aborting file output restores verified staged originals and deletes
+  exclusively created output paths. Missing or replaced backups preserve the
+  output, and cleanup keeps unrelated files. Unix replacements retain rwx
+  access without copying privilege bits ([#1005](https://github.com/atgreen/evergreen/pull/1005)).
+
 - Compile bytecode closure creation in RV64 T1 while preserving captured
   locations and retained definitions
   ([#987](https://github.com/atgreen/evergreen/pull/987)).

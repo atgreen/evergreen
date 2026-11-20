@@ -258,6 +258,8 @@ pub const IF_EXISTS_ERROR_VAL: EgclVal = EgclVal(1 << 3); // fixnum 1
 pub const IF_EXISTS_SUPERSEDE_VAL: EgclVal = EgclVal(2 << 3); // fixnum 2
 pub const IF_EXISTS_APPEND_VAL: EgclVal = EgclVal(3 << 3); // fixnum 3
 pub const IF_EXISTS_OVERWRITE_VAL: EgclVal = EgclVal(4 << 3); // fixnum 4
+/// :RENAME — like :SUPERSEDE, but the old file stays under its new name.
+pub const IF_EXISTS_RENAME_VAL: EgclVal = EgclVal(6 << 3); // fixnum 6
 
 /// Missing-file creation policy; NIL returns NIL and T signals a file error.
 pub const IF_DOES_NOT_EXIST_CREATE_VAL: EgclVal = EgclVal(5 << 3);
@@ -318,6 +320,9 @@ struct StreamMutableState {
     /// `get_stream_alloc`. Points into the same (stable, off-heap) `Box`, so it
     /// stays valid for the block's lifetime. Read via `self.components()`.
     components_ptr: *const [EgclVal],
+    /// What CLOSE :ABORT T undoes, for a file stream whose OPEN created or
+    /// superseded a file.
+    abort_plan: Option<AbortPlan>,
 }
 
 impl StreamMutableState {
@@ -2758,6 +2763,16 @@ fn alloc_stream(
     components: Vec<EgclVal>,
     file_namestring: Option<String>,
 ) -> EgclVal {
+    alloc_stream_with_abort_plan(element_type, inner, components, file_namestring, None)
+}
+
+fn alloc_stream_with_abort_plan(
+    element_type: StreamElementType,
+    inner: StreamInner,
+    components: Vec<EgclVal>,
+    file_namestring: Option<String>,
+    abort_plan: Option<AbortPlan>,
+) -> EgclVal {
     // Composite streams are constructed after their immutable components and
     // acquire the composite lock first. Descending keys therefore put every
     // newer composite before all of its older components.
@@ -2785,6 +2800,7 @@ fn alloc_stream(
                 element_type,
                 inner,
                 components_ptr: std::ptr::slice_from_raw_parts(std::ptr::null::<EgclVal>(), 0),
+                abort_plan,
             },
         ),
         input: OrderedExecutionMutex::new(
@@ -2812,6 +2828,11 @@ fn alloc_stream(
     // performed while it was being allocated before exposing the handle.
     for (component, root) in boxed.components.iter_mut().zip(component_roots.iter()) {
         *component = *root;
+    }
+    // Only a successfully allocated handle commits normal finalizer cleanup.
+    // Before this point, an allocation failure/unwind must retain old backups.
+    if let Some(plan) = boxed.state.get_mut().abort_plan.as_mut() {
+        plan.published = true;
     }
     let box_ptr = Box::into_raw(boxed) as u64;
     unsafe {
@@ -3127,6 +3148,423 @@ fn missing_file_policy(if_does_not_exist: EgclVal, path_str: &str) -> Result<(),
     )))
 }
 
+#[derive(PartialEq, Eq)]
+struct OutputIdentity {
+    device: u64,
+    file: u64,
+}
+
+fn output_identity(file: &std::fs::File) -> std::io::Result<OutputIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        Ok(OutputIdentity {
+            device: meta.dev(),
+            file: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // The File keeps the queried handle alive; success initializes INFO.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let info = unsafe { info.assume_init() };
+        Ok(OutputIdentity {
+            device: u64::from(info.dwVolumeSerialNumber),
+            file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file identity unavailable",
+        ))
+    }
+}
+
+fn output_path_identity(path: &std::path::Path) -> std::io::Result<OutputIdentity> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::other(
+            "output path is no longer a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(OutputIdentity {
+            device: meta.dev(),
+            file: meta.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        };
+        // Query identity without following a substituted reparse point and
+        // without demanding read access to the file's contents.
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        output_identity(&file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file identity unavailable",
+        ))
+    }
+}
+
+/// Keep the original inode alive as well as its identity: a removed backup's
+/// file ID must not be reused by an unrelated replacement before cleanup.
+struct BackupFile {
+    path: std::path::PathBuf,
+    identity: OutputIdentity,
+    _identity_handle: std::fs::File,
+}
+
+impl BackupFile {
+    fn verify(&self) -> std::io::Result<()> {
+        if output_path_identity(&self.path)? != self.identity {
+            return Err(std::io::Error::other(
+                "backup no longer names the original file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_if_owned(&self) -> std::io::Result<()> {
+        self.verify()?;
+        std::fs::remove_file(&self.path)
+    }
+}
+
+/// CLHS CLOSE: "If stream performs output to a file that was created when the
+/// stream was created, the file is deleted and any previously existing file is
+/// not superseded." OPEN records the file it created and where it moved the
+/// file it superseded; CLOSE settles both.
+struct AbortPlan {
+    path: std::path::PathBuf,
+    /// Where OPEN moved the superseded file.
+    backup: Option<BackupFile>,
+    /// :RENAME keeps the old file under its new name after a normal close.
+    keep_backup: bool,
+    output_identity: OutputIdentity,
+    /// A successfully allocated Lisp handle now owns normal cleanup.
+    published: bool,
+}
+
+impl AbortPlan {
+    fn created(path: &std::path::Path, file: &std::fs::File) -> Result<Self, EgclError> {
+        Ok(AbortPlan {
+            path: std::path::absolute(path).map_err(|e| EgclError::FileError(e.to_string()))?,
+            backup: None,
+            keep_backup: false,
+            published: false,
+            output_identity: output_identity(file)
+                .map_err(|e| EgclError::FileError(e.to_string()))?,
+        })
+    }
+
+    fn finish(mut self, abort: bool) -> Result<(), EgclError> {
+        if !abort {
+            return Ok(());
+        }
+        // An abort failure must never let Drop discard the only old copy.
+        self.keep_backup = true;
+        // Check recovery authority BEFORE removing even our own output. A
+        // missing/substituted backup must leave all involved paths untouched.
+        if let Some(backup) = &self.backup {
+            backup.verify().map_err(|e| EgclError::FileError(format!(
+                "cannot abort output: original backup {} is unavailable ({e}); output preserved",
+                backup.path.display()
+            )))?;
+        }
+        match output_path_identity(&self.path) {
+            Ok(current) if current == self.output_identity => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(EgclError::FileError(format!(
+                    "cannot abort output: {} no longer names the opened file; backup retained",
+                    self.path.display()
+                )));
+            }
+        }
+        remove_if_present(&self.path)?;
+        if let Some(backup) = self.backup.as_ref() {
+            restore_backup(backup, &self.path).map_err(|e| {
+                EgclError::FileError(format!(
+                    "cannot restore {} from {}: {}",
+                    self.path.display(),
+                    backup.path.display(),
+                    e
+                ))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AbortPlan {
+    /// A normal close, or a published stream collected unclosed, discards
+    /// the superseded file unless :RENAME asked to keep it. An unpublished
+    /// plan may be unwinding from allocation failure, so retain its backup.
+    fn drop(&mut self) {
+        if let Some(backup) = self.backup.take()
+            && !self.keep_backup
+            && self.published
+        {
+            let _ = backup.remove_if_owned();
+        }
+    }
+}
+
+fn remove_if_present(path: &std::path::Path) -> Result<(), EgclError> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(EgclError::FileError(format!(
+            "cannot delete {}: {}",
+            path.display(),
+            e
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Restore without replacing a path another actor created after CLOSE removed
+/// its output. On failure the backup remains available for manual recovery.
+fn restore_backup(backup: &BackupFile, path: &std::path::Path) -> std::io::Result<()> {
+    backup.verify()?;
+    std::fs::hard_link(&backup.path, path)?;
+    backup.remove_if_owned()
+}
+
+/// Reserve a backup atomically: hard_link fails if the candidate already
+/// exists, including a dangling symlink. Never rename over unrelated files.
+fn backup_file(path: &std::path::Path, keep_backup: bool) -> std::io::Result<std::path::PathBuf> {
+    static NEXT_BACKUP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for attempt in 0..128 {
+        let candidate = if keep_backup && attempt == 0 {
+            path.with_file_name(format!("{name}.bak"))
+        } else {
+            let n = NEXT_BACKUP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            path.with_file_name(format!(".{name}.egcl-{}-{n}.bak", std::process::id()))
+        };
+        match std::fs::hard_link(path, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "cannot reserve a unique backup name",
+    ))
+}
+
+/// Stage only ordinary writable files. Symlinks keep their previous
+/// write-through behavior, and paths that cannot be staged retain the old
+/// in-place open behavior. Those fallback cases cannot restore old contents.
+fn supersede_file(
+    path: &std::path::Path,
+    read: bool,
+    keep_backup: bool,
+) -> Result<(std::fs::File, Option<AbortPlan>), EgclError> {
+    // Plans outlive OPEN and may be closed after the process changes cwd.
+    // Anchor paths without canonicalizing (and thereby following) symlinks.
+    let absolute_path =
+        std::path::absolute(path).map_err(|e| EgclError::FileError(e.to_string()))?;
+    let path = absolute_path.as_path();
+    let mut options = std::fs::OpenOptions::new();
+    options.read(read).write(true);
+    let regular = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    if !regular {
+        // In particular, opening a FIFO twice can consume its reader on the
+        // preflight open and then block forever. Preserve one write-through
+        // open for symlinks/devices/FIFOs; directories still fail normally.
+        return options
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map(|file| (file, None))
+            .map_err(|e| EgclError::FileError(format!("cannot create file: {e}")));
+    }
+    // Check the original access permissions before replacing its directory
+    // entry: a writable directory must not bypass a read-only file's mode.
+    let original = options
+        .open(path)
+        .map_err(|e| EgclError::FileError(format!("cannot open file: {e}")))?;
+    let original_metadata = original
+        .metadata()
+        .map_err(|e| EgclError::FileError(format!("cannot inspect original file: {e}")))?;
+    let original_identity = output_identity(&original)
+        .map_err(|e| EgclError::FileError(format!("cannot identify original file: {e}")))?;
+    let backup = match backup_file(path, keep_backup) {
+        Ok(backup) => Some(backup),
+        Err(e) if keep_backup => {
+            return Err(EgclError::FileError(format!(
+                "cannot rename existing file: {e}"
+            )));
+        }
+        Err(_) => None,
+    };
+    let Some(backup) = backup else {
+        drop(original);
+        return options
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map(|file| (file, None))
+            .map_err(|e| EgclError::FileError(format!("cannot create file: {e}")));
+    };
+    // Retain the identity through the backup link before removing the old
+    // output name. Keeping the original inode alive prevents file-ID reuse.
+    let identity_handle = match std::fs::OpenOptions::new()
+        .read(read)
+        .write(true)
+        .open(&backup)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            if output_path_identity(&backup).is_ok_and(|id| id == original_identity) {
+                let _ = std::fs::remove_file(&backup);
+            }
+            return Err(EgclError::FileError(format!(
+                "cannot retain original backup: {e}"
+            )));
+        }
+    };
+    if output_identity(&identity_handle).map_err(|e| EgclError::FileError(e.to_string()))?
+        != original_identity
+    {
+        return Err(EgclError::FileError(
+            "backup changed while opening; original output preserved".into(),
+        ));
+    }
+    let backup = BackupFile {
+        path: backup,
+        identity: original_identity,
+        _identity_handle: identity_handle,
+    };
+    backup
+        .verify()
+        .map_err(|e| EgclError::FileError(e.to_string()))?;
+    let permissions = original_metadata.permissions();
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // Never create a private file with the default, potentially broader
+        // mode, even transiently. Copy rwx only: new output must not acquire
+        // the original's setuid/setgid/sticky bits.
+        let mode = permissions.mode() & 0o777;
+        options.mode(mode);
+        std::fs::Permissions::from_mode(mode)
+    };
+    drop(original);
+    if let Err(e) = std::fs::remove_file(path) {
+        // PATH still names the original; discard only our extra link.
+        let _ = backup.remove_if_owned();
+        return Err(EgclError::FileError(format!("cannot replace file: {e}")));
+    }
+    // Do not truncate a new path that appeared after removal of the original.
+    let file = match options.create_new(true).open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            // A failed restore leaves the original at BACKUP. In particular,
+            // an intervening PATH is never overwritten by recovery.
+            let restored = restore_backup(&backup, path);
+            return Err(EgclError::FileError(format!(
+                "cannot create file: {e}; original recovery from {}: {}",
+                backup.path.display(),
+                match restored {
+                    Ok(()) => "restored".to_owned(),
+                    Err(e) => format!("backup retained ({e})"),
+                }
+            )));
+        }
+    };
+    // Identity failure leaves the restricted replacement and original backup
+    // in place, and reports recovery information rather than discarding either.
+    let output_identity = output_identity(&file).map_err(|e| {
+        EgclError::FileError(format!(
+            "cannot inspect replacement: {e}; original retained at {}",
+            backup.path.display()
+        ))
+    })?;
+    let plan = AbortPlan {
+        path: path.to_path_buf(),
+        backup: Some(backup),
+        keep_backup,
+        output_identity,
+        published: false,
+    };
+    if let Err(e) = file.set_permissions(permissions) {
+        drop(file);
+        let recovery = plan.finish(true);
+        return Err(EgclError::FileError(format!(
+            "cannot set replacement permissions: {e}; recovery: {}",
+            match recovery {
+                Ok(()) => "restored original".to_owned(),
+                Err(e) => format!("{e:?}"),
+            }
+        )));
+    }
+    Ok((file, Some(plan)))
+}
+
+/// A failed initial existence check does not grant ownership of whatever OPEN
+/// later finds. Only O_EXCL/CREATE_NEW success permits CLOSE to delete a file.
+fn create_output_file(
+    path: &std::path::Path,
+    read: bool,
+) -> Result<(std::fs::File, Option<AbortPlan>), EgclError> {
+    match std::fs::OpenOptions::new()
+        .read(read)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let plan = AbortPlan::created(path, &file)?;
+            Ok((file, Some(plan)))
+        }
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.file_type().is_symlink()) =>
+        {
+            // A dangling symlink is an existing directory entry. Preserve
+            // write-through, without truncating a target that appeared in the
+            // meantime or claiming authority to delete the link/target.
+            std::fs::OpenOptions::new()
+                .read(read)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .map(|file| (file, None))
+                .map_err(|e| EgclError::FileError(format!("cannot open symlink target: {e}")))
+        }
+        Err(e) => Err(EgclError::FileError(format!(
+            "cannot exclusively create output: {e}"
+        ))),
+    }
+}
+
 pub fn open(
     pathname: EgclVal,
     direction: StreamDirection,
@@ -3273,6 +3711,7 @@ fn open_file(
             Ok(*stream)
         }
         StreamDirection::Output => {
+            let mut abort_plan = None;
             // Issue #8: Handle if_exists variants including :append.
             let file = if path.exists() {
                 if if_exists == NIL {
@@ -3299,19 +3738,22 @@ fn open_file(
                         path_str
                     )));
                 } else {
-                    // Default (:supersede / T / any other value) — truncate and create
-                    std::fs::File::create(path)
-                        .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                    // Default (:supersede / T / any other value) — a new file
+                    let (file, plan) =
+                        supersede_file(path, false, if_exists == IF_EXISTS_RENAME_VAL)?;
+                    abort_plan = plan;
+                    file
                 }
             } else {
                 if if_does_not_exist == NIL {
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                std::fs::File::create(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?
+                let (file, plan) = create_output_file(path, false)?;
+                abort_plan = plan;
+                file
             };
-            Ok(alloc_stream(
+            let stream = alloc_stream_with_abort_plan(
                 elt,
                 StreamInner::FileOutput {
                     file: StreamHandle::File(file),
@@ -3322,9 +3764,12 @@ fn open_file(
                 },
                 vec![],
                 Some(absolute_path),
-            ))
+                abort_plan,
+            );
+            Ok(stream)
         }
         StreamDirection::Io => {
+            let mut abort_plan = None;
             let file = if path.exists() {
                 if if_exists == NIL {
                     return Ok(NIL);
@@ -3350,28 +3795,22 @@ fn open_file(
                         .open(path)
                         .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
                 } else {
-                    // Default (:supersede / T) — truncate
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .truncate(true)
-                        .open(path)
-                        .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
+                    // Default (:supersede / T) — a new file
+                    let (file, plan) =
+                        supersede_file(path, true, if_exists == IF_EXISTS_RENAME_VAL)?;
+                    abort_plan = plan;
+                    file
                 }
             } else {
                 if if_does_not_exist == NIL {
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?
+                let (file, plan) = create_output_file(path, true)?;
+                abort_plan = plan;
+                file
             };
-            Ok(alloc_stream(
+            let stream = alloc_stream_with_abort_plan(
                 elt,
                 StreamInner::FileIo {
                     file: StreamHandle::File(file),
@@ -3386,13 +3825,15 @@ fn open_file(
                 },
                 vec![],
                 Some(absolute_path),
-            ))
+                abort_plan,
+            );
+            Ok(stream)
         }
     }
 }
 
 pub fn close(stream: EgclVal, abort: bool) -> Result<(), EgclError> {
-    with_stream(stream, |guard| {
+    let abort_plan = with_stream(stream, |guard| {
         // Flush write buffers before closing (unless abort)
         if guard.open && !abort {
             match &mut guard.inner {
@@ -3414,8 +3855,19 @@ pub fn close(stream: EgclVal, abort: bool) -> Result<(), EgclError> {
             _ => {}
         }
         guard.open = false;
-        Ok(())
-    })
+        Ok(StreamCloseOutcome(guard.abort_plan.take()))
+    })?;
+    match abort_plan.0 {
+        Some(plan) => plan.finish(abort),
+        None => Ok(()),
+    }
+}
+
+/// The file work CLOSE leaves until the stream's lock is released.
+struct StreamCloseOutcome(Option<AbortPlan>);
+
+impl egcl_rt::gc::TraceHostRoots for StreamCloseOutcome {
+    fn trace_host_roots(&mut self, _visit: &mut dyn FnMut(*mut EgclVal)) {}
 }
 
 pub fn make_string_input_stream(
@@ -5292,6 +5744,123 @@ pub fn concatenated_stream_streams(stream: EgclVal) -> Option<Vec<EgclVal>> {
 #[cfg(windows)]
 pub fn stream_raw_fd(_stream: EgclVal) -> Option<i32> {
     None
+}
+
+#[cfg(test)]
+mod abort_restore_tests {
+    #[test]
+    fn exclusive_creation_never_claims_an_existing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("egcl-exclusive-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        for read in [false, true] {
+            std::fs::write(&path, "appeared before exclusive creation").unwrap();
+            assert!(matches!(
+                super::create_output_file(&path, read),
+                Err(super::EgclError::FileError(_))
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "appeared before exclusive creation"
+            );
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dropping_an_unpublished_plan_retains_the_original_backup() {
+        let dir =
+            std::env::temp_dir().join(format!("egcl-abort-unpublished-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, "old").unwrap();
+        let (file, plan) = super::supersede_file(&path, false, false).unwrap();
+        let backup = plan.as_ref().unwrap().backup.as_ref().unwrap().path.clone();
+        drop(file);
+        drop(plan);
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn open_abort_plan_survives_a_physically_relocated_handle() {
+        use egcl_rt::{Collector, HeapCollector};
+        const CHILD: &str = "EGCL_ABORT_PLAN_MOVING_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "streams::abort_restore_tests::open_abort_plan_survives_a_physically_relocated_handle", "--nocapture"])
+                .env(CHILD, "1").env("EGCL_GC_POISON", "1")
+                .env_remove("EGCL_GC_STRESS").env_remove("EGCL_GC_STRESS_AT")
+                .env_remove("EGCL_GC_STRESS_SKIP").env_remove("EGCL_GC_STRESS_AFTER_INIT")
+                .output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        super::install_gc_hooks();
+        let dir = std::env::temp_dir().join(format!("egcl-abort-moving-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        let name = path.to_str().unwrap();
+        for direction in [super::StreamDirection::Output, super::StreamDirection::Io] {
+            std::fs::write(&path, "old").unwrap();
+            egcl_rt::rooted!(pathname = super::make_lisp_string_fresh(name));
+            crate::pathnames::register_string(*pathname, name);
+            HeapCollector::new().minor_gc().unwrap();
+            egcl_rt::rooted!(
+                stream = super::open(
+                    *pathname,
+                    direction,
+                    super::NIL,
+                    super::IF_EXISTS_SUPERSEDE_VAL,
+                    super::IF_DOES_NOT_EXIST_CREATE_VAL,
+                    super::ExternalFormat::Utf8
+                )
+                .unwrap()
+            );
+            let before = stream.to_raw();
+            HeapCollector::new().minor_gc().unwrap();
+            assert_ne!(stream.to_raw(), before, "fresh handle must physically move");
+            egcl_rt::rooted!(text = super::make_lisp_string("new"));
+            super::stream_write_string(*stream, *text, 0, None).unwrap();
+            super::close(*stream, true).unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restore_never_replaces_an_intervening_path() {
+        let dir = std::env::temp_dir().join(format!("egcl-abort-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let backup = dir.join("backup");
+        let output = dir.join("output");
+        std::fs::write(&backup, "original").unwrap();
+        std::fs::write(&output, "independent").unwrap();
+        let backup_file = super::BackupFile {
+            identity: super::output_path_identity(&backup).unwrap(),
+            _identity_handle: std::fs::File::open(&backup).unwrap(),
+            path: backup.clone(),
+        };
+        assert!(super::restore_backup(&backup_file, &output).is_err());
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "original");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "independent");
+        drop(backup_file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(test)]
