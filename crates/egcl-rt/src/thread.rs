@@ -3434,16 +3434,18 @@ pub(crate) fn current_yield_requested() -> bool {
         .unwrap_or(true)
 }
 
-// Resolve carrier TLS inside a fresh call, just like current_fiber(). Inlining
-// lets LLVM retain the old carrier's TLS address across a yielding caller,
-// selecting another fiber's ExecutionLocal slots after migration.
+/// Read the carrier's mount key. Zero identifies native-thread execution.
+/// Call through a non-inlined accessor so the TLS address is resolved again
+/// after a callback yields and resumes on another carrier.
+#[inline]
+pub(crate) fn mounted_fiber_key() -> u64 {
+    ACTIVE_FIBER_ID.try_with(|slot| slot.get()).unwrap_or(0)
+}
+
 #[inline(never)]
 pub fn current_fiber_id() -> Option<FiberId> {
-    ACTIVE_FIBER_ID
-        .try_with(|slot| slot.get())
-        .ok()
-        .filter(|&id| id != 0)
-        .map(FiberId)
+    let key = mounted_fiber_key();
+    (key != 0).then_some(FiberId(key))
 }
 
 pub fn all_fiber_ids() -> Vec<FiberId> {

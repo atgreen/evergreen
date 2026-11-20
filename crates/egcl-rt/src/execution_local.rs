@@ -36,36 +36,41 @@ thread_local! {
 
 #[derive(Clone, Copy)]
 struct CachedSlot {
-    fiber: Option<crate::thread::FiberId>,
+    fiber_key: u64,
     pointer: *const (),
 }
 
 const EMPTY_SLOT: CachedSlot = CachedSlot {
-    fiber: None,
+    fiber_key: 0,
     pointer: std::ptr::null(),
 };
 
 // A callback can yield and migrate. Keep TLS address computation inside fresh
 // calls, and never retain a cache borrow across a callback or initializer.
 #[inline(never)]
-fn cached_pointer(index: usize, fiber: Option<crate::thread::FiberId>) -> Option<*const ()> {
-    // No retirement check here: `retire_native` empties this thread's native
-    // entries, so a retired execution can only miss. This is the hot path of
-    // every execution-local access and now needs one TLS access, not two.
+fn cached_pointer(index: usize) -> *const () {
+    // Resolve both TLS slots on the same carrier before running any callback.
+    // An empty entry already has a null pointer. Native retirement clears
+    // this carrier's native entries before destroying the owning boxes.
+    let fiber_key = crate::thread::mounted_fiber_key();
     CACHE
         .try_with(|cache| {
             let entry = cache.get(index)?.get();
-            (entry.fiber == fiber && !entry.pointer.is_null()).then_some(entry.pointer)
+            (entry.fiber_key == fiber_key).then_some(entry.pointer)
         })
         .ok()
         .flatten()
+        .unwrap_or(std::ptr::null())
 }
 
 #[inline(never)]
 fn cache_pointer(index: usize, fiber: Option<crate::thread::FiberId>, pointer: *const ()) {
     let _ = CACHE.try_with(|cache| {
         if let Some(entry) = cache.get(index) {
-            entry.set(CachedSlot { fiber, pointer });
+            entry.set(CachedSlot {
+                fiber_key: fiber.map_or(0, |id| id.0),
+                pointer,
+            });
         }
     });
 }
@@ -118,13 +123,14 @@ impl<T> ExecutionLocal<T> {
     }
 
     pub fn with<R>(&'static self, f: impl FnOnce(&T) -> R) -> R {
-        let fiber = crate::thread::current_fiber_id();
-        if let Some(pointer) = cached_pointer(self.cache_index.load(Ordering::Acquire), fiber) {
+        let pointer = cached_pointer(self.cache_index.load(Ordering::Acquire));
+        if !pointer.is_null() {
             // SAFETY: a cache entry is borrowed from this local's stable box and
             // keyed by the current execution. Fiber IDs are never reused; a
             // retired fiber cannot run again. Native retirement rejects hits.
             return f(unsafe { &*pointer.cast::<T>() });
         }
+        let fiber = crate::thread::current_fiber_id();
         self.registered.call_once(|| {
             let mut locals = LOCALS.lock().unwrap();
             let index = locals.len();
@@ -162,11 +168,12 @@ impl<T> ExecutionLocal<T> {
 
     /// Access an existing slot without reviving a retiring native execution.
     pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let fiber = crate::thread::current_fiber_id();
-        if let Some(pointer) = cached_pointer(self.cache_index.load(Ordering::Acquire), fiber) {
+        let pointer = cached_pointer(self.cache_index.load(Ordering::Acquire));
+        if !pointer.is_null() {
             // Same stable-box and execution-identity contract as `with`.
             return Some(f(unsafe { &*pointer.cast::<T>() }));
         }
+        let fiber = crate::thread::current_fiber_id();
         let key = current_key(fiber);
         if is_retired(key) {
             return None;
@@ -244,7 +251,7 @@ pub(crate) fn retire_native(id: ThreadId) {
     // the retirement checks on the slow path (see `cached_pointer`).
     let _ = CACHE.try_with(|cache| {
         for entry in cache {
-            if entry.get().fiber.is_none() {
+            if entry.get().fiber_key == 0 {
                 entry.set(EMPTY_SLOT);
             }
         }
