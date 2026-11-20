@@ -14,6 +14,10 @@
   their ordinary native entry, including singleton NIL lists and local block exits
   ([#1013](https://github.com/atgreen/evergreen/pull/1013)).
 
+- EGCL finds reclaimed storage for pinned functions and symbols by object size.
+  Parsing UnicodeData records with CL-UNICODE took 16% less time in a warmed
+  x86-64 Linux benchmark ([#1017](https://github.com/atgreen/evergreen/pull/1017)).
+
 - Aborting file output restores verified staged originals and deletes
   exclusively created output paths. Missing or replaced backups preserve the
   output, and cleanup keeps unrelated files. Unix replacements retain rwx
