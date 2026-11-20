@@ -142,23 +142,44 @@ mod bounded_poll_coalescing_tests;
 mod emit_cycle_membership_tests;
 
 /// All vertices on a directed cycle in the emitted layout. A target absent
-/// from `successors` is a dead end, including a block removed from the layout.
+/// from `blocks` is a dead end, including a block removed from the layout.
 /// Iterative Tarjan traversal visits every vertex and edge once; using dense
 /// indices avoids allocating by the largest (possibly sparse) IR block ID.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn native_cycle_vertices(
-    successors: &std::collections::HashMap<crate::t2::ir::Block, Vec<crate::t2::ir::Block>>,
-) -> std::collections::HashSet<crate::t2::ir::Block> {
+fn native_cycle_vertices<I>(
+    blocks: &[crate::t2::ir::Block],
+    mut successors: impl FnMut(crate::t2::ir::Block) -> I,
+) -> std::collections::HashSet<crate::t2::ir::Block>
+where
+    I: IntoIterator<Item = crate::t2::ir::Block>,
+{
     use std::collections::HashMap;
-    let blocks: Vec<_> = successors.keys().copied().collect();
+    // Tiny CFGs need no indexing or SCC workspace: their only possible
+    // cycles are self-edges and the pair of opposing edges.
+    if blocks.len() <= 2 {
+        let mut edges = [[false; 2]; 2];
+        for (source, &block) in blocks.iter().enumerate() {
+            for target in successors(block) {
+                if let Some(destination) = blocks.iter().position(|&b| b == target) {
+                    edges[source][destination] = true;
+                }
+            }
+        }
+        let mutual = edges[0][1] && edges[1][0];
+        return blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &block)| (edges[i][i] || mutual).then_some(block))
+            .collect();
+    }
     let indices: HashMap<_, _> = blocks.iter().enumerate().map(|(i, &b)| (b, i)).collect();
     let mut offsets = Vec::with_capacity(blocks.len() + 1);
     let mut edges = Vec::new();
     let mut cyclic = vec![false; blocks.len()];
     for (i, block) in blocks.iter().enumerate() {
         offsets.push(edges.len());
-        for target in &successors[block] {
-            if let Some(&next) = indices.get(target) {
+        for target in successors(*block) {
+            if let Some(&next) = indices.get(&target) {
                 edges.push(next);
                 cyclic[i] |= next == i;
             }
@@ -223,7 +244,8 @@ fn native_cycle_vertices(
         }
     }
     blocks
-        .into_iter()
+        .iter()
+        .copied()
         .enumerate()
         .filter_map(|(i, block)| cyclic[i].then_some(block))
         .collect()
@@ -7594,22 +7616,11 @@ fn emit_framed_inner(
         HashSet<crate::t2::ir::Block>,
         HashMap<crate::t2::ir::Block, usize>,
     ) = if native_poll_veneer.is_some() {
-        let mut successors: HashMap<_, Vec<_>> = HashMap::new();
-        for &block in &blocks {
-            successors.insert(
-                block,
-                f.terminator(block)
-                    .map(|terminator| {
-                        f.inst(terminator)
-                            .targets
-                            .iter()
-                            .map(|target| target.block)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            );
-        }
-        let mut headers = native_cycle_vertices(&successors);
+        let mut headers = native_cycle_vertices(&blocks, |block| {
+            f.terminator(block).into_iter().flat_map(move |terminator| {
+                f.inst(terminator).targets.iter().map(|target| target.block)
+            })
+        });
         headers.extend(bounded_polls.keys().copied());
         // A parameter-free jump to the next block emits no edge moves or
         // branch. Its poll is redundant when that next block still polls.

@@ -5,6 +5,11 @@ use super::native_cycle_vertices;
 use crate::t2::ir::Block;
 use std::collections::{HashMap, HashSet};
 
+fn cycle_vertices(successors: &HashMap<Block, Vec<Block>>) -> HashSet<Block> {
+    let blocks: Vec<_> = successors.keys().copied().collect();
+    native_cycle_vertices(&blocks, |block| successors[&block].iter().copied())
+}
+
 // Exact pre-change definition: for every emitted edge source -> target,
 // select target iff it can reach source. Missing layout keys are dead ends.
 fn original_cycle_vertices(successors: &HashMap<Block, Vec<Block>>) -> HashSet<Block> {
@@ -49,7 +54,7 @@ fn exhaustive_directed_graphs_match_original_poll_membership() {
                 })
                 .collect();
             assert_eq!(
-                native_cycle_vertices(&successors),
+                cycle_vertices(&successors),
                 original_cycle_vertices(&successors),
                 "n={n}, adjacency mask={mask:#x}"
             );
@@ -78,25 +83,27 @@ fn sparse_disconnected_irreducible_and_missing_layout_targets_match() {
         (Block(100), vec![]),
     ]);
     let expected = HashSet::from([a, b, d, e, f]);
-    assert_eq!(native_cycle_vertices(&successors), expected);
+    assert_eq!(cycle_vertices(&successors), expected);
     assert_eq!(original_cycle_vertices(&successors), expected);
 
     // Removing a layout block makes all edges to it dead ends. Its old
     // adjacency must not be followed even if its numeric handle remains valid.
     successors.remove(&d);
     let expected = HashSet::from([a, b, f]);
-    assert_eq!(native_cycle_vertices(&successors), expected);
+    assert_eq!(cycle_vertices(&successors), expected);
     assert_eq!(original_cycle_vertices(&successors), expected);
+
+    for targets in [vec![], vec![outside], vec![outside, f, f]] {
+        let single = HashMap::from([(f, targets)]);
+        assert_eq!(cycle_vertices(&single), original_cycle_vertices(&single));
+    }
 
     // A nontrivial SCC whose vertices have no self-loop must all be kept,
     // including vertices reached from different entries into the component.
     let irreducible = HashMap::from([(a, vec![b, c]), (b, vec![c]), (c, vec![b, d]), (d, vec![b])]);
+    assert_eq!(cycle_vertices(&irreducible), HashSet::from([b, c, d]));
     assert_eq!(
-        native_cycle_vertices(&irreducible),
-        HashSet::from([b, c, d])
-    );
-    assert_eq!(
-        native_cycle_vertices(&irreducible),
+        cycle_vertices(&irreducible),
         original_cycle_vertices(&irreducible)
     );
 }
@@ -116,9 +123,9 @@ fn long_graphs_use_an_iterative_traversal_and_keep_every_cycle_vertex() {
             )
         })
         .collect();
-    assert!(native_cycle_vertices(&successors).is_empty());
+    assert!(cycle_vertices(&successors).is_empty());
     successors.get_mut(&Block(N - 1)).unwrap().push(Block(0));
-    let cyclic = native_cycle_vertices(&successors);
+    let cyclic = cycle_vertices(&successors);
     assert_eq!(cyclic.len(), N as usize);
     assert!((0..N).all(|i| cyclic.contains(&Block(i))));
 }
