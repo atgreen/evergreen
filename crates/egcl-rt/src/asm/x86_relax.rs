@@ -64,6 +64,21 @@ impl Asm {
         let branches = &self.relaxable_branches;
         let mut short = vec![false; branches.len()];
         let mut branch_fixups = Vec::with_capacity(branches.len());
+        // Emission appends both records in site order. Merge that common case
+        // once rather than searching every fixup for every branch. Preserve
+        // the old search for noncanonical internal records, including duplicate
+        // branch sites, so ordering alone does not change their acceptance.
+        let ordered = self
+            .fixups
+            .windows(2)
+            .all(|pair| pair[0].site <= pair[1].site)
+            && branches.windows(2).all(|pair| {
+                pair[0]
+                    .0
+                    .checked_add(pair[0].1)
+                    .is_some_and(|end| end <= pair[1].0)
+            });
+        let mut next_fixup = 0;
         for &(start, size) in branches {
             // Consult final bytes, including deliberate condition-code patches.
             match size {
@@ -76,11 +91,23 @@ impl Asm {
                 _ => return None,
             }
             let site = start.checked_add(size - 4)?;
-            let mut matches = self
-                .fixups
+            let (begin, end) = if ordered {
+                while next_fixup < self.fixups.len() && self.fixups[next_fixup].site < site {
+                    next_fixup += 1;
+                }
+                let begin = next_fixup;
+                while next_fixup < self.fixups.len() && self.fixups[next_fixup].site == site {
+                    next_fixup += 1;
+                }
+                (begin, next_fixup)
+            } else {
+                (0, self.fixups.len())
+            };
+            let mut matches = self.fixups[begin..end]
                 .iter()
-                .filter(|fx| fx.site == site && matches!(fx.kind, FixupKind::Rel32));
-            branch_fixups.push(matches.next()?);
+                .enumerate()
+                .filter(|(_, fx)| fx.site == site && matches!(fx.kind, FixupKind::Rel32));
+            branch_fixups.push(begin + matches.next()?.0);
             if matches.next().is_some() {
                 return None;
             }
@@ -88,7 +115,10 @@ impl Asm {
         let map = loop {
             let map = OffsetMap::new(self.code.len(), branches, &short)?;
             let mut changed = false;
-            for (i, (&(start, size), fixup)) in branches.iter().zip(&branch_fixups).enumerate() {
+            for (i, (&(start, size), &fixup_index)) in
+                branches.iter().zip(&branch_fixups).enumerate()
+            {
+                let fixup = &self.fixups[fixup_index];
                 if short[i] {
                     continue;
                 }
@@ -125,18 +155,21 @@ impl Asm {
             } else {
                 self.code[start + 1] - 0x10
             });
-            let target = map.translate((*self.labels.get(branch_fixups[i].label.0)?)?)?;
+            let target =
+                map.translate((*self.labels.get(self.fixups[branch_fixups[i]].label.0)?)?)?;
             let displacement = target as i128 - (code.len() as i128 + 1);
             code.push(i8::try_from(displacement).ok()? as u8);
             copied = start + size;
         }
         code.extend_from_slice(self.code.get(copied..)?);
-        for fixup in &self.fixups {
-            if branch_fixups
-                .iter()
-                .enumerate()
-                .any(|(i, branch)| short[i] && std::ptr::eq(*branch, fixup))
-            {
+        let mut shortened_fixups = vec![false; self.fixups.len()];
+        for (&fixup_index, &selected) in branch_fixups.iter().zip(&short) {
+            if selected {
+                shortened_fixups[fixup_index] = true;
+            }
+        }
+        for (fixup, shortened) in self.fixups.iter().zip(shortened_fixups) {
+            if shortened {
                 continue;
             }
             let site = map.translate(fixup.site)?;
@@ -300,6 +333,66 @@ mod tests {
         a.bind(target);
         a.patch_u8(0, 0x90);
         assert!(a.finish_relaxed().is_none());
+    }
+
+    #[test]
+    fn ordered_and_unordered_fixup_records_produce_identical_bytes_and_maps() {
+        let mut a = Asm::new();
+        let base = a.label();
+        let near = a.label();
+        let far = a.label();
+        a.bind(base);
+        for _ in 0..64 {
+            a.jcc(Cc::Ne, near);
+            a.call(far);
+            a.lea_rip_label(9, near);
+            a.relative_i32(far, base);
+        }
+        a.bind(near);
+        a.jmp(base);
+        a.extend_from_slice(&[0x90; 128]);
+        a.bind(far);
+        a.push(0xc3);
+        let length = a.code.len();
+        let mut reordered = a.clone();
+        reordered.fixups.reverse();
+        let (expected, expected_map) = a.finish_relaxed().unwrap();
+        let (actual, actual_map) = reordered.finish_relaxed().unwrap();
+        assert_eq!(actual, expected);
+        for offset in 0..=length + 1 {
+            assert_eq!(actual_map.translate(offset), expected_map.translate(offset));
+        }
+    }
+
+    #[test]
+    fn indexed_fixup_association_preserves_duplicate_and_missing_rejection() {
+        for reverse in [false, true] {
+            let mut a = Asm::new();
+            let target = a.label();
+            a.call(target);
+            a.jcc(Cc::E, target);
+            a.bind(target);
+            let mut duplicate = a.clone();
+            duplicate.fixups.push(duplicate.fixups[1].clone());
+            if reverse {
+                duplicate.fixups.reverse();
+            }
+            assert!(duplicate.finish_relaxed().is_none());
+            a.fixups.remove(1);
+            assert!(a.finish_relaxed().is_none());
+        }
+        // Noncanonical repeated branch records were accepted when neither
+        // branch shortened; retain that behavior rather than skipping a fixup.
+        let mut a = Asm::new();
+        let target = a.label();
+        a.jmp(target);
+        a.extend_from_slice(&[0x90; 128]);
+        a.bind(target);
+        a.relaxable_branches.push(a.relaxable_branches[0]);
+        let legacy = a.clone().finish().unwrap();
+        let (actual, map) = a.finish_relaxed().unwrap();
+        assert_eq!(actual, legacy);
+        assert_eq!(map.translate(actual.len()), Some(actual.len()));
     }
 
     #[cfg(unix)]
