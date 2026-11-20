@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Compile bytecode closure creation in RV64 T1 while preserving captured
+  locations and retained definitions
+  ([#987](https://github.com/atgreen/evergreen/pull/987)).
+
 - With eager FASL compilation enabled, prepare reusable closure templates
   throughout portable loaded function graphs
   ([#986](https://github.com/atgreen/evergreen/pull/986)).
