@@ -170,8 +170,19 @@ impl EmittedTransfer {
             audited_leaf,
             &roots,
         );
+        // The installed T1/T2 owner retains this exact bytecode body. Its shape
+        // is stable across calls, including when a redefinition installs another owner.
+        let fixed_ordinary_child =
+            body.self_call_sites.is_empty() && fixed_tagged_parameters(&body);
+        let lean_root_parameters = !body.variadic
+            && body.min_args == body.arity
+            && body.param_types.iter().all(|ty| ty.is_any());
+        let t1_ordinary_tagbody = !self.is_t2 && configured_t1_ordinary_tagbody(&body);
         Ok(TransferCode {
             executable,
+            fixed_ordinary_child,
+            lean_root_parameters,
+            t1_ordinary_tagbody,
             body,
             _body_roots: roots,
             deopt_metadata: metadata,

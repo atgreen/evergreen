@@ -46,19 +46,11 @@ impl TransferCode {
     /// The ordinary entry offset, when a root activation of this code may use
     /// [`Self::run_ordinary_root`].
     pub(in crate::cli::bytecode) fn lean_root_entry(&self) -> Option<usize> {
-        // Ordinary emission already requires a scope-free body with fixed
-        // tagged parameters; restate the facts this entry relies on.
         self.ordinary_entry.filter(|_| {
-            !self.body.variadic
+            self.lean_root_parameters
                 && (!self.body.has_env
                     || self.native_callable_slot.is_some()
                         && ordinary_outer_capture_body(&self.body))
-                && self.body.min_args == self.body.arity
-                && self
-                    .body
-                    .param_types
-                    .iter()
-                    .all(|ty| matches!(ty, DeclaredType::Any))
                 && self.osr_entries.is_empty()
                 && self.ordinary_root_allowed()
                 && lean_root_enabled()

@@ -825,17 +825,7 @@ pub(super) fn prefer_ordinary_child(code: &NativeCode, function: EgclVal, promot
     let NativeCodeStorage::Mapped(mapped) = &code._storage else {
         return false;
     };
-    !mapped.needs_recompile()
-        && fixed_ordinary_child_shape(code)
-        && mapped.lean_root_entry().is_some()
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn fixed_ordinary_child_shape(code: &NativeCode) -> bool {
-    code.body.as_ref().is_some_and(|body| {
-        super::native_transfer_entry::fixed_tagged_parameters(body)
-            && body.self_call_sites.is_empty()
-    })
+    !mapped.needs_recompile() && mapped.fixed_ordinary_child && mapped.lean_root_entry().is_some()
 }
 
 /// What `warm` would enter for this cell when it has a lean ordinary root.
@@ -889,7 +879,7 @@ pub(super) unsafe fn lean_native_target(
         if !t1_ordinary_child_enabled() {
             return decline(Reason::SelectorT1Disabled);
         }
-        if !fixed_ordinary_child_shape(code) {
+        if !mapped.fixed_ordinary_child {
             return decline(Reason::SelectorT1Shape);
         }
         if *promote && promotion_due(*function) {

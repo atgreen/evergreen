@@ -361,6 +361,12 @@ pub(super) struct TransferCode {
     executable: ExecutableOwner,
     frame_entry: Option<usize>,
     pub(super) ordinary_entry: Option<usize>,
+    /// Fixed positional slots and no self-calls on this installed body.
+    pub(super) fixed_ordinary_child: bool,
+    /// The body can receive the original arguments at a lean root entry.
+    lean_root_parameters: bool,
+    /// T1 must service this body's local control and loop heat in a managed frame.
+    t1_ordinary_tagbody: bool,
     /// `ordinary_entry` preceded by its stack check (bliss-gg3i1.7.15.10.1).
     ordinary_lean_entry: Option<usize>,
     ordinary_stack_required: Option<usize>,
@@ -1110,7 +1116,7 @@ impl TransferCode {
     /// body's loops still sample heat and may OSR to T2, which only the
     /// general activation services (bliss-gg3i1.7.15.10.7).
     pub(super) fn ordinary_root_allowed(&self) -> bool {
-        self.is_t2 || !t1_ordinary_tagbody_body(&self.body)
+        !self.t1_ordinary_tagbody || t1_tagbody_mapped_for_test()
     }
 
     pub(super) fn mapped_entry(&self) -> Option<*const u8> {
@@ -2624,11 +2630,14 @@ fn t1_tagbody_mapped_for_test() -> bool {
 /// entry beside its mapped one instead of staying a mapped-only tier until
 /// T2 promotion. `EGCL_T1_ORDINARY_TAGBODY=0` keeps such bodies mapped-only.
 pub(super) fn t1_ordinary_tagbody_body(body: &BytecodeFunction) -> bool {
+    !t1_tagbody_mapped_for_test() && configured_t1_ordinary_tagbody(body)
+}
+
+fn configured_t1_ordinary_tagbody(body: &BytecodeFunction) -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("EGCL_T1_ORDINARY_TAGBODY").is_none_or(|value| value != "0")
-    }) && !t1_tagbody_mapped_for_test()
-        && !body.has_env
+    }) && !body.has_env
         && slot_parameters(body, false)
         && body.code.iter().any(|op| {
             matches!(

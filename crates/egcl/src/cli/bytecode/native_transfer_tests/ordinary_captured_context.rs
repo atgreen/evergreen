@@ -79,6 +79,37 @@ pub(in crate::cli::bytecode) fn install_automatic(function: EgclVal) -> Rc<Nativ
 
 #[test]
 #[ignore = "requires a platform-supported native segment transition"]
+fn captured_root_selection_respects_mapped_values_on_the_installed_owner() {
+    let _lock = crate::cli::heap_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut env = Env::new(false);
+    egcl_rt::rooted_ref!(_env = &mut env);
+    let body = template("((values ordinary-native-cell next))", &env);
+    egcl_rt::rooted!(_body = ActiveBytecodeRoot::new(&body));
+    egcl_rt::rooted!(function = closure(&body, EgclVal::from_fixnum(11), &mut env));
+    let code = install(*function);
+    let NativeCodeStorage::Mapped(owner) = &code._storage else {
+        panic!("expected the installed T2 owner")
+    };
+    let entry = owner.lean_root_entry().expect("ordinary captured entry");
+    {
+        let _mapped = native_transfer_entry::MappedValuesForTest::new();
+        assert_eq!(owner.lean_root_entry(), None);
+    }
+    assert_eq!(owner.lean_root_entry(), Some(entry));
+    native_transfer_entry::take_ordinary_lexical_leaf_hits_for_test();
+    assert_eq!(
+        owner
+            .run_callable(*function, &[EgclVal::from_fixnum(22)], &mut env)
+            .unwrap(),
+        EgclVal::from_fixnum(11)
+    );
+    assert!(native_transfer_entry::take_ordinary_lexical_leaf_hits_for_test() > 0);
+}
+
+#[test]
+#[ignore = "requires a platform-supported native segment transition"]
 fn ordinary_captured_instances_share_code_without_sharing_lexical_cells() {
     let _lock = crate::cli::heap_test_lock()
         .lock()
