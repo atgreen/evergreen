@@ -143,7 +143,7 @@ fn standard_delegate(method: &MethodDef, operation: Operation, env: &Env) -> boo
 /// method is a pure standard delegate. Filter on the CLASS argument alone:
 /// the remaining arguments could have EQL/custom slot-definition specializers.
 /// Declining conservatively for those retains their full dispatch semantics.
-/// Custom-metaclass instances always use the MOP, even without overrides.
+/// A metaclass that does not inherit from STANDARD-CLASS always uses the MOP.
 ///
 /// May allocate on a generation miss: callers must root their arguments.
 pub(super) fn pristine(instance: EgclVal, operation: Operation, env: &Env) -> bool {
@@ -159,13 +159,6 @@ pub(super) fn pristine(instance: EgclVal, operation: Operation, env: &Env) -> bo
     let Some(layout) = egcl_stdlib::clos::class_layout_key(class) else {
         return false;
     };
-    let metaclass = egcl_stdlib::clos::class_metaclass(class);
-    if !metaclass.is_nil() {
-        let standard = reader::find_symbol_index("STANDARD-CLASS");
-        if standard.is_none() || egcl_stdlib::class_name(metaclass).symbol_index() != standard {
-            return false;
-        }
-    }
     let generation = GF_DISPATCH_GENERATION.load(AtomicOrdering::Acquire);
     let call_generation = bytecode::direct_call_gen();
     let slot = ((layout >> 4) ^ operation as usize) % 32;
@@ -178,6 +171,22 @@ pub(super) fn pristine(instance: EgclVal, operation: Operation, env: &Env) -> bo
         return entry.yes;
     }
     egcl_rt::rooted!(class = class);
+    // A metaclass that inherits from STANDARD-CLASS gets STANDARD-CLASS's
+    // instance layout. Any method the metaclass adds to an operation below is
+    // applicable to the class and is no standard delegate, so it still sends
+    // access through the MOP (GH #954). Any other metaclass always does.
+    if !standard_class_metaclass(*class) {
+        PRISTINE.with(|cache| {
+            cache[slot].set(Some(Pristine {
+                layout,
+                generation,
+                operation: operation as u8,
+                call_generation,
+                yes: false,
+            }))
+        });
+        return false;
+    }
     let name = operation.key();
     let symbol = EgclVal::from_symbol_index(reader::intern_symbol(&name));
     if !generic_binding::current(&name)
@@ -237,6 +246,22 @@ pub(super) fn pristine(instance: EgclVal, operation: Operation, env: &Env) -> bo
         }))
     });
     yes
+}
+
+/// Whether `class`'s metaclass is STANDARD-CLASS or inherits from it.
+/// Computes the metaclass's precedence list, so it can allocate.
+fn standard_class_metaclass(class: EgclVal) -> bool {
+    egcl_rt::rooted!(metaclass = egcl_stdlib::clos::class_metaclass(class));
+    if metaclass.is_nil() {
+        return true;
+    }
+    let Some(standard) = resolve_sym("STANDARD-CLASS").and_then(egcl_stdlib::find_class) else {
+        return false;
+    };
+    egcl_rt::rooted!(standard = standard);
+    *metaclass == *standard
+        || egcl_stdlib::compute_class_precedence_list(*metaclass)
+            .is_ok_and(|precedence| precedence.contains(&*standard))
 }
 
 fn meta_call(name: &str, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
