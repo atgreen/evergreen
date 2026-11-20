@@ -131,14 +131,21 @@ extern "C" fn null<const C: bool>(x: u64) -> u64 {
 }
 
 extern "C" fn consp<const C: bool>(x: u64) -> u64 {
-    boolean::<C>(EgclVal(x).is_cons())
+    let x = EgclVal(x);
+    if x.is_cons() && maybe_closure_cons(x) {
+        // An interpreter closure is the cons `(EGCL::CLOSURE . id)`, but its
+        // type is FUNCTION; the full builtin decides (bliss-gg3i1.7.21).
+        MISS
+    } else {
+        boolean::<C>(x.is_cons())
+    }
 }
 
 extern "C" fn endp<const C: bool>(x: u64) -> u64 {
     let x = EgclVal(x);
     if x.is_nil() {
         single::<C>(T)
-    } else if x.is_cons() {
+    } else if x.is_cons() && !maybe_closure_cons(x) {
         single::<C>(NIL)
     } else {
         MISS
@@ -149,7 +156,7 @@ extern "C" fn car<const C: bool>(x: u64) -> u64 {
     let x = EgclVal(x);
     if x.is_nil() {
         single::<C>(NIL)
-    } else if x.is_cons() {
+    } else if x.is_cons() && !maybe_closure_cons(x) {
         // SAFETY: a live cons.
         single::<C>(unsafe { (*(x.as_ptr() as *const egcl_rt::object::ConsCell)).car })
     } else {
@@ -161,7 +168,7 @@ extern "C" fn cdr<const C: bool>(x: u64) -> u64 {
     let x = EgclVal(x);
     if x.is_nil() {
         single::<C>(NIL)
-    } else if x.is_cons() {
+    } else if x.is_cons() && !maybe_closure_cons(x) {
         // SAFETY: a live cons.
         single::<C>(unsafe { (*(x.as_ptr() as *const egcl_rt::object::ConsCell)).cdr })
     } else {
