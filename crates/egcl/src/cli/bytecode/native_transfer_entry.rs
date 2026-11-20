@@ -3213,6 +3213,7 @@ fn local_control_op(
             | Instr::LoadLocal(_)
             | Instr::StoreLocal(_)
             | Instr::LoadGlobal(_) | Instr::StoreGlobal(_)
+            | Instr::StructGuard { .. }
             | Instr::Pop
             | Instr::Dup
             | Instr::ClearMv

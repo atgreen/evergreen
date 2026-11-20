@@ -37,6 +37,7 @@ pub mod packages;
 pub mod packed_f64;
 pub mod packed_u8;
 pub mod random_state;
+pub mod struct_guards;
 pub mod symbols;
 /// Runtime OS services for Linux, Windows, and macOS.
 #[cfg_attr(windows, path = "syscall/windows.rs")]
