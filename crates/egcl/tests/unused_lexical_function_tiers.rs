@@ -4,7 +4,7 @@
 use std::process::Command;
 
 const PROGRAM: &str = r#"
-;; EVAL deliberately creates source closures rather than compiled creators.
+;; EVAL creates source closures before lazy expansion examines their namespaces.
 (defparameter *unused-local* (eval
  '(flet ((registration-helper () :unused))
     (macrolet ((advance (x) `(1+ ,x)))
@@ -28,7 +28,8 @@ const PROGRAM: &str = r#"
   (assert (= (funcall *used-local* 5) 16))
   (assert (= (funcall *function-local* 5) 22))
   (assert (= (funcall *macro-local* 5) 28)))
-;; The initial proof intentionally rejects all references, even quoted data.
+;; The unused-namespace proof rejects references, including quoted data.
+;; Captured namespace compilation independently supports these closures.
 (defparameter *recursive-local* (eval
  '(labels ((recursive-helper (n)
              (if (zerop n) 0 (1+ (recursive-helper (1- n))))))
@@ -41,11 +42,21 @@ const PROGRAM: &str = r#"
 (defparameter *quoted-control* (eval
  '(labels ((encoding-helper () '(block encoding-helper))) #'encoding-helper)))
 (dotimes (i 20) (assert (equal (funcall *quoted-control*) '(block encoding-helper))))
+;; A definition-site special binding remains an unsupported namespace capture.
+;; Its dynamic extent has ended: the escaped helper must read the global value.
+(set 'legacy-source-value 31)
+(defparameter *legacy-source-local* (eval
+ '(let ((legacy-source-value 9))
+    (declare (special legacy-source-value))
+    (flet ((legacy-helper (n) (+ n legacy-source-value)))
+      (lambda (n) (legacy-helper n))))))
+(dotimes (i 40) (assert (= 36 (funcall *legacy-source-local* 5))))
+(assert (null (egcl-ext:function-tier *legacy-source-local*)))
 (format t "UNUSED-LEXICAL-FUNCTIONS-OK~%")
 "#;
 
 #[test]
-fn source_closure_ignores_only_proven_unused_definition_site_functions() {
+fn source_closure_preserves_unused_and_captured_namespace_policies() {
     let mut reference = None;
     for (tier, stress) in [
         ("interp", false),
@@ -54,17 +65,43 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
         ("t2", false),
         ("t2", true),
     ] {
-        for disabled in [false, true] {
-            let proof = if tier == "t2" && !disabled {
+        // Independently control unused-namespace erasure and actual capture.
+        for (disabled, captured_disabled) in [(false, false), (true, false), (false, true)] {
+            if captured_disabled && tier != "t2" {
+                continue;
+            }
+            let unused_proof = if tier == "t2" && !disabled {
                 "(loop repeat 200 until (eql 2 (egcl-ext:function-tier *unused-local*))
                    do (funcall *unused-local* 4) (sleep 0.01))
-                 (assert (= 2 (egcl-ext:function-tier *unused-local*)))
-                 (assert (null (egcl-ext:function-tier *recursive-local*)))
-                 (assert (null (egcl-ext:function-tier *quoted-control*)))"
+                 (assert (eql 2 (egcl-ext:function-tier *unused-local*)))"
+            } else if disabled {
+                "(assert (null (egcl-ext:function-tier *unused-local*)))"
             } else {
                 "nil"
             };
-            let program = format!("{PROGRAM}\n{proof}");
+            let captured_proof = if captured_disabled {
+                "(dolist (f (list *used-local* *function-local* *macro-local*
+                                  *recursive-local* *quoted-local* *quoted-control*))
+                   (assert (null (egcl-ext:function-tier f))))"
+            } else if tier == "t2" {
+                "(loop repeat 200
+                   until (and (eql 2 (egcl-ext:function-tier *recursive-local*))
+                              (eql 2 (egcl-ext:function-tier *quoted-control*)))
+                   do (assert (= 4 (funcall *recursive-local* 4)))
+                      (assert (equal '(block encoding-helper) (funcall *quoted-control*)))
+                      (sleep 0.01))
+                 (assert (eql 2 (egcl-ext:function-tier *recursive-local*)))
+                 (assert (eql 2 (egcl-ext:function-tier *quoted-control*)))"
+            } else {
+                "nil"
+            };
+            // Invoke again after installation, preserving all original results.
+            let program = format!(
+                "{PROGRAM}\n{unused_proof}\n{captured_proof}\n\
+                 (assert (= 4 (funcall *recursive-local* 4)))\n\
+                 (assert (equal '(block encoding-helper) (funcall *quoted-control*)))\n\
+                 (assert (= 36 (funcall *legacy-source-local* 5)))"
+            );
             let mut command = Command::new(env!("CARGO_BIN_EXE_egcl"));
             command
                 .args(["--no-init", "--eval", &program])
@@ -77,6 +114,7 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
             for key in [
                 "EGCL_DISABLE_TREE_CLOSURE_EXPANSION",
                 "EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS",
+                "EGCL_DISABLE_CAPTURED_CLOSURE_FUNCTIONS",
                 "EGCL_PROFILING_DISABLED",
                 "EGCL_T2_NO_QUEUE",
                 "EGCL_GC_STRESS",
@@ -96,12 +134,15 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
             if disabled {
                 command.env("EGCL_DISABLE_UNUSED_CLOSURE_FUNCTIONS", "1");
             }
+            if captured_disabled {
+                command.env("EGCL_DISABLE_CAPTURED_CLOSURE_FUNCTIONS", "1");
+            }
             let result = command.output().expect("run source closure regression");
             let stdout = String::from_utf8_lossy(&result.stdout);
             let stderr = String::from_utf8_lossy(&result.stderr);
             assert!(
                 result.status.success(),
-                "tier={tier} disabled={disabled}: {stdout}\n{stderr}"
+                "tier={tier} unused_disabled={disabled} captured_disabled={captured_disabled}: {stdout}\n{stderr}"
             );
             assert!(
                 stdout.contains("UNUSED-LEXICAL-FUNCTIONS-OK"),
@@ -111,7 +152,7 @@ fn source_closure_ignores_only_proven_unused_definition_site_functions() {
                 assert!(
                     stderr.lines().any(|line| line.contains("<lambda>")
                         && line.contains("optimized worker result installed with ")),
-                    "actual native closure installation required: {stderr}"
+                    "optimized closure installation required: {stderr}"
                 );
             }
             if let Some(expected) = &reference {
