@@ -5921,12 +5921,22 @@ impl<'e> Lowerer<'e> {
                         .any(|restart| bf_may_reach_control(&restart.function, blocks, tags))
                 })
             }
-            // Tree-walked forms are not analysed, and a named exit already in
-            // this body keeps the conservative registration it always had.
-            Instr::EvalHost(_)
-            | Instr::MakeClosureEnv(_)
-            | Instr::ReturnFromNamed { .. }
-            | Instr::GoNamed { .. } => true,
+            // A named exit in this body looks its target up by name, as one
+            // in a created closure does (see `bf_may_reach_control`): it can
+            // reach only a block or tag of that name. Leaving an outer block
+            // from inside a loop kept the loop's own tags registered, and the
+            // resulting NamedTag kept the whole body off native code
+            // (bliss-gg3i1.7.24).
+            Instr::ReturnFromNamed { name_idx } => self
+                .names
+                .get(*name_idx as usize)
+                .is_none_or(|name| blocks.contains(&name.as_str())),
+            Instr::GoNamed { name_idx } => self
+                .names
+                .get(*name_idx as usize)
+                .is_none_or(|name| tags.contains(&name.as_str())),
+            // Tree-walked forms are not analysed.
+            Instr::EvalHost(_) | Instr::MakeClosureEnv(_) => true,
             _ => false,
         })
     }
