@@ -1372,6 +1372,21 @@ pub fn symbol_global_cells_are_pristine(idx: u32) -> bool {
 pub fn set_symbol_function(idx: u32, function: EgclVal) {
     read_cell(idx, |s| s.function.store(function.0, Ordering::Release));
     crate::call_table::invalidate(idx);
+    let hook = FUNCTION_CELL_HOOK.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `set_function_cell_hook` stores a nonzero value, a `fn(u32)`.
+        let hook: fn(u32) = unsafe { std::mem::transmute::<usize, fn(u32)>(hook) };
+        hook(idx);
+    }
+}
+
+static FUNCTION_CELL_HOOK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Run `hook` with the symbol index after every write of a global function
+/// cell, so a cache of facts about a definition can drop them when the
+/// function is redefined. The hook must not allocate on the Lisp heap.
+pub fn set_function_cell_hook(hook: fn(u32)) {
+    FUNCTION_CELL_HOOK.store(hook as usize, Ordering::Release);
 }
 
 /// Diagnostic: the raw address of a symbol's pinned `SymbolData` object, or

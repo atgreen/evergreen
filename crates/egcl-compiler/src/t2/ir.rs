@@ -288,6 +288,11 @@ pub enum Opcode {
     /// Exact packed-double layout predicate; never signals or allocates.
     PackedF64P,
     SymbolValue,
+    /// A tagged word at the fixed address in `AuxData::FixnumImm` that no
+    /// binding can shadow: a DEFSTRUCT inline-access guard flag. One load:
+    /// never collects, signals or calls. Effectful only so it is reread where
+    /// the source reads it (a definition can change between reads).
+    GlobalCell,
     /// `#'f` for a global function name — a RUNTIME load of the symbol's
     /// function cell, not a constant: the function may be redefined between
     /// compile and call. Lowered like `SymbolValue`, through a c2i helper

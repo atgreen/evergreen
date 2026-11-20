@@ -1039,6 +1039,7 @@ pub fn emit_framed_ordinary_function_with_self_call_facts(
                 | Opcode::ConstSymbol
                 | Opcode::ConstChar
                 | Opcode::ClearMv
+                | Opcode::GlobalCell
                 // Reads the tuple through the noncollecting MV leaf into
                 // frame words (bliss-gg3i1.7.15.10.4).
                 | Opcode::TakeValuesToLocals

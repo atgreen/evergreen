@@ -1647,6 +1647,7 @@ impl<'a> Builder<'a> {
                 Instr::Const(_)
                 | Instr::LoadLocal(_)
                 | Instr::LoadGlobal(_)
+                | Instr::StructGuard { .. }
                 | Instr::LoadEnvVar(_)
                 | Instr::LoadFunction(_)
                 | Instr::Dup => {
@@ -2667,6 +2668,25 @@ impl<'a> Builder<'a> {
                             Some(fs),
                         );
                     }
+                }
+                Instr::StructGuard { id, .. } => {
+                    let address = egcl_rt::struct_guards::address(*id)
+                        .ok_or(BuildError::Unsupported("struct guard without a flag"))?;
+                    let value = self
+                        .emit(
+                            block,
+                            Opcode::GlobalCell,
+                            vec![],
+                            AuxData::FixnumImm(address as i64),
+                            InstFlags {
+                                effectful: true,
+                                ..Default::default()
+                            },
+                            None,
+                            IRType::TOP,
+                        )
+                        .expect("GlobalCell has a result");
+                    stack.push(value);
                 }
                 Instr::LoadGlobal(sym) => {
                     if let Some(value) = self.inline_options.constant_global(self.root_symbol, *sym)

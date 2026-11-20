@@ -178,6 +178,12 @@ pub enum Instr {
     /// type-checked) value, store it as [`Instr::StructRef`] would read it, and
     /// push the value.
     StructSet { name: u16, slot: u16, hint: u16 },
+    /// Push the inline-access guard flag of DEFSTRUCT function guard symbol
+    /// `sym` (T while DEFSTRUCT's definition stands, else NIL; see
+    /// `egcl_rt::struct_guards`). `id` is this process's dense index for
+    /// `sym`, assigned when the instruction is made or decoded; only `sym` is
+    /// serialized.
+    StructGuard { sym: u32, id: u32 },
     /// DEFSTRUCT predicate body: pop one operand, push T when it is an instance
     /// of the structure named by constant `name` or of one including it.
     StructTypeP { name: u16 },

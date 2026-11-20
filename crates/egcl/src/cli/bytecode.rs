@@ -684,6 +684,7 @@ fn trace_instruction_roots(
             | Instr::LoadFunction(sym)
             | Instr::LoadGlobal(sym)
             | Instr::StoreGlobal(sym)
+            | Instr::StructGuard { sym, .. }
             | Instr::BindSpecial(sym) => *sym,
             _ => continue,
         };
@@ -1249,6 +1250,7 @@ fn closure_body_has_acyclic_owner_lease(body: &BytecodeFunction) -> bool {
         | Instr::LoadFunction(sym)
         | Instr::LoadGlobal(sym)
         | Instr::StoreGlobal(sym)
+        | Instr::StructGuard { sym, .. }
         | Instr::BindSpecial(sym) => !egcl_rt::symbols::is_uninterned(*sym),
         // These instructions retain executable forms/control metadata or can
         // manufacture code edges beyond the immutable constant graph above.
@@ -4946,6 +4948,72 @@ impl<'e> Lowerer<'e> {
         Ok(Some(()))
     }
 
+    /// A call of a DEFSTRUCT reader or predicate that is still DEFSTRUCT's own
+    /// definition performs the access in place: the same opcode the
+    /// function's body would run, without the call. NOTINLINE keeps the call.
+    fn lower_struct_inline_call(&mut self, op: EgclVal, rest: EgclVal) -> LowerResult<Option<()>> {
+        let Some(symbol) = op.symbol_index() else {
+            return Ok(None);
+        };
+        if self_calls::notinline(symbol, &self.inline_policies) {
+            return Ok(None);
+        }
+        let Some(call) = super::struct_inline_call(symbol) else {
+            return Ok(None);
+        };
+        let instr = match call.access {
+            super::StructInlineAccess::Reader { slot, index } => Instr::StructRef {
+                name: self.add_const(call.structure),
+                slot: self.add_const(slot),
+                hint: index,
+            },
+            super::StructInlineAccess::Predicate => Instr::StructTypeP {
+                name: self.add_const(call.structure),
+            },
+            super::StructInlineAccess::Writer { .. } => return Ok(None),
+        };
+        egcl_rt::rooted!(args = list_to_vec(rest));
+        if args.len() != 1 {
+            return Ok(None);
+        }
+        self.lower_expr(args[0])?;
+        self.emit_struct_inline_guarded(call.guard, instr, symbol, 1);
+        Ok(Some(()))
+    }
+
+    /// With the `nargs` operands on the stack: perform `instr` while `guard`
+    /// says DEFSTRUCT's definition stands, else call `function` with them.
+    /// Both arms leave the multiple-value state as a call's single value does.
+    fn emit_struct_inline_guarded(&mut self, guard: u32, instr: Instr, function: u32, nargs: u16) {
+        let Some(id) = egcl_rt::struct_guards::id_for(guard) else {
+            self.emit(Instr::CallNamed {
+                sym: function,
+                nargs,
+            });
+            self.pop_n(nargs);
+            self.push_n(1);
+            return;
+        };
+        self.emit(Instr::StructGuard { sym: guard, id });
+        self.push_n(1);
+        self.emit(Instr::BrIfFalse(0)); // patched
+        let to_call = self.code.len() - 1;
+        self.pop_n(1);
+        self.emit(instr);
+        self.emit(Instr::Br(0)); // patched
+        let to_end = self.code.len() - 1;
+        let call_pc = self.code.len() as u32;
+        self.emit(Instr::CallNamed {
+            sym: function,
+            nargs,
+        });
+        let end_pc = self.code.len() as u32;
+        self.code[to_call] = Instr::BrIfFalse(call_pc);
+        self.code[to_end] = Instr::Br(end_pc);
+        self.pop_n(nargs);
+        self.push_n(1);
+    }
+
     /// A DEFSTRUCT constructor's `(%make-struct 'name v1 .. vn)` with a
     /// literal structure name lowers to MAKE-STRUCT. Any other shape stays a
     /// call.
@@ -5028,6 +5096,11 @@ impl<'e> Lowerer<'e> {
         }
         if !self.closure_fns.contains(local_name)
             && let Some(()) = self.lower_structure_primitive(name, rest)?
+        {
+            return Ok(());
+        }
+        if !self.closure_fns.contains(local_name)
+            && let Some(()) = self.lower_struct_inline_call(op, rest)?
         {
             return Ok(());
         }
@@ -5639,6 +5712,31 @@ impl<'e> Lowerer<'e> {
                     self.emit(Instr::Pop);
                     self.pop_n(1);
                 }
+            } else if let Some((call, writer, mut object)) = self.struct_inline_setf_place(place) {
+                // `(setf (acc obj) v)` for DEFSTRUCT's own untyped writer:
+                // store in place. OBJ is evaluated before V (CLHS 5.1.1.1);
+                // StructSet takes V beneath the instance.
+                egcl_rt::rooted_ref!(_object_root = &mut object);
+                self.lower_expr(object)?;
+                let temp = self.alloc_slot("__setf_struct__");
+                self.emit(Instr::StoreLocal(temp));
+                self.pop_n(1);
+                self.lower_expr(items[2 * i + 1])?;
+                self.emit(Instr::LoadLocal(temp));
+                self.push_n(1);
+                let super::StructInlineAccess::Writer { slot, index } = call.access else {
+                    return Err(Bail);
+                };
+                let instr = Instr::StructSet {
+                    name: self.add_const(call.structure),
+                    slot: self.add_const(slot),
+                    hint: index,
+                };
+                self.emit_struct_inline_guarded(call.guard, instr, writer, 2);
+                if !last {
+                    self.emit(Instr::Pop);
+                    self.pop_n(1);
+                }
             } else if let Some((writer, args)) = self.user_setf_writer_place(place) {
                 // `(setf (f a b) val)` for a user `(defun (setf f) …)` writer:
                 // call the writer as `(writer val a b)` — the new value is the
@@ -5832,6 +5930,42 @@ impl<'e> Lowerer<'e> {
             return None;
         }
         resolve_sym(&super::setf_writer_symbol_name(&accessor_name)).map(|s| s.as_symbol_index())
+    }
+
+    /// Recognise `(acc obj)` where `(setf acc)` is still DEFSTRUCT's untyped
+    /// writer, neither shadowed lexically nor declared NOTINLINE: its record,
+    /// its mangled symbol and the object form.
+    fn struct_inline_setf_place(
+        &self,
+        place: EgclVal,
+    ) -> Option<(super::StructInlineCall, u32, EgclVal)> {
+        if !place.is_cons() {
+            return None;
+        }
+        let (op, rest) = cp(place);
+        let symbol = op.symbol_index()?;
+        if !rest.is_cons() || !cp(rest).1.is_nil() {
+            return None;
+        }
+        // As `function_name_key` spells `(setf ACC)`; nothing here allocates.
+        let setf_key = format!("(SETF {})", sym_name(op));
+        let reader_key = super::lexical_function_name_key(op);
+        if self.local_fns.contains_key(&setf_key)
+            || self.closure_fns.contains(&setf_key)
+            || self.local_fns.contains_key(reader_key.as_str())
+            || self.closure_fns.contains(reader_key.as_str())
+            || self.inline_local_fns.contains_key(reader_key.as_str())
+            || self_calls::notinline(symbol, &self.inline_policies)
+        {
+            return None;
+        }
+        let writer = reader::find_symbol_index(&super::setf_writer_symbol_name(&sym_name(op)))?;
+        let call = super::struct_inline_call(writer)?;
+        matches!(call.access, super::StructInlineAccess::Writer { .. }).then_some((
+            call,
+            writer,
+            cp(rest).0,
+        ))
     }
 
     /// Recognise a `(f a b …)` place whose accessor `f` has a user
@@ -13609,7 +13743,8 @@ const BBU_MAGIC: &[u8; 4] = b"BBU\0";
 // 0x0305: heap lexical environments (Backpack): MAKE_ENV 0x4c, ENV_REF 0x4d,
 // ENV_SET 0x4e, CLOSURE_ENV 0x4f, MAKE_ENV_CLOSURE 0x50. Older units carry
 // only the name-keyed frame opcodes and still load.
-const BBU_BYTECODE_VERSION: u16 = 0x0305;
+// 0x0306: STRUCT_GUARD 0x52, the guard of an inlined DEFSTRUCT accessor call.
+const BBU_BYTECODE_VERSION: u16 = 0x0306;
 const BBU_FUNCTION_NAME_REF: u32 = 1 << 31;
 mod array_constants;
 mod make_load_form;
@@ -14378,7 +14513,7 @@ fn bbu_instr_len(i: &Instr) -> Option<usize> {
     Some(match i {
         Instr::Const(_) => 5,
         Instr::LoadLocal(_) | Instr::StoreLocal(_) => 3,
-        Instr::LoadGlobal(_) | Instr::StoreGlobal(_) => 5,
+        Instr::LoadGlobal(_) | Instr::StoreGlobal(_) | Instr::StructGuard { .. } => 5,
         Instr::LoadFunction(_) => 5,
         Instr::BindSpecial(_) => 5,
         Instr::UnbindSpecial(_) => 3,
@@ -14534,6 +14669,11 @@ fn serialize_bbu_function(
             }
             Instr::LoadGlobal(sym) => {
                 put_u8(&mut code, 0x07);
+                let cp = traced_symbol_by_index(pool, *sym)?;
+                put_u32(&mut code, cp);
+            }
+            Instr::StructGuard { sym, .. } => {
+                put_u8(&mut code, 0x52);
                 let cp = traced_symbol_by_index(pool, *sym)?;
                 put_u32(&mut code, cp);
             }
@@ -16850,6 +16990,7 @@ fn validate_bbu_lexical_operands(
             0x4c if version >= 0x0305 => 2,
             0x4f if version >= 0x0305 => 0,
             0x50 if version >= 0x0305 => 6,
+            0x52 if version >= 0x0306 => 4,
             0x01 | 0x07 | 0x08 | 0x09 | 0x1c | 0x15 | 0x18 | 0x19 | 0x1a | 0x1f | 0x3f | 0x40
             | 0x2a | 0x46 | 0x47 => 4,
             0x02 | 0x03 | 0x1d | 0x13 | 0x10 | 0x42 => 2,
@@ -17777,6 +17918,12 @@ fn decode_bbu_function(
             0x02 => Instr::LoadLocal(cursor.u16()?),
             0x03 => Instr::StoreLocal(cursor.u16()?),
             0x07 => Instr::LoadGlobal(bbu_symbol(constants, cursor.u32()?)?),
+            0x52 if bytecode_version >= 0x0306 => {
+                let sym = bbu_symbol(constants, cursor.u32()?)?;
+                let id = egcl_rt::struct_guards::id_for(sym)
+                    .ok_or_else(|| bbu_error("struct guard table full"))?;
+                Instr::StructGuard { sym, id }
+            }
             0x08 => Instr::StoreGlobal(bbu_symbol(constants, cursor.u32()?)?),
             0x09 => Instr::LoadFunction(bbu_symbol(constants, cursor.u32()?)?),
             0x1c => Instr::BindSpecial(bbu_symbol(constants, cursor.u32()?)?),
@@ -20033,6 +20180,7 @@ fn eliminate_self_tail_calls(func: &mut BytecodeFunction, self_sym: u32) -> bool
             Instr::Const(_)
             | Instr::LoadLocal(_)
             | Instr::LoadGlobal(_)
+            | Instr::StructGuard { .. }
             | Instr::LoadFunction(_) => (0, 1),
             Instr::StoreLocal(_) | Instr::Pop => (1, 0),
             Instr::ClearMv => (0, 0),
@@ -20248,6 +20396,7 @@ fn verified_operand_stack_depths(func: &BytecodeFunction) -> Result<Vec<Option<u
             Instr::Const(_)
             | Instr::LoadLocal(_)
             | Instr::LoadGlobal(_)
+            | Instr::StructGuard { .. }
             | Instr::LoadFunction(_)
             | Instr::EvalHost(_)
             | Instr::LoadEnvVar(_)
@@ -22615,6 +22764,9 @@ fn run_loop(acts: &mut Vec<Activation>, env: &mut Env) -> Result<EgclVal, EgclEr
                         )?;
                     }
                 }
+            }
+            Instr::StructGuard { id, .. } => {
+                acts[top_idx].push_op(egcl_rt::struct_guards::get(id));
             }
             Instr::StoreGlobal(sym) => {
                 let s = EgclVal::from_symbol_index(sym);
@@ -25372,6 +25524,31 @@ extern "C" fn c2i_call_builtin_regs(
     c2i_call_builtin_impl(idx_and_sym, n, storage.as_ptr(), baked_gen)
 }
 
+/// The structure layout T2 compiles an inline access against, in the
+/// compiler's terms (see `egcl_stdlib::struct_inline_layout`).
+#[cfg(not(egcl_no_t2))]
+fn struct_inline_layout(
+    name: u32,
+    slot: Option<u32>,
+    hint: u16,
+) -> Option<egcl_compiler::t2::emit::StructInlineLayout> {
+    let layout = egcl_stdlib::struct_inline_layout(
+        EgclVal::from_symbol_index(name),
+        slot.map(EgclVal::from_symbol_index),
+        usize::from(hint),
+    )?;
+    Some(egcl_compiler::t2::emit::StructInlineLayout {
+        wrapper: layout.wrapper as u64,
+        state_offset: u8::try_from(layout.state_offset).ok()?,
+        current: layout.current,
+        storage_offset: u8::try_from(layout.storage_offset).ok()?,
+        index: match layout.index {
+            Some(index) => Some(u32::try_from(index).ok()?),
+            None => None,
+        },
+    })
+}
+
 /// Install the direct-builtin hooks into the T2 emitter. The builtin table
 /// lives in this crate, which depends on egcl-compiler, so the compiler cannot
 /// reach it directly (bliss-x5y.27).
@@ -25394,6 +25571,7 @@ pub(super) fn install_direct_builtin_hooks() {
             reference: c2i_struct_ref as extern "C" fn(u64, u64, u64) -> u64 as usize as u64,
             set: c2i_struct_set as extern "C" fn(u64, u64, u64, u64) -> u64 as usize as u64,
             typep: c2i_struct_typep as extern "C" fn(u64, u64) -> u64 as usize as u64,
+            layout: super::struct_inline_enabled().then_some(struct_inline_layout as _),
         },
     );
     #[cfg(not(egcl_no_t2))]
@@ -31457,6 +31635,15 @@ fn emit_native(
             // to EvalHost, which T1 accepted and T2 rejected, so moving to
             // LoadFunction without this arm would merely move the cap from T2
             // down to T1 (measured: deriv fell back to T0 and got slower).
+            Instr::StructGuard { id, .. } => {
+                let Some(address) = egcl_rt::struct_guards::address(*id) else {
+                    decline_t1!("struct guard {id} has no flag");
+                };
+                c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64 (flag address)
+                c.extend_from_slice(&address.to_le_bytes());
+                c.extend_from_slice(&[0x48, 0x8B, 0x00]); // mov rax, [rax]
+                push_rax(&mut c);
+            }
             Instr::LoadFunction(sym) => {
                 c.extend_from_slice(&[0xBF]); // mov edi, imm32 (sym)
                 c.extend_from_slice(&sym.to_le_bytes());
