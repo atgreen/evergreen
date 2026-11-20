@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Calling a method whose lambda list has `&rest` or `&key` is about 13x
+  faster (about 35 µs to 2.7–3.6 µs) when its body never uses
+  CALL-NEXT-METHOD or NEXT-METHOD-P
+  ([#1020](https://github.com/atgreen/evergreen/pull/1020)).
+
 - Instances of a metaclass that inherits from `STANDARD-CLASS` get direct
   slot access again: a read no longer searches `CLASS-SLOTS`, and costs about
   5 µs instead of 186–920 µs

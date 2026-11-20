@@ -11830,6 +11830,63 @@ fn rename_special_parameters(
 /// Leading declarations move into the LET*, where they apply to the
 /// defaulted bindings; a docstring is dropped. A body that declares anything
 /// SPECIAL is left alone, as for [`optional_entry_prologue`].
+/// A lambda-list default whose evaluation runs no code: a literal fixnum,
+/// character, single-float, NIL, T, keyword, or a QUOTE of one of these or a
+/// symbol.
+fn immediate_default(form: EgclVal) -> bool {
+    form.is_fixnum()
+        || form.is_character()
+        || form.is_single_float()
+        || form.is_nil()
+        || form == T
+        || (form.is_symbol() && super::sym_name_rc(form).starts_with("KEYWORD:"))
+        || (form.is_cons()
+            && cp(form).0.is_symbol()
+            && super::sym_name_rc(cp(form).0).as_ref() == "QUOTE"
+            && cp(form).1.is_cons()
+            && cp(cp(form).1).1.is_nil()
+            && {
+                let quoted = cp(cp(form).1).0;
+                quoted.is_fixnum()
+                    || quoted.is_character()
+                    || quoted.is_single_float()
+                    || quoted.is_symbol()
+            })
+}
+
+/// Whether binding the variadic lambda list `params_form` can run no code:
+/// every `&optional`, `&key` and `&aux` init form is absent or
+/// [`immediate_default`]. `&rest` and keyword parsing run none.
+/// [`key_default_prologue`] has already moved computed `&key` defaults into
+/// the body, where lowering sees them.
+fn variadic_binding_runs_no_code(params_form: EgclVal) -> bool {
+    if !list_tail(params_form).is_nil() {
+        return false;
+    }
+    for p in list_to_vec(params_form) {
+        if p.is_symbol() {
+            let name = super::sym_name_rc(p);
+            if name.starts_with('&')
+                && !matches!(
+                    name.as_ref(),
+                    "&OPTIONAL" | "&REST" | "&BODY" | "&KEY" | "&ALLOW-OTHER-KEYS" | "&AUX"
+                )
+            {
+                return false;
+            }
+            continue;
+        }
+        if !p.is_cons() {
+            return false;
+        }
+        let items = list_to_vec(p);
+        if items.get(1).is_some_and(|form| !immediate_default(*form)) {
+            return false;
+        }
+    }
+    true
+}
+
 fn key_default_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal, EgclVal)> {
     // An earlier rename may have declined because a default needs a live
     // dynamic binding. Moving that default past the remaining special
@@ -11852,26 +11909,7 @@ fn key_default_prologue(params_form: EgclVal, body: EgclVal) -> Option<(EgclVal,
     {
         return None;
     }
-    let immediate = |form: EgclVal| {
-        form.is_fixnum()
-            || form.is_character()
-            || form.is_single_float()
-            || form.is_nil()
-            || form == T
-            || (form.is_symbol() && super::sym_name_rc(form).starts_with("KEYWORD:"))
-            || (form.is_cons()
-                && cp(form).0.is_symbol()
-                && super::sym_name_rc(cp(form).0).as_ref() == "QUOTE"
-                && cp(form).1.is_cons()
-                && cp(cp(form).1).1.is_nil()
-                && {
-                    let quoted = cp(cp(form).1).0;
-                    quoted.is_fixnum()
-                        || quoted.is_character()
-                        || quoted.is_single_float()
-                        || quoted.is_symbol()
-                })
-    };
+    let immediate = immediate_default;
     // Every variable the lambda list binds, in order, for the scope check.
     let mut bound: Vec<(usize, String)> = Vec::new();
     for (index, &p) in params.iter().enumerate() {
@@ -12871,7 +12909,11 @@ fn compile_function_forcing_boxed(
         }
     }
 
-    if variadic && optional_required.is_none() {
+    // A variadic binder that evaluates default forms may run code the
+    // lowering never sees, such as a default calling CALL-NEXT-METHOD.
+    // Without such forms (`&rest`, plain `&key`) the method body's own
+    // lowering is the complete record of its context use (GH #958).
+    if variadic && optional_required.is_none() && !variadic_binding_runs_no_code(*params_form) {
         method_context_use::unknown();
     }
     let mut lo = Lowerer::new(env);
