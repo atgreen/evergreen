@@ -6,12 +6,13 @@
 
 use std::path::{Path, PathBuf};
 
+use egcl_rt::error::EgclError;
 use egcl_rt::value::{EgclVal, NIL};
 use egcl_stdlib::pathnames::register_string;
 use egcl_stdlib::streams::{
     ExternalFormat, IF_DOES_NOT_EXIST_CREATE_VAL, IF_EXISTS_APPEND_VAL, IF_EXISTS_RENAME_VAL,
     IF_EXISTS_SUPERSEDE_VAL, StreamDirection, close, make_lisp_string, make_lisp_string_fresh,
-    open, stream_write_string,
+    open, stream_finish_output, stream_write_string,
 };
 
 fn scratch_dir(name: &str) -> PathBuf {
@@ -495,4 +496,126 @@ fn superseding_a_fifo_keeps_a_single_write_through_open() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn flushed_output(path: &Path, direction: StreamDirection, if_exists: EgclVal) -> EgclVal {
+    egcl_rt::rooted!(
+        stream = open(
+            lisp_path(path),
+            direction,
+            NIL,
+            if_exists,
+            IF_DOES_NOT_EXIST_CREATE_VAL,
+            ExternalFormat::Utf8,
+        )
+        .unwrap()
+    );
+    egcl_rt::rooted!(text = make_lisp_string("new\n"));
+    stream_write_string(*stream, *text, 0, None).unwrap();
+    stream_finish_output(*stream).unwrap();
+    *stream
+}
+
+#[test]
+fn aborting_with_a_substituted_backup_preserves_all_files() {
+    let dir = scratch_dir("substituted-backup");
+    let path = dir.join("f");
+    let backup = dir.join("f.bak");
+    let saved = dir.join("saved");
+    for direction in [StreamDirection::Output, StreamDirection::Io] {
+        std::fs::write(&path, "old\n").unwrap();
+        egcl_rt::rooted!(stream = flushed_output(&path, direction, IF_EXISTS_RENAME_VAL));
+        std::fs::rename(&backup, &saved).unwrap();
+        std::fs::write(&backup, "independent\n").unwrap();
+        assert!(matches!(close(*stream, true), Err(EgclError::FileError(_))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "independent\n");
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "old\n");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::remove_file(&saved).unwrap();
+    }
+}
+
+#[test]
+fn aborting_with_a_missing_backup_preserves_output() {
+    let dir = scratch_dir("missing-backup");
+    let path = dir.join("f");
+    let backup = dir.join("f.bak");
+    let saved = dir.join("saved");
+    for direction in [StreamDirection::Output, StreamDirection::Io] {
+        std::fs::write(&path, "old\n").unwrap();
+        egcl_rt::rooted!(stream = flushed_output(&path, direction, IF_EXISTS_RENAME_VAL));
+        std::fs::rename(&backup, &saved).unwrap();
+        assert!(matches!(close(*stream, true), Err(EgclError::FileError(_))));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(!backup.exists());
+        assert_eq!(std::fs::read_to_string(&saved).unwrap(), "old\n");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&saved).unwrap();
+    }
+}
+
+#[test]
+fn normal_cleanup_preserves_a_substituted_private_backup() {
+    let dir = scratch_dir("normal-backup-substitution");
+    let path = dir.join("f");
+    let saved = dir.join("saved");
+    // Unix also permits unlink/recreate while the retained identity handle
+    // keeps the old inode alive. Windows exercises rename/replacement.
+    let moves: &[bool] = if cfg!(unix) { &[true, false] } else { &[true] };
+    for &move_original in moves {
+        std::fs::write(&path, "old\n").unwrap();
+        egcl_rt::rooted!(
+            stream = flushed_output(&path, StreamDirection::Output, IF_EXISTS_SUPERSEDE_VAL)
+        );
+        let backups: Vec<_> = names(&dir)
+            .into_iter()
+            .filter(|name| name.starts_with(".f.egcl-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup = dir.join(&backups[0]);
+        if move_original {
+            std::fs::rename(&backup, &saved).unwrap();
+        } else {
+            std::fs::remove_file(&backup).unwrap();
+        }
+        std::fs::write(&backup, "independent\n").unwrap();
+        close(*stream, false).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), "independent\n");
+        if move_original {
+            assert_eq!(std::fs::read_to_string(&saved).unwrap(), "old\n");
+            std::fs::remove_file(&saved).unwrap();
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&backup).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_symlink_write_through_does_not_claim_link_ownership() {
+    let dir = scratch_dir("dangling-write-through");
+    let link = dir.join("link");
+    let target = dir.join("target");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    write_new(
+        &link,
+        StreamDirection::Output,
+        IF_EXISTS_SUPERSEDE_VAL,
+        false,
+    );
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    std::fs::remove_file(&target).unwrap();
+    egcl_rt::rooted!(stream = flushed_output(&link, StreamDirection::Io, IF_EXISTS_SUPERSEDE_VAL));
+    close(*stream, true).unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(names(&dir), ["link", "target"]);
 }

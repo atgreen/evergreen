@@ -3229,6 +3229,30 @@ fn output_path_identity(path: &std::path::Path) -> std::io::Result<OutputIdentit
     }
 }
 
+/// Keep the original inode alive as well as its identity: a removed backup's
+/// file ID must not be reused by an unrelated replacement before cleanup.
+struct BackupFile {
+    path: std::path::PathBuf,
+    identity: OutputIdentity,
+    _identity_handle: std::fs::File,
+}
+
+impl BackupFile {
+    fn verify(&self) -> std::io::Result<()> {
+        if output_path_identity(&self.path)? != self.identity {
+            return Err(std::io::Error::other(
+                "backup no longer names the original file",
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_if_owned(&self) -> std::io::Result<()> {
+        self.verify()?;
+        std::fs::remove_file(&self.path)
+    }
+}
+
 /// CLHS CLOSE: "If stream performs output to a file that was created when the
 /// stream was created, the file is deleted and any previously existing file is
 /// not superseded." OPEN records the file it created and where it moved the
@@ -3236,7 +3260,7 @@ fn output_path_identity(path: &std::path::Path) -> std::io::Result<OutputIdentit
 struct AbortPlan {
     path: std::path::PathBuf,
     /// Where OPEN moved the superseded file.
-    backup: Option<std::path::PathBuf>,
+    backup: Option<BackupFile>,
     /// :RENAME keeps the old file under its new name after a normal close.
     keep_backup: bool,
     output_identity: OutputIdentity,
@@ -3262,6 +3286,14 @@ impl AbortPlan {
         }
         // An abort failure must never let Drop discard the only old copy.
         self.keep_backup = true;
+        // Check recovery authority BEFORE removing even our own output. A
+        // missing/substituted backup must leave all involved paths untouched.
+        if let Some(backup) = &self.backup {
+            backup.verify().map_err(|e| EgclError::FileError(format!(
+                "cannot abort output: original backup {} is unavailable ({e}); output preserved",
+                backup.path.display()
+            )))?;
+        }
         match output_path_identity(&self.path) {
             Ok(current) if current == self.output_identity => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -3278,7 +3310,7 @@ impl AbortPlan {
                 EgclError::FileError(format!(
                     "cannot restore {} from {}: {}",
                     self.path.display(),
-                    backup.display(),
+                    backup.path.display(),
                     e
                 ))
             })?;
@@ -3296,7 +3328,7 @@ impl Drop for AbortPlan {
             && !self.keep_backup
             && self.published
         {
-            let _ = remove_if_present(&backup);
+            let _ = backup.remove_if_owned();
         }
     }
 }
@@ -3314,9 +3346,10 @@ fn remove_if_present(path: &std::path::Path) -> Result<(), EgclError> {
 
 /// Restore without replacing a path another actor created after CLOSE removed
 /// its output. On failure the backup remains available for manual recovery.
-fn restore_backup(backup: &std::path::Path, path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::hard_link(backup, path)?;
-    std::fs::remove_file(backup)
+fn restore_backup(backup: &BackupFile, path: &std::path::Path) -> std::io::Result<()> {
+    backup.verify()?;
+    std::fs::hard_link(&backup.path, path)?;
+    backup.remove_if_owned()
 }
 
 /// Reserve a backup atomically: hard_link fails if the candidate already
@@ -3378,6 +3411,8 @@ fn supersede_file(
     let original_metadata = original
         .metadata()
         .map_err(|e| EgclError::FileError(format!("cannot inspect original file: {e}")))?;
+    let original_identity = output_identity(&original)
+        .map_err(|e| EgclError::FileError(format!("cannot identify original file: {e}")))?;
     let backup = match backup_file(path, keep_backup) {
         Ok(backup) => Some(backup),
         Err(e) if keep_backup => {
@@ -3396,6 +3431,38 @@ fn supersede_file(
             .map(|file| (file, None))
             .map_err(|e| EgclError::FileError(format!("cannot create file: {e}")));
     };
+    // Retain the identity through the backup link before removing the old
+    // output name. Keeping the original inode alive prevents file-ID reuse.
+    let identity_handle = match std::fs::OpenOptions::new()
+        .read(read)
+        .write(true)
+        .open(&backup)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            if output_path_identity(&backup).is_ok_and(|id| id == original_identity) {
+                let _ = std::fs::remove_file(&backup);
+            }
+            return Err(EgclError::FileError(format!(
+                "cannot retain original backup: {e}"
+            )));
+        }
+    };
+    if output_identity(&identity_handle).map_err(|e| EgclError::FileError(e.to_string()))?
+        != original_identity
+    {
+        return Err(EgclError::FileError(
+            "backup changed while opening; original output preserved".into(),
+        ));
+    }
+    let backup = BackupFile {
+        path: backup,
+        identity: original_identity,
+        _identity_handle: identity_handle,
+    };
+    backup
+        .verify()
+        .map_err(|e| EgclError::FileError(e.to_string()))?;
     let permissions = original_metadata.permissions();
     #[cfg(unix)]
     let permissions = {
@@ -3410,7 +3477,7 @@ fn supersede_file(
     drop(original);
     if let Err(e) = std::fs::remove_file(path) {
         // PATH still names the original; discard only our extra link.
-        let _ = std::fs::remove_file(&backup);
+        let _ = backup.remove_if_owned();
         return Err(EgclError::FileError(format!("cannot replace file: {e}")));
     }
     // Do not truncate a new path that appeared after removal of the original.
@@ -3422,7 +3489,7 @@ fn supersede_file(
             let restored = restore_backup(&backup, path);
             return Err(EgclError::FileError(format!(
                 "cannot create file: {e}; original recovery from {}: {}",
-                backup.display(),
+                backup.path.display(),
                 match restored {
                     Ok(()) => "restored".to_owned(),
                     Err(e) => format!("backup retained ({e})"),
@@ -3435,7 +3502,7 @@ fn supersede_file(
     let output_identity = output_identity(&file).map_err(|e| {
         EgclError::FileError(format!(
             "cannot inspect replacement: {e}; original retained at {}",
-            backup.display()
+            backup.path.display()
         ))
     })?;
     let plan = AbortPlan {
@@ -3457,6 +3524,45 @@ fn supersede_file(
         )));
     }
     Ok((file, Some(plan)))
+}
+
+/// A failed initial existence check does not grant ownership of whatever OPEN
+/// later finds. Only O_EXCL/CREATE_NEW success permits CLOSE to delete a file.
+fn create_output_file(
+    path: &std::path::Path,
+    read: bool,
+) -> Result<(std::fs::File, Option<AbortPlan>), EgclError> {
+    match std::fs::OpenOptions::new()
+        .read(read)
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let plan = AbortPlan::created(path, &file)?;
+            Ok((file, Some(plan)))
+        }
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.file_type().is_symlink()) =>
+        {
+            // A dangling symlink is an existing directory entry. Preserve
+            // write-through, without truncating a target that appeared in the
+            // meantime or claiming authority to delete the link/target.
+            std::fs::OpenOptions::new()
+                .read(read)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .map(|file| (file, None))
+                .map_err(|e| EgclError::FileError(format!("cannot open symlink target: {e}")))
+        }
+        Err(e) => Err(EgclError::FileError(format!(
+            "cannot exclusively create output: {e}"
+        ))),
+    }
 }
 
 pub fn open(
@@ -3643,9 +3749,8 @@ fn open_file(
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                let file = std::fs::File::create(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot create file: {}", e)))?;
-                abort_plan = Some(AbortPlan::created(path, &file)?);
+                let (file, plan) = create_output_file(path, false)?;
+                abort_plan = plan;
                 file
             };
             let stream = alloc_stream_with_abort_plan(
@@ -3701,14 +3806,8 @@ fn open_file(
                     return Ok(NIL);
                 }
                 missing_file_policy(if_does_not_exist, &path_str)?;
-                let file = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(path)
-                    .map_err(|e| EgclError::FileError(format!("cannot open file: {}", e)))?;
-                abort_plan = Some(AbortPlan::created(path, &file)?);
+                let (file, plan) = create_output_file(path, true)?;
+                abort_plan = plan;
                 file
             };
             let stream = alloc_stream_with_abort_plan(
@@ -5650,6 +5749,28 @@ pub fn stream_raw_fd(_stream: EgclVal) -> Option<i32> {
 #[cfg(test)]
 mod abort_restore_tests {
     #[test]
+    fn exclusive_creation_never_claims_an_existing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("egcl-exclusive-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        for read in [false, true] {
+            std::fs::write(&path, "appeared before exclusive creation").unwrap();
+            assert!(matches!(
+                super::create_output_file(&path, read),
+                Err(super::EgclError::FileError(_))
+            ));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "appeared before exclusive creation"
+            );
+            assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn dropping_an_unpublished_plan_retains_the_original_backup() {
         let dir =
             std::env::temp_dir().join(format!("egcl-abort-unpublished-{}", std::process::id()));
@@ -5658,7 +5779,7 @@ mod abort_restore_tests {
         let path = dir.join("f");
         std::fs::write(&path, "old").unwrap();
         let (file, plan) = super::supersede_file(&path, false, false).unwrap();
-        let backup = plan.as_ref().unwrap().backup.as_ref().unwrap().clone();
+        let backup = plan.as_ref().unwrap().backup.as_ref().unwrap().path.clone();
         drop(file);
         drop(plan);
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "old");
@@ -5729,9 +5850,15 @@ mod abort_restore_tests {
         let output = dir.join("output");
         std::fs::write(&backup, "original").unwrap();
         std::fs::write(&output, "independent").unwrap();
-        assert!(super::restore_backup(&backup, &output).is_err());
+        let backup_file = super::BackupFile {
+            identity: super::output_path_identity(&backup).unwrap(),
+            _identity_handle: std::fs::File::open(&backup).unwrap(),
+            path: backup.clone(),
+        };
+        assert!(super::restore_backup(&backup_file, &output).is_err());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "original");
         assert_eq!(std::fs::read_to_string(&output).unwrap(), "independent");
+        drop(backup_file);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
