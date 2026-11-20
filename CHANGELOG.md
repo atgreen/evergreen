@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Native closures use fewer instructions to read and update captured lexical
+  variables ([#1016](https://github.com/atgreen/evergreen/pull/1016)).
+
 - The x86-64 JIT assembler spends less CPU time compiling branch-heavy
   functions. In a cross-compile of SBCL’s `sset`, EGCL executed about 5.5%
   fewer instructions and generated identical output
