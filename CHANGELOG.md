@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Natively compiled code reads, writes and tests DEFSTRUCT instances inline
+  instead of calling the accessor: a slot read takes about 6.5 ns instead of
+  36 ns. Redefining an accessor with DEFUN still reaches callers compiled
+  earlier. FASLs now use bytecode version 0x0306, which older EGCL builds
+  cannot load ([#1026](https://github.com/atgreen/evergreen/pull/1026)).
+
 - Calling a method whose lambda list has `&rest` or `&key` is about 13x
   faster (about 35 µs to 2.7–3.6 µs) when its body never uses
   CALL-NEXT-METHOD or NEXT-METHOD-P
