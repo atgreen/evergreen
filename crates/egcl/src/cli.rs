@@ -48,6 +48,11 @@ mod shake;
 mod slot_access;
 pub mod sprof;
 pub mod tw_census;
+
+/// Write the `EGCL_DECLINE_CENSUS` report, if requested (bliss-gg3i1.7.23).
+pub fn decline_census_dump_on_exit() {
+    bytecode::decline_census::dump_on_exit();
+}
 mod type_registry_index;
 use egcl_rt::object::{ComplexData, ConsCell, ObjectHeader, type_id};
 use egcl_rt::runtime::parse_cli as parse_runtime_cli;
