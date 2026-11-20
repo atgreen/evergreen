@@ -6,6 +6,7 @@ use egcl_compiler::t2::emit::TransferCallRequest;
 use egcl_rt::native_transfer::{NativeExit, NativeOutcome};
 use egcl_rt::{Collector, HeapCollector};
 mod backpack_entry;
+mod captured_function_namespace;
 mod catches;
 mod cleanup_ir;
 mod closure_entry;
