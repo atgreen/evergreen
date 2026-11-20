@@ -241,11 +241,7 @@ mod tests {
                 assert_eq!(
                     code[padding],
                     if padding == 126 {
-                        if conditional {
-                            0x75
-                        } else {
-                            0xeb
-                        }
+                        if conditional { 0x75 } else { 0xeb }
                     } else if conditional {
                         0x0f
                     } else {
