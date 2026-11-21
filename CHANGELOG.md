@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Compiled type checks against standard types such as `NULL`, `LIST`,
+  `BOOLEAN`, `(UNSIGNED-BYTE 32)` and `(OR NULL ...)`, including typed
+  DEFSTRUCT slot checks, no longer take the general TYPEP path; a check
+  like `(typep i '(integer 0 1000000))` is about 5x faster, and compiling
+  SBCL's `sset` under EGCL is 8.6% faster
+  ([#1028](https://github.com/atgreen/evergreen/pull/1028)).
+
 - Calling a method whose lambda list has `&rest` or `&key` is about 13x
   faster (about 35 µs to 2.7–3.6 µs) when its body never uses
   CALL-NEXT-METHOD or NEXT-METHOD-P
