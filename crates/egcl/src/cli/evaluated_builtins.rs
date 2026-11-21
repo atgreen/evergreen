@@ -1590,6 +1590,9 @@ fn resolve(name: &str) -> Option<Handler> {
                     "%DECLARATION-TYPEP takes two arguments".into(),
                 ));
             };
+            if let Some(matches) = super::bytecode::quick_typep(*object, *spec) {
+                return Ok(if matches { T } else { NIL });
+            }
             Ok(
                 if declaration_typep_matches(env, *object, *spec, false, 0)? {
                     T
@@ -3803,6 +3806,9 @@ fn resolve(name: &str) -> Option<Handler> {
                 return Err(EgclError::ProgramError(
                     "TYPEP: VALUES and FUNCTION type specifiers are not valid here".into(),
                 ));
+            }
+            if let Some(matches) = super::bytecode::quick_typep(args[0], args[1]) {
+                return Ok(if matches { T } else { NIL });
             }
             typep_matches(env, args[0], args[1]).map(|matches| if matches { T } else { NIL })
         }),

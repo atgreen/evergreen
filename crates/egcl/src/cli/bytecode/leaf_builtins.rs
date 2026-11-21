@@ -514,12 +514,303 @@ extern "C" fn get3<const C: bool>(symbol: u64, indicator: u64, default: u64) -> 
 /// class name is never expanded as a DEFTYPE, so both reach the same
 /// structure test on the general path.
 extern "C" fn structure_typep<const C: bool>(object: u64, name: u64) -> u64 {
-    guarded(
-        || match egcl_stdlib::structure_typep_leaf(EgclVal(object), EgclVal(name)) {
+    guarded(|| {
+        match egcl_stdlib::structure_typep_leaf(EgclVal(object), EgclVal(name))
+            .or_else(|| quick_typep(EgclVal(object), EgclVal(name)))
+        {
             Some(yes) => boolean::<C>(yes),
             None => MISS,
-        },
+        }
+    })
+}
+
+// ── Constant standard type specifiers ──────────────────────────────
+
+/// The standard type names [`quick_typep`] decides, by symbol index.
+struct StandardTypes {
+    t: u32,
+    null: u32,
+    boolean: u32,
+    symbol: u32,
+    cons: u32,
+    list: u32,
+    atom: u32,
+    fixnum: u32,
+    integer: u32,
+    character: u32,
+    structure_object: u32,
+    or: u32,
+    and: u32,
+    not: u32,
+    member: u32,
+    eql: u32,
+    unsigned_byte: u32,
+    signed_byte: u32,
+    r#mod: u32,
+    star: u32,
+}
+
+static STANDARD_TYPES: std::sync::OnceLock<StandardTypes> = std::sync::OnceLock::new();
+
+/// Intern the names once, outside any leaf context: the helper map and the
+/// evaluated TYPEP handlers call this before a leaf can need it.
+pub(in crate::cli) fn init_standard_types() {
+    // EGCL_DISABLE_QUICK_TYPEP leaves the table unset, so every check takes
+    // the general path: the oracle for comparing answers.
+    if std::env::var_os("EGCL_DISABLE_QUICK_TYPEP").is_some() {
+        return;
+    }
+    STANDARD_TYPES.get_or_init(|| {
+        let i = egcl_rt::symbols::intern;
+        StandardTypes {
+            t: i("T"),
+            null: i("NULL"),
+            boolean: i("BOOLEAN"),
+            symbol: i("SYMBOL"),
+            cons: i("CONS"),
+            list: i("LIST"),
+            atom: i("ATOM"),
+            fixnum: i("FIXNUM"),
+            integer: i("INTEGER"),
+            character: i("CHARACTER"),
+            structure_object: i("STRUCTURE-OBJECT"),
+            or: i("OR"),
+            and: i("AND"),
+            not: i("NOT"),
+            member: i("MEMBER"),
+            eql: i("EQL"),
+            unsigned_byte: i("UNSIGNED-BYTE"),
+            signed_byte: i("SIGNED-BYTE"),
+            r#mod: i("MOD"),
+            star: i("*"),
+        }
+    });
+}
+
+/// A value whose type follows from its representation alone: no closure,
+/// function, stream, metaobject handle or instance whose class a type name
+/// could refine.
+fn plain_value(x: EgclVal) -> bool {
+    use egcl_rt::object::type_id;
+    if x.is_fixnum() || x.is_character() || x.is_single_float() || x.is_symbol() {
+        return true;
+    }
+    if x.is_cons() {
+        return !maybe_closure_cons(x);
+    }
+    matches!(
+        egcl_rt::gc::heap_object_type_id(x),
+        Some(
+            type_id::SIMPLE_VECTOR
+                | type_id::SIMPLE_ARRAY
+                | type_id::SIMPLE_BASE_STRING
+                | type_id::SIMPLE_CHARACTER_STRING
+                | type_id::COMPLEX_ARRAY
+                | type_id::BIGNUM
+                | type_id::RATIO
+                | type_id::COMPLEX
+                | type_id::DOUBLE_FLOAT
+                | type_id::HASH_TABLE
+        )
     )
+}
+
+/// `(car . cdr)` of a real cons, read without allocating.
+fn cons_parts(x: EgclVal) -> Option<(EgclVal, EgclVal)> {
+    // SAFETY: a live cons.
+    x.is_cons().then(|| unsafe {
+        let cell = &*(x.as_ptr() as *const egcl_rt::object::ConsCell);
+        (cell.car, cell.cdr)
+    })
+}
+
+/// A lower or upper integer bound of `(INTEGER low high)`: `*`, an integer, or
+/// a one-element list of an integer (exclusive). `None` for anything else.
+fn integer_bound(bound: EgclVal, star: u32, upper: bool) -> Option<Option<i128>> {
+    if bound.is_symbol() && !bound.is_nil() && bound == EgclVal::from_symbol_index(star) {
+        return Some(None);
+    }
+    if let Some(n) = small_integer(bound) {
+        return Some(Some(n));
+    }
+    let (inner, rest) = cons_parts(bound)?;
+    if !rest.is_nil() {
+        return None;
+    }
+    // At most one limb of magnitude, so the step cannot overflow.
+    let n = small_integer(inner)?;
+    Some(Some(if upper { n - 1 } else { n + 1 }))
+}
+
+/// `object` within `[low, high]`, deciding only integers and non-numbers.
+fn integer_range(object: EgclVal, low: Option<i128>, high: Option<i128>) -> Option<bool> {
+    match small_integer(object) {
+        Some(n) => Some(low.is_none_or(|l| n >= l) && high.is_none_or(|h| n <= h)),
+        // A larger bignum needs the general comparison.
+        None if egcl_rt::gc::heap_object_type_id(object)
+            == Some(egcl_rt::object::type_id::BIGNUM) =>
+        {
+            None
+        }
+        // Every other integer is a fixnum or bignum; nothing else is one.
+        None => Some(false),
+    }
+}
+
+/// `(TYPEP object spec)` for the standard type specifiers sset's structure
+/// slot checks and the SBCL compiler's own TYPEPs use most -- NULL, LIST,
+/// SYMBOL, BOOLEAN, fixnum ranges, MEMBER, and OR/AND/NOT of them -- decided
+/// from `object`'s representation without allocating, polling or resolving a
+/// DEFTYPE. `None` defers to the general TYPEP. Standard type names cannot be
+/// redefined (CLHS 11.1.2.1.2), so these answers never go stale; a same-named
+/// symbol of another package is a different index and is not decided here.
+/// The answers equal TYPEP's and %DECLARATION-TYPEP's, which differ only for
+/// FUNCTION types, never decided here.
+pub(in crate::cli) fn quick_typep(object: EgclVal, spec: EgclVal) -> Option<bool> {
+    quick_typep_at(object, spec, STANDARD_TYPES.get()?, 0)
+}
+
+fn quick_typep_at(object: EgclVal, spec: EgclVal, ty: &StandardTypes, depth: u8) -> Option<bool> {
+    if depth > 8 {
+        return None;
+    }
+    if spec.is_symbol() {
+        if spec.is_nil() {
+            return Some(false);
+        }
+        if spec == T {
+            return Some(true);
+        }
+        let name = spec.as_symbol_index();
+        // These two hold for every object, whatever its representation.
+        if name == ty.null {
+            return Some(object.is_nil());
+        }
+        if name == ty.boolean {
+            return Some(object.is_nil() || object == T);
+        }
+        if name == ty.t {
+            return Some(true);
+        }
+        if name == ty.structure_object {
+            if egcl_stdlib::structure_object_leaf(object) {
+                return Some(true);
+            }
+            return plain_value(object).then_some(false);
+        }
+        if !plain_value(object) {
+            return None;
+        }
+        return Some(if name == ty.symbol {
+            object.is_symbol()
+        } else if name == ty.cons {
+            object.is_cons()
+        } else if name == ty.list {
+            object.is_nil() || object.is_cons()
+        } else if name == ty.atom {
+            !object.is_cons()
+        } else if name == ty.fixnum {
+            object.is_fixnum()
+        } else if name == ty.character {
+            object.is_character()
+        } else if name == ty.integer {
+            return integer_range(object, None, None);
+        } else {
+            return None;
+        });
+    }
+    let (head, args) = cons_parts(spec)?;
+    let head = head.symbol_index()?;
+    if head == ty.or || head == ty.and {
+        // OR is true on any true member, AND false on any false one; an
+        // undecided member decides the whole only when no member settles it.
+        let settles = head == ty.or;
+        let mut undecided = false;
+        let mut rest = args;
+        while !rest.is_nil() {
+            let (member, next) = cons_parts(rest)?;
+            match quick_typep_at(object, member, ty, depth + 1) {
+                Some(answer) if answer == settles => return Some(settles),
+                Some(_) => {}
+                None => undecided = true,
+            }
+            rest = next;
+        }
+        return (!undecided).then_some(!settles);
+    }
+    if head == ty.not {
+        let (inner, rest) = cons_parts(args)?;
+        return rest
+            .is_nil()
+            .then(|| quick_typep_at(object, inner, ty, depth + 1))?
+            .map(|a| !a);
+    }
+    if head == ty.member || head == ty.eql {
+        // EQL is EQ for the immediates decided here.
+        if !(object.is_fixnum() || object.is_character() || object.is_symbol()) {
+            return None;
+        }
+        let mut items = args;
+        let mut count = 0;
+        while !items.is_nil() {
+            let (item, next) = cons_parts(items)?;
+            if !(item.is_fixnum() || item.is_character() || item.is_symbol()) {
+                return None;
+            }
+            if item == object {
+                return Some(true);
+            }
+            count += 1;
+            items = next;
+        }
+        return (head == ty.member || count == 1).then_some(false);
+    }
+    let (low, high) = if head == ty.integer {
+        let (low, rest) = match cons_parts(args) {
+            Some(parts) => parts,
+            None if args.is_nil() => (EgclVal::from_symbol_index(ty.star), NIL),
+            None => return None,
+        };
+        let high = match cons_parts(rest) {
+            Some((high, tail)) if tail.is_nil() => high,
+            None if rest.is_nil() => EgclVal::from_symbol_index(ty.star),
+            _ => return None,
+        };
+        (
+            integer_bound(low, ty.star, false)?,
+            integer_bound(high, ty.star, true)?,
+        )
+    } else if head == ty.unsigned_byte || head == ty.signed_byte {
+        let size = match cons_parts(args) {
+            Some((size, tail)) if tail.is_nil() => Some(size),
+            None if args.is_nil() => None,
+            _ => return None,
+        };
+        let bits = match size {
+            None => None,
+            Some(size) if size == EgclVal::from_symbol_index(ty.star) => None,
+            Some(size) if size.is_fixnum() && (1..=120).contains(&size.as_fixnum()) => {
+                Some(size.as_fixnum() as u32)
+            }
+            Some(_) => return None,
+        };
+        match (head == ty.unsigned_byte, bits) {
+            (true, None) => (Some(0), None),
+            (true, Some(bits)) => (Some(0), Some((1i128 << bits) - 1)),
+            (false, None) => (None, None),
+            (false, Some(bits)) => (
+                Some(-(1i128 << (bits - 1))),
+                Some((1i128 << (bits - 1)) - 1),
+            ),
+        }
+    } else if head == ty.r#mod {
+        let (n, tail) = cons_parts(args)?;
+        let n = small_integer(n).filter(|&n| n > 0 && tail.is_nil())?;
+        (Some(0), Some(n - 1))
+    } else {
+        return None;
+    };
+    integer_range(object, low, high)
 }
 
 macro_rules! logical3 {
@@ -640,6 +931,7 @@ type StubPlan = (Vec<(u8, u64)>, Option<(usize, u8)>);
 fn helpers() -> &'static HelperMap {
     static HELPERS: std::sync::OnceLock<HelperMap> = std::sync::OnceLock::new();
     HELPERS.get_or_init(|| {
+        init_standard_types();
         // Neither stub can prove the caller's buffer empty.
         let mut map = HelperMap::new();
         for (name, nargs, helper, primary_only) in table() {

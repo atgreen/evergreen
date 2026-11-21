@@ -4153,6 +4153,13 @@ pub fn structure_typep_leaf(object: EgclVal, name: EgclVal) -> Option<bool> {
     })
 }
 
+/// Whether `object` is an instance of a current DEFSTRUCT structure class, and
+/// so of type STRUCTURE-OBJECT. False also means "not shown": callers decide
+/// other objects themselves. Does not allocate.
+pub fn structure_object_leaf(object: EgclVal) -> bool {
+    current_struct_wrapper(object).is_some()
+}
+
 /// The current structure wrapper of `object` and its [`StructInfo`], or None
 /// when `object` is not an instance, its wrapper is obsolete or absent, or its
 /// class is not a (prefix-laid-out) structure class. Does not allocate.
