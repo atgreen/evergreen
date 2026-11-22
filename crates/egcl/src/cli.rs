@@ -1940,6 +1940,101 @@ fn class_name_symbol(class: EgclVal) -> Option<u32> {
 static STRUCT_ACCESSOR_SLOTS: LazyLock<std::sync::RwLock<HashMap<u32, (EgclVal, EgclVal)>>> =
     LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
+/// A DEFSTRUCT reader or predicate whose global definition is still the one
+/// DEFSTRUCT made, so compiled callers may perform its structure access in
+/// place of calling it, as SBCL's accessor transforms do (CLHS 3.2.2.3).
+///
+/// Compiled callers are not told about a later redefinition, so each inlined
+/// site first reads `guard`, an internal symbol whose global value is T while
+/// the definition stands, and calls the function once it is NIL: a warm
+/// caller sees a later DEFUN of the accessor, as it would without inlining.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StructInlineCall {
+    pub(crate) access: StructInlineAccess,
+    pub(crate) structure: EgclVal,
+    pub(crate) guard: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StructInlineAccess {
+    Reader {
+        slot: EgclVal,
+        index: u16,
+    },
+    Predicate,
+    /// Keyed by the writer's mangled `%SETF-WRITER-` symbol: an untyped
+    /// slot's writer, which stores without checking.
+    Writer {
+        slot: EgclVal,
+        index: u16,
+    },
+}
+
+// Consulted for every named call the bytecode compiler lowers.
+type StructInlineCalls = HashMap<u32, StructInlineCall, egcl_rt::fxhash::FxBuildHasher>;
+
+static STRUCT_INLINE_CALLS: LazyLock<std::sync::RwLock<StructInlineCalls>> = LazyLock::new(|| {
+    // Any later write of the function cell, by DEFUN, (SETF FDEFINITION),
+    // FMAKUNBOUND or DEFSTRUCT itself, retracts the fact until DEFSTRUCT
+    // records it again.
+    egcl_rt::symbols::set_function_cell_hook(|symbol| {
+        let retracted = STRUCT_INLINE_CALLS.write().unwrap().remove(&symbol);
+        if let Some(id) = retracted.and_then(|call| egcl_rt::struct_guards::id_for(call.guard)) {
+            egcl_rt::struct_guards::set(id, false);
+        }
+    });
+    std::sync::RwLock::new(StructInlineCalls::default())
+});
+
+/// Record that `function` was just defined by DEFSTRUCT to perform `access`
+/// on instances of `structure`. Its guard is named for the function and the
+/// access, so a DEFSTRUCT that redefines the function for the same access
+/// revives the callers inlined for it, and any other one leaves them calling.
+fn register_struct_inline_call(function: EgclVal, structure: EgclVal, access: StructInlineAccess) {
+    let Some(index) = function.symbol_index() else {
+        return;
+    };
+    let slot = match access {
+        StructInlineAccess::Reader { slot, .. } | StructInlineAccess::Writer { slot, .. } => {
+            sym_name(slot)
+        }
+        StructInlineAccess::Predicate => String::new(),
+    };
+    // Colons sanitized as for the `%SETF-WRITER-` symbols.
+    let key = format!("{}/{}/{}", sym_name(function), sym_name(structure), slot);
+    let guard = reader::intern_symbol(&format!(
+        "EGCL-INTERNAL::%STRUCT-INLINE-{}",
+        key.replace(':', ".")
+    ));
+    STRUCT_INLINE_CALLS.write().unwrap().insert(
+        index,
+        StructInlineCall {
+            access,
+            structure,
+            guard,
+        },
+    );
+    if let Some(id) = egcl_rt::struct_guards::id_for(guard) {
+        egcl_rt::struct_guards::set(id, true);
+    }
+}
+
+/// The structure access a call to the global function `symbol` performs, when
+/// DEFSTRUCT defined it and nothing has redefined it since.
+pub(crate) fn struct_inline_call(symbol: u32) -> Option<StructInlineCall> {
+    if !struct_inline_enabled() {
+        return None;
+    }
+    STRUCT_INLINE_CALLS.read().unwrap().get(&symbol).copied()
+}
+
+/// `EGCL_DISABLE_STRUCT_INLINE` keeps structure accessors as calls and their
+/// native bodies on the leaf helpers, for comparison and bisection.
+pub(crate) fn struct_inline_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("EGCL_DISABLE_STRUCT_INLINE").is_none())
+}
+
 fn register_struct_accessor(accessor: EgclVal, structure: EgclVal, slot: EgclVal) {
     if let Some(index) = accessor.symbol_index() {
         STRUCT_ACCESSOR_SLOTS
@@ -41924,8 +42019,20 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 ])
             );
             egcl_rt::rooted!(reader = vec_to_list(&[sym("DEFUN"), slot.accessor, *params, *body]));
+            // Make the table (and its hook) exist before DEFUN writes the cell.
+            LazyLock::force(&STRUCT_INLINE_CALLS);
             eval_form(*reader, env)?;
             register_struct_accessor(slot.accessor, *name_sym_r, slot.slot_sym);
+            if let Ok(index) = u16::try_from(index.as_fixnum()) {
+                register_struct_inline_call(
+                    slot.accessor,
+                    *name_sym_r,
+                    StructInlineAccess::Reader {
+                        slot: slot.slot_sym,
+                        index,
+                    },
+                );
+            }
             if !slot.read_only {
                 egcl_rt::rooted!(writer_name = vec_to_list(&[sym("SETF"), slot.accessor]));
                 egcl_rt::rooted!(writer_params = vec_to_list(&[value, obj]));
@@ -41942,6 +42049,20 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                 );
                 let writer = vec_to_list(&[sym("DEFUN"), *writer_name, *writer_params, *body]);
                 eval_form(writer, env)?;
+                if slot.slot_type == T
+                    && let Ok(index) = u16::try_from(index.as_fixnum())
+                    && let Some(writer) =
+                        resolve_sym(&setf_writer_symbol_name(&sym_name(slot.accessor)))
+                {
+                    register_struct_inline_call(
+                        writer,
+                        *name_sym_r,
+                        StructInlineAccess::Writer {
+                            slot: slot.slot_sym,
+                            index,
+                        },
+                    );
+                }
             }
         }
     }
@@ -42210,7 +42331,11 @@ fn eval_defstruct(cdr: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
         };
         egcl_rt::rooted!(pred_body = vec_to_list(&[test, obj, quote(name_sym)]));
         let pred_defun = vec_to_list(&[sym("DEFUN"), *pred_name_r, *pred_params, *pred_body]);
+        LazyLock::force(&STRUCT_INLINE_CALLS);
         eval_form(pred_defun, env)?;
+        if representation.is_none() {
+            register_struct_inline_call(*pred_name_r, name_sym, StructInlineAccess::Predicate);
+        }
     }
 
     // (defun copy-NAME (o) (make-instance 'NAME :slot (accessor o) ...))

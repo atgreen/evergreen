@@ -728,7 +728,7 @@ fn lower_inst(lo: &mut Lowering, inst: Inst) {
             un_or_bin(lo, inst, op::LOAD, defs, uses)
         }
         StringByteLength | StringAsciiCharAt | StringCharOrNil | ArrayReadDiscarded
-        | PackedF64P | TryVecRef | EnvSlotRef | CallableClosureEnv => {
+        | PackedF64P | TryVecRef | EnvSlotRef | CallableClosureEnv | GlobalCell => {
             lo.emit_annotated(inst, op::LOAD, defs, uses)
         }
         // Lowered away before emission (ordinary entry or mapped request).

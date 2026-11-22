@@ -87,7 +87,10 @@ pub use clos::{
     struct_ref_fast, struct_set_fast, struct_typep_fast, structure_instance_typep,
     structure_typep_leaf,
 };
-pub use clos::{StructAllocation, allocate_struct, struct_allocation, struct_init_slot};
+pub use clos::{
+    StructAllocation, StructInlineLayout, allocate_struct, struct_allocation, struct_init_slot,
+    struct_inline_layout,
+};
 pub use conditions::{
     HandlerBinding, RestartSpec, acquire_preallocated_storage_condition, clear_funcall_hook,
     compute_restarts, error_condition, find_restart, handler_bind, handler_bind_fn, handler_case,
