@@ -6122,7 +6122,7 @@ fn resolve(name: &str) -> Option<Handler> {
                         store_generic_lambda_list(name_form, lambda_list);
                     }
                 }
-                if !args[4].is_nil() && name_form.is_symbol() {
+                if !args[4].is_nil() {
                     let lambda_list = stored_generic_lambda_list(name_form).unwrap_or(args[1]);
                     let precedence =
                         parse_argument_precedence_order(name_form, lambda_list, args[3])?;

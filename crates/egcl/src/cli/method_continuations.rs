@@ -99,7 +99,16 @@ pub(super) fn invocation_for_method(
     let (name, _) = method_def_by_id(env, method.method_id).ok_or_else(bad)?;
     egcl_rt::rooted!(methods = env.methods.borrow().get(&name).cloned().unwrap_or_default());
     egcl_rt::rooted!(symbol = generic_name_form_for_key(env, &name));
-    let precedence = egcl_stdlib::clos::argument_precedence_order(*symbol);
+    // A `(setf f)` name form is a cons; its order is on its key's symbol.
+    let precedence = if symbol.is_symbol() {
+        egcl_stdlib::clos::argument_precedence_order(*symbol)
+    } else {
+        egcl_rt::symbols::find_index(&name)
+            .map(|idx| {
+                egcl_stdlib::clos::argument_precedence_order(EgclVal::from_symbol_index(idx))
+            })
+            .unwrap_or_default()
+    };
     egcl_rt::rooted!(invocation = snapshot(&name, &methods, &[], &precedence, env)?);
     let expected = ordered(&invocation, args, env);
     invocation.expected = Arc::new(expected);

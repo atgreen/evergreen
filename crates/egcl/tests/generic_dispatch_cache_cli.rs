@@ -51,7 +51,7 @@ const PROGRAM: &str = r#"
         (list (make-hash-table) '(:other :other :other (:hash :other)))))
 (dotimes (pass 20)
   (dolist (row *gf901-cases*)
-    (assert (equal (gf901-native-probe (first row)) (second row))))
+    (assert (equal (gf901-native-probe (first row)) (second row)))))
 ;; Classification belongs to the retained object, including a public alias
 ;; whose binding is subsequently replaced with a different callable family.
 (setf (fdefinition 'gf901-alias) *gf901-generic*)

@@ -27437,13 +27437,17 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     for v in eval_args(*aargs, env)?.iter() {
                                         args.push(*v);
                                     }
-                                    eval_lambda_call(
+                                    // SETF yields the writer's own return, as
+                                    // for the writers above (bliss-9298).
+                                    result = eval_lambda_call(
                                         env,
                                         params_form,
                                         body,
                                         &args,
                                         Arc::clone(&env.frame),
                                     )?;
+                                    *c = *r2;
+                                    continue;
                                 } else if env_has_setf_generic(env, other) {
                                     // A (setf place) *generic function* (defmethod
                                     // (setf place) …): dispatch it with the new
@@ -27455,7 +27459,11 @@ fn eval_list(mut form: EgclVal, env: &mut Env) -> Result<EgclVal, EgclError> {
                                     }
                                     let function =
                                         EgclVal::from_symbol_index(reader::intern_symbol(&key));
-                                    apply_function(function, &args, env)?;
+                                    // The generic's own return is SETF's value
+                                    // (CLHS 5.1.2.9), as compiled code answers.
+                                    result = apply_function(function, &args, env)?;
+                                    *c = *r2;
+                                    continue;
                                 } else if let Some(slot_name) = accessor_slot_name(env, other) {
                                     egcl_rt::rooted!(tgt = eval_form(tgt_form, env)?);
                                     // Resolve on this instance: unrelated classes can
@@ -42416,9 +42424,13 @@ fn parse_argument_precedence_order(
 /// any earlier one, so redefining a generic without the option restores the
 /// default left-to-right comparison.
 fn store_argument_precedence_order(name_form: EgclVal, order: &[usize]) {
-    if !name_form.is_symbol() {
-        return; // a `(setf f)` name is a cons and carries no plist
-    }
+    // A `(setf f)` name is a cons with no plist. Its order lives on the symbol
+    // its registry key interns, which is the symbol every dispatch path finds
+    // by that key (`find_index("(SETF F)")`), like its other DEFGENERIC options.
+    let Some(holder) = generic_option_holder(name_form) else {
+        return;
+    };
+    egcl_rt::rooted!(holder = holder);
     let Some(indicator) = resolve_sym(egcl_stdlib::clos::ARGUMENT_PRECEDENCE_PROPERTY) else {
         return;
     };
@@ -42426,7 +42438,7 @@ fn store_argument_precedence_order(name_form: EgclVal, order: &[usize]) {
     for position in order.iter().rev() {
         *positions = arena_cons(EgclVal::from_fixnum(*position as i64), *positions);
     }
-    symbol_plist_put(name_form, indicator, *positions);
+    symbol_plist_put(*holder, indicator, *positions);
 }
 
 /// Reorder a method's per-argument specificity distances so that comparing two

@@ -40,10 +40,16 @@ fn legacy_generic_cache_is_normalized_before_exposure_and_preserves_bindings() {
     egcl_rt::symbols::set_symbol_function(name.as_symbol_index(), egcl_rt::value::UNBOUND);
     assert!(generic_binding::undefined("GF800-CACHE"));
     assert!(!generic_binding::current("GF800-CACHE"));
-    assert!(matches!(
-        apply_function(name, &[NIL], &mut env),
-        Err(EgclError::UndefinedFunction(_))
-    ));
+    // The published callable entry attaches a backtrace to the error it
+    // returns; the condition itself must still be UNDEFINED-FUNCTION on NAME.
+    let error = apply_function(name, &[NIL], &mut env).unwrap_err();
+    assert!(
+        matches!(
+            error.without_backtrace(),
+            EgclError::UndefinedFunction(undefined) if *undefined == name
+        ),
+        "{error:?}"
+    );
     assert_eq!(
         apply_function(*function, &[NIL], &mut env).unwrap(),
         resolve_sym(":RETAINED").unwrap()
