@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `EGCL-EXT:EXIT` and `EGCL-EXT:QUIT` are defined. Runs pinned to T0 or the
+  tree-walker map no executable memory. `:ARGUMENT-PRECEDENCE-ORDER` is kept
+  for `(SETF F)` generic functions, an interpreted SETF returns the writer's
+  value, and `COMPILED-FUNCTION` is a built-in class. A compiled function
+  whose type guard keeps failing is now recompiled, so its callers stop
+  deoptimizing on every call
+  ([#1030](https://github.com/atgreen/evergreen/pull/1030)).
+
 - Type checks against a DEFTYPE name, such as a structure slot declared
   `(or index null)`, no longer run the type's expander on every check: its
   expansion is remembered until a DEFTYPE or a new class could change it.

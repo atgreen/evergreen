@@ -768,8 +768,16 @@ mod tests {
             Some("(defun method-context-plain (object) object)"),
         );
     }
+    /// The host-handoff guard in `Lowerer::emit` (EvalHost/MakeClosureEnv
+    /// make the proof Unknown) cannot decide a method proof, because a method
+    /// body never reaches host fallback: the generated helper FLET makes every
+    /// nested lambda lower portably, and the opportunistic lowering -- the only
+    /// one with a host handoff -- cannot compile the generated initializer.
+    /// What the method compiler installs is therefore the portable, completely
+    /// lowered body that the proof covers.
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     #[test]
-    fn user_host_closure_fallback_is_unknown_not_unused() {
+    fn user_closure_in_method_body_never_takes_host_fallback() {
         let _lock = heap_test_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -779,16 +787,31 @@ mod tests {
         egcl_rt::rooted!(body = arena_cons(*expression, NIL));
         let mut metadata = None;
         *body = method_continuations::wrap_body(*body, &mut metadata).unwrap();
-        let scope = Scope::enter(metadata.unwrap());
+        let _scope = Scope::enter(metadata.unwrap());
+        {
+            // Even when every opportunistic lambda is forced to the host, the
+            // non-portable lowering of a method body produces nothing.
+            let _forced = ForceLambdaHostHandoff::enter();
+            assert!(
+                compile_function("(METHOD HOST-CONTEXT)", NIL, *body, &env, false, false).is_none()
+            );
+        }
         let bytecode =
-            compile_function("(METHOD HOST-CONTEXT)", NIL, *body, &env, false, false).unwrap();
+            compile_function("(METHOD HOST-CONTEXT)", NIL, *body, &env, true, false).unwrap();
         assert!(
-            bytecode.code.iter().any(|instruction| matches!(
-                instruction,
-                Instr::EvalHost(_) | Instr::MakeClosureEnv(_)
-            )),
-            "the fixture must exercise actual host fallback"
+            !contains_host_eval(&bytecode),
+            "a method body's user closure must not be handed to the host: {:?}",
+            bytecode.code
         );
-        assert!(!scope.unused());
+        // The two generated helpers plus the user closure, all lowered.
+        assert_eq!(bytecode.nested_functions.len(), 3);
+        assert!(
+            bytecode
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, Instr::MakeClosure { func: 2, .. })),
+            "the user closure must be a portable template: {:?}",
+            bytecode.code
+        );
     }
 }

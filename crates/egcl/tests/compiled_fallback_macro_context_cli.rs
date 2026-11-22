@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later WITH Classpath-exception-2.0
 use std::{fs, path::PathBuf, process::Command};
 
+// RUN-FALLBACK, RUN-MACROLET, RUN-SYMBOLMACROLET and RUN-SHADOW must be
+// retained as source by COMPILE-FILE (BFASL load action 9): that is the path
+// whose local macro scopes are frozen in the compilation package. Their
+// SPECIAL declaration once forced it, but the portable compiler now lowers
+// those bodies, so a nested DEFUN (which it never lowers) keeps them on it.
+// CHECKS asserts that each really has a retained source body.
 const DEFINITIONS: &str = r#"(defpackage :attribute-definition (:use :cl) (:export :block-delete-p))
 (defpackage :attribute-use (:use :cl))
 (in-package :attribute-definition)
@@ -29,17 +35,20 @@ const DEFINITIONS: &str = r#"(defpackage :attribute-definition (:use :cl) (:expo
   (nreverse result)))
 (defun run-fallback (items)
  (declare (special items))
+ (when nil (defun retained-fallback-anchor () nil))
  (let ((result nil))
   (dolist (value items) (push (block-delete-p value) result))
   (nreverse result)))
 (defun run-macrolet (items)
  (declare (special items))
+ (when nil (defun retained-fallback-anchor () nil))
  (let ((result nil))
   (macrolet ((add-result (value) `(push ,value result)))
    (dolist (value items) (add-result (block-delete-p value))))
   (nreverse result)))
 (defun run-symbolmacrolet (items)
  (declare (special items))
+ (when nil (defun retained-fallback-anchor () nil))
  (let ((result nil))
   (symbol-macrolet ((alias items))
    (dolist (value alias) (push (block-delete-p value) result)))
@@ -47,6 +56,7 @@ const DEFINITIONS: &str = r#"(defpackage :attribute-definition (:use :cl) (:expo
 
 (defun run-shadow (items)
  (declare (special items))
+ (when nil (defun retained-fallback-anchor () nil))
  (let ((value (first items)))
   (macrolet ((marker () :local))
    (flet ((block-delete-p (item) (list item :shadowed)))
@@ -68,7 +78,8 @@ const CHECKS: &str = r#"(in-package :attribute-definition)
 (let ((expansion (macroexpand-1 '(attribute-definition:block-delete-p 42))))
  (assert (eq (symbol-package (third expansion)) *package*)))
 #+egcl
-(dolist (name '(attribute-definition::run-macrolet attribute-definition::run-symbolmacrolet))
+(dolist (name '(attribute-definition::run-fallback attribute-definition::run-macrolet
+                attribute-definition::run-symbolmacrolet attribute-definition::run-shadow))
  (assert (egcl::%fn-body (symbol-function name))))
 (in-package :attribute-definition)
 (defmacro block-delete-p (value) `(list ,value '(late-redefinition)))

@@ -42,7 +42,7 @@ fn embedded_quit_preserves_cleanup_and_the_host_process() {
     }
     let path = std::env::temp_dir().join(format!("egcl-embedded-cleanup-{}", std::process::id()));
     let name = quote(path.to_str().unwrap());
-    let code = egcl::run_embedded(&args(format!("(unwind-protect (egcl-ext:quit 7) (with-open-file (out {name} :direction :output :if-exists :supersede :if-does-not-exist :create) (write-string \"cleanup completed\" out)))"))).unwrap();
+    let code = egcl::run_embedded(&args(format!("(unwind-protect (egcl-ext:quit :unix-status 7) (with-open-file (out {name} :direction :output :if-exists :supersede :if-does-not-exist :create) (write-string \"cleanup completed\" out)))"))).unwrap();
     assert_eq!(code, 7);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "cleanup completed");
     std::fs::remove_file(path).unwrap();
@@ -59,7 +59,7 @@ fn real_cleanup_errors_supersede_the_exit_request() {
         return;
     }
     let result = egcl::run_embedded(&args(
-        "(unwind-protect (egcl-ext:quit 7) (error \"cleanup failure\"))".into(),
+        "(unwind-protect (egcl-ext:quit :unix-status 7) (error \"cleanup failure\"))".into(),
     ));
     assert!(result.is_err());
 }
@@ -98,7 +98,7 @@ fn ordinary_cli_quit_still_owns_its_process() {
     const NAME: &str = "ordinary_cli_quit_still_owns_its_process";
     const MARKER: &str = "EGCL_EMBEDDED_EXIT_CASE";
     if std::env::var(MARKER).as_deref() == Ok(NAME) {
-        let _ = egcl::run(&args("(egcl-ext:quit 9)".into()));
+        let _ = egcl::run(&args("(egcl-ext:quit :unix-status 9)".into()));
         panic!("ordinary CLI QUIT returned to its caller");
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())

@@ -134,7 +134,16 @@ fn note_segment_deopt(code: &TransferCode, guard_bcp: u32) {
     // original body; unsupported numeric phases then leave their calls generic.
     // An older suspended activation must not retire its replacement.
     if count >= deopt_blacklist_threshold() {
+        let first_request = !code.needs_recompile();
         code.request_recompile();
+        // A generated ordinary caller enters the descriptor published in its
+        // call cell directly, without consulting this request, so an installed
+        // version would keep failing the same guard on every call. Send those
+        // callers back through checked dispatch, which refreshes the version
+        // (`refresh_installed`) instead of entering it again.
+        if first_request && let Some((symbol, _)) = &installed {
+            egcl_rt::call_table::invalidate(*symbol);
+        }
     }
 }
 

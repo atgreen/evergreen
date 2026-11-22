@@ -1873,6 +1873,8 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
     let sgf_cls = alloc_class_metaobject()
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
+    let cfun_cls = alloc_class_metaobject()
+        .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
     let method_cls = alloc_class_metaobject()
         .ok_or_else(|| EgclError::Internal("GC heap unavailable for a built-in class".into()))?;
     let smethod_cls = alloc_class_metaobject()
@@ -1928,6 +1930,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
         con_cls,
         flt_cls,
         fun_cls,
+        cfun_cls,
         hpo_cls,
         num_cls,
         real_cls,
@@ -1970,6 +1973,7 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
     let con_nm = nm("CONS");
     let flt_nm = nm("FLOAT");
     let fun_nm = nm("FUNCTION");
+    let cfun_nm = nm("COMPILED-FUNCTION");
     let hpo_nm = nm("HEAP-OBJECT");
     let num_nm = nm("NUMBER");
     let real_nm = nm("REAL");
@@ -2144,6 +2148,10 @@ fn initialize_clos(reset: bool) -> Result<(), EgclError> {
             // A forward-referenced class is a CLASS that is not yet any of the
             // three above: nothing has said what its instances look like.
             (frc_nm, frc_cls, vec![class_cls]),
+            // COMPILED-FUNCTION is a FUNCTION subclass (spec 5.3.1); which
+            // objects belong to it is the type predicate's policy, so a method
+            // on it applies to exactly the callables TYPEP accepts.
+            (cfun_nm, cfun_cls, vec![fun_cls]),
             (gf_nm, gf_cls, vec![fun_cls, std_obj]),
             (sgf_nm, sgf_cls, vec![gf_cls]),
             (method_nm, method_cls, vec![std_obj]),

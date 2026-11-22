@@ -11,7 +11,9 @@ const LIBRARY: &str = r##"
 (defmethod documentation ((object documentation-target) (kind (eql 'function)))
   (let ((raw (call-next-method))) (and raw (concatenate 'string "read:" raw))))
 (defmethod (setf documentation) (new (object documentation-target) (kind (eql 'function)))
-  (call-next-method (and new (concatenate 'string "write:" new)) object kind))
+  ;; CLHS 5.1.2.9: a (SETF F) function returns its first argument.
+  (call-next-method (and new (concatenate 'string "write:" new)) object kind)
+  new)
 (defclass documentation-metaclass (standard-class) ())
 (defmethod egcl-mop:validate-superclass ((class documentation-metaclass) (super standard-class)) t)
 (defclass documented-class () () (:metaclass documentation-metaclass))

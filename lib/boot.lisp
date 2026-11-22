@@ -6123,6 +6123,19 @@ sorted by nickname."
   '(egcl::%memory-fence :write))
 (export '(egcl-ext::memory-barrier egcl-ext::load-barrier egcl-ext::store-barrier) :egcl-ext)
 
+;;; R9.16: process exit with a status code. A command-line process exits; an
+;;; embedded world (EGCL:RUN-EMBEDDED) unwinds its root instead, running
+;;; UNWIND-PROTECT cleanups, and reports the first explicit code to its host.
+;;; ABORT and TIMEOUT are accepted for SBCL compatibility; %EXIT already skips
+;;; thread joins in a command-line process.
+(defun egcl-ext::exit (&key (code 0) abort timeout)
+  (declare (ignore abort timeout))
+  (check-type code integer)
+  (egcl::%exit code))
+(defun egcl-ext::quit (&key (unix-status 0) recklessly-p)
+  (egcl-ext::exit :code unix-status :abort recklessly-p))
+(export '(egcl-ext::exit egcl-ext::quit) :egcl-ext)
+
 (export (intern "IO-TIMEOUT" :egcl-ext) :egcl-ext)
 
 (defun egcl-ext::socket-os-error-errno (condition)

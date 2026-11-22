@@ -126,7 +126,17 @@ pub(super) fn mapped_adapter(pc: usize) -> Option<&'static PublishedAdapter> {
         .find(|entry| entry.contains_return(pc))
 }
 
+/// Whether Rust-to-Lisp calls enter through the mapped published entries. A
+/// run pinned below native tiers maps no code and calls the interpreter
+/// directly, as the other targets do until their transfer is activated.
+pub(in crate::cli) fn enabled() -> bool {
+    native_code_permitted()
+}
+
 pub(super) fn entries() -> Option<&'static NativeCallableEntries> {
+    if !enabled() {
+        return None;
+    }
     let entries = ENTRIES
         .get_or_init(|| {
             let entry = |slice| {
