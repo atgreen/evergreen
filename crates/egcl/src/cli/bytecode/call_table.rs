@@ -623,7 +623,9 @@ fn publish_target(state: &State, revision: u64, target: Option<Target>) {
                 promote,
             }) if !super::native_transfer_entry::ordinary_primitives::is_private(state.symbol) => {
                 match &code._storage {
-                    NativeCodeStorage::Mapped(code) => code
+                    // Code awaiting recompilation is entered only through
+                    // checked dispatch, which replaces it first.
+                    NativeCodeStorage::Mapped(code) if !code.needs_recompile() => code
                         .ordinary_descriptor(revision)
                         .map(|descriptor| (descriptor, Rc::clone(code), *function, *promote)),
                     _ => None,
