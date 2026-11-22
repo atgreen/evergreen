@@ -82,16 +82,23 @@ fn agrees_at_every_tier(program: &str, expected: &[&str]) {
 
 /// Assert candidate recognition. This diagnostic precedes final emission and
 /// does not independently prove native installation or kernel execution.
+///
+/// The default T1 -> T2 invocation threshold is 4096 calls, above this
+/// fixture's 4001, and the T2 compile runs on a background worker, so the
+/// threshold is lowered and the worker count pinned: otherwise OCTETS never
+/// reaches the T2 pipeline that runs the fusion pass, and the log line this
+/// test needs is never written.
 #[test]
 fn octet_loop_is_recognized_for_fusion() {
     let program = format!(
         "{DRIVER}
          (dotimes (i 4000) (run 16 0 8 123456789))
-         (format t \"HOT ~a~%}}\" (second (run 16 0 8 123456789)))"
-    )
-    .replace("}}", "");
+         (format t \"HOT ~a~%\" (second (run 16 0 8 123456789)))"
+    );
     let out = Command::new(BIN)
         .args(["--no-init", "--eval", &program])
+        .env("EGCL_T2_THRESHOLD", "40")
+        .env("EGCL_T2_THREADS", "1")
         .env("EGCL_T2_LOG", "stderr")
         .output()
         .expect("run egcl");
@@ -99,7 +106,13 @@ fn octet_loop_is_recognized_for_fusion() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stdout}\n{stderr}");
     assert!(
-        stderr.lines().any(|l| l.contains("octet word stores:")),
+        stdout.lines().any(|l| l.trim() == "HOT 0"),
+        "{stdout}\n{stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.contains("OCTETS: octet word stores: 1")),
         "the loop was not recognized for octet word fusion:\n{stderr}"
     );
 }

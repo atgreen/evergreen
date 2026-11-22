@@ -158,6 +158,18 @@ fn release_forcing_observer() {
     // reach Rust through generated execution-slot checks, not an observer.
     root_publication::OBSERVE.with(|hook| hook.set(None));
 }
+// Since bliss-tudsy (#980) a baseline's idle polls test the execution's poll
+// slot in generated code, as final-tier polls do, and skip the runtime call
+// when nothing is pending; a forcing observer no longer reaches them. So T1,
+// like T2, samples once through the observer and then must reach Rust again
+// through the generated check for the request posted after that poll.
+fn sample_then_release() {
+    let before = OWNER_VISITS.with(Cell::get);
+    sample_leaf();
+    if OWNER_VISITS.with(Cell::get) > before {
+        root_publication::OBSERVE.with(|hook| hook.set(None));
+    }
+}
 fn post_after_poll() {
     if root_publication::OBSERVE.with(|hook| hook.get().is_some()) {
         return;
@@ -198,12 +210,13 @@ fn pending_samples_reach_call_free_native_polls_and_keep_actual_tier() {
         let _recording = Recording::begin();
         EXPECTED_OWNER.with(|owner| owner.set(std::ptr::from_ref(code) as usize));
         EXPECTED_CALLER.with(|owner| owner.set(0));
-        if t2 {
-            root_publication::OBSERVE.with(|hook| hook.set(Some(release_forcing_observer)));
-            root_publication::OBSERVE_AFTER.with(|hook| hook.set(Some(post_after_poll)));
+        let observer: fn() = if t2 {
+            release_forcing_observer
         } else {
-            root_publication::OBSERVE.with(|hook| hook.set(Some(sample_leaf)));
-        }
+            sample_then_release
+        };
+        root_publication::OBSERVE.with(|hook| hook.set(Some(observer)));
+        root_publication::OBSERVE_AFTER.with(|hook| hook.set(Some(post_after_poll)));
         assert_eq!(
             native_transfer_entry::with_ordinary_entry_hook_for_test(
                 crate::cli::sprof::request_for_test,

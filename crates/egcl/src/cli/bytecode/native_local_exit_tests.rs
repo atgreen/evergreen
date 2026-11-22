@@ -167,21 +167,39 @@ fn local_exit_ir_retains_original_scope_identity_and_refuses_other_unwinds() {
         );
     }
     // Leaving a captured binding's child frame is a local record the exit
-    // helper pops itself (bliss-gg3i1.7.11).
+    // helper pops itself (bliss-gg3i1.7.11). The lowerer now emits the
+    // PopEnvChild itself before an exit that crosses only blocks, tagbodies,
+    // special bindings and environments (bliss-3k0xm, exit_unwind.rs), and
+    // that exit needs no helper. A CATCH between the environment and the
+    // block keeps the frames on the exit, so the helper must retire both.
     let captured = fixture_body(
         &env,
         "CAPTURED-LOCAL-EXIT",
-        "((block done (let ((captured marker)) (flet ((escape () captured)) (return-from done #'escape)))))",
+        "((block done (catch tag (let ((captured marker)) (flet ((escape () captured)) (return-from done #'escape))))))",
     );
     let _captured_root = ActiveBytecodeRoot::new(&captured);
+    let captured_scopes =
+        egcl_compiler::control_scope::ScopeMap::analyze_function(&captured).unwrap();
     let ir = build::build_from_bytecode_for_native_cleanups(&captured).unwrap();
     verify::verify(&ir).unwrap();
-    assert!(ir.block_order().iter().any(|&b| {
-        ir.block(b)
-            .insts
-            .iter()
-            .any(|&i| matches!(ir.inst(i).aux, AuxData::DirectExit { .. }))
-    }));
+    let exits: Vec<u32> = ir
+        .block_order()
+        .iter()
+        .flat_map(|&b| &ir.block(b).insts)
+        .filter_map(|&i| match ir.inst(i).aux {
+            AuxData::DirectExit { bcp } => Some(bcp),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exits.len(), 1, "{:?}", captured.code);
+    let exit = captured_scopes.exit_at(exits[0]).unwrap();
+    assert!(
+        exit.removed.iter().any(|s| matches!(
+            s.kind,
+            egcl_compiler::control_scope::ScopeKind::LexicalEnvironment
+        )),
+        "the direct exit must itself leave the captured binding's frame: {exit:?}"
+    );
 }
 
 #[test]
