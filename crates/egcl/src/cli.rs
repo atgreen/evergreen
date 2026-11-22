@@ -52374,10 +52374,10 @@ mod method_block_tests {
             r#"
           (labels ((local-reference-race () 42))
             (let* ((callback (lambda () #'local-reference-race))
-                   (one (egcl-thread:make-thread callback))
-                   (two (egcl-thread:make-thread callback)))
-              (let ((first (egcl-thread:join-thread one))
-                    (second (egcl-thread:join-thread two)))
+                   (one (egcl-thread::make-thread callback))
+                   (two (egcl-thread::make-thread callback)))
+              (let ((first (egcl-thread::join-thread one))
+                    (second (egcl-thread::join-thread two)))
                 (if (eq first second) 42 -1))))
         "#,
             &mut env,

@@ -73,6 +73,13 @@ fn constructor_check_forms_follow_relocated_inputs() {
         assert_eq!(binding[0], parts[3]);
     }
     egcl_rt::rooted!(env = Env::new(false));
+    // DEFMETHOD specializes only on a registered class (#873), so the typed
+    // writer needs a real class to install against.
+    read_eval_all_env(
+        "(defclass writer-root-class () ((writer-root-slot)))",
+        &mut env,
+    )
+    .unwrap();
     let class = resolve_sym("WRITER-ROOT-CLASS").unwrap();
     let slot = resolve_sym("WRITER-ROOT-SLOT").unwrap();
     let accessor = resolve_sym("WRITER-ROOT-ACCESSOR").unwrap();
