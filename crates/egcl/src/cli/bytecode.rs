@@ -171,7 +171,9 @@ pub(super) fn initialize_native_callable_entries() {
     let _ = native_callable::entries();
 }
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-pub(super) use native_callable::invoke as invoke_native_callable;
+pub(super) use native_callable::{
+    enabled as native_callable_enabled, invoke as invoke_native_callable,
+};
 #[cfg(all(target_arch = "x86_64", unix))]
 mod call_table_native;
 // Same name, same API, System Z machine code: the shared linkage plumbing in
@@ -288,6 +290,14 @@ pub(super) fn forced_tier() -> Option<ForcedTier> {
             _ => tier,
         })
     })
+}
+
+/// Whether this run may generate native code. A run pinned to T0 or the
+/// tree-walker never promotes, so it must not map executable memory either,
+/// not even for helper stubs and veneers (the no-executable-memory profile).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+pub(super) fn native_code_permitted() -> bool {
+    !matches!(forced_tier(), Some(ForcedTier::T0 | ForcedTier::Interp))
 }
 
 /// Whether the bytecode backend is enabled.
@@ -25558,9 +25568,12 @@ pub(super) fn install_direct_builtin_hooks() {
     // with or without leaf helpers.
     leaf_builtins::init_standard_types();
     leaf_builtins::install();
-    // Raw double-float code boxes escaping values through this veneer.
+    // Raw double-float code boxes escaping values through this veneer. Only
+    // native code calls it, so a run pinned below native tiers maps none.
     #[cfg(all(not(egcl_no_t2), target_arch = "x86_64", target_os = "linux"))]
-    native_transfer_entry::install_box_double_veneer();
+    if native_code_permitted() {
+        native_transfer_entry::install_box_double_veneer();
+    }
     #[cfg(not(egcl_no_t2))]
     egcl_compiler::t2::emit::install_call_slice_rooted(
         c2i_call_slice_rooted as extern "C" fn(u64, u64, *const EgclVal, u64) -> u64 as usize

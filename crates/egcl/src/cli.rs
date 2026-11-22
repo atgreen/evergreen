@@ -45350,21 +45350,14 @@ impl Drop for CallDepthGuard {
 }
 
 fn apply_function(fn_val: EgclVal, args: &[EgclVal], env: &mut Env) -> Result<EgclVal, EgclError> {
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-        bytecode::invoke_native_callable(fn_val, args, env)
+    #[cfg(any(
+        all(target_arch = "x86_64", any(target_os = "linux", windows)),
+        all(target_arch = "aarch64", unix)
+    ))]
+    if bytecode::native_callable_enabled() {
+        return bytecode::invoke_native_callable(fn_val, args, env);
     }
-    #[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
-    {
-        #[cfg(any(
-            all(target_arch = "x86_64", windows),
-            all(target_arch = "aarch64", unix)
-        ))]
-        if bytecode::native_callable_enabled() {
-            return bytecode::invoke_native_callable(fn_val, args, env);
-        }
-        apply_function_impl(fn_val, args, env)
-    }
+    apply_function_impl(fn_val, args, env)
 }
 
 // The published adapter has already selected this callable. Calling the public
