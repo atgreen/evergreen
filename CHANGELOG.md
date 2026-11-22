@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Type checks against a DEFTYPE name, such as a structure slot declared
+  `(or index null)`, no longer run the type's expander on every check: its
+  expansion is remembered until a DEFTYPE or a new class could change it.
+  Compiling SBCL's `sset` under EGCL is about 7% faster
+  ([#1029](https://github.com/atgreen/evergreen/pull/1029)).
+
 - Natively compiled code reads, writes and tests DEFSTRUCT instances inline
   instead of calling the accessor: a slot read takes about 6.5 ns instead of
   36 ns. Redefining an accessor with DEFUN still reaches callers compiled
