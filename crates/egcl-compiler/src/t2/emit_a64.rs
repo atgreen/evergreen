@@ -3687,7 +3687,8 @@ mod cycle_poll_tests {
         jump(&mut f, left, right);
         branch(&mut f, right, condition, left, exit);
         f.set_terminator(exit, data(Opcode::Return));
-        crate::t2::verify::verify(&f).unwrap();
+        // The verifier rejects irreducible control flow (V10), so this shape
+        // is checked only against the poll selection, which must still cover it.
         let polls = cycle_poll_terminators(&f).unwrap();
         assert!(!polls.is_empty());
         assert!(no_poll_free_cycle(&f, &polls));
