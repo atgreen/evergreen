@@ -77,7 +77,7 @@ pub mod time;
 pub use clos::{
     MethodCombinationType, MethodQualifier, allocate_instance, bind_class_name, bootstrap_clos,
     change_class, class_direct_subclasses, class_direct_superclasses, class_name, class_of,
-    class_slots, compute_applicable_methods, compute_class_precedence_list,
+    class_registry_size, class_slots, compute_applicable_methods, compute_class_precedence_list,
     compute_effective_method, define_class, effective_slots, ensure_clos_bootstrapped, find_class,
     funcallable_slot_index, generic_function_name, initialize_instance, instance_slot_at,
     is_instance, is_structure_class, make_generic_function, make_instance, make_struct,

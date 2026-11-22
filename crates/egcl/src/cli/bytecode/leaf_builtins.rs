@@ -526,6 +526,12 @@ extern "C" fn structure_typep<const C: bool>(object: u64, name: u64) -> u64 {
 
 // ── Constant standard type specifiers ──────────────────────────────
 
+#[path = "leaf_builtins/deftype_expansions.rs"]
+mod deftype_expansions;
+pub(in crate::cli) use deftype_expansions::record as record_deftype_expansions;
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+pub(super) use deftype_expansions::take_hits_for_test as take_deftype_expansion_hits;
+
 /// The standard type names [`quick_typep`] decides, by symbol index.
 struct StandardTypes {
     t: u32,
@@ -560,6 +566,7 @@ pub(in crate::cli) fn init_standard_types() {
     if std::env::var_os("EGCL_DISABLE_QUICK_TYPEP").is_some() {
         return;
     }
+    deftype_expansions::init();
     STANDARD_TYPES.get_or_init(|| {
         let i = egcl_rt::symbols::intern;
         StandardTypes {
@@ -660,8 +667,9 @@ fn integer_range(object: EgclVal, low: Option<i128>, high: Option<i128>) -> Opti
 /// `(TYPEP object spec)` for the standard type specifiers sset's structure
 /// slot checks and the SBCL compiler's own TYPEPs use most -- NULL, LIST,
 /// SYMBOL, BOOLEAN, fixnum ranges, MEMBER, and OR/AND/NOT of them -- decided
-/// from `object`'s representation without allocating, polling or resolving a
-/// DEFTYPE. `None` defers to the general TYPEP. Standard type names cannot be
+/// from `object`'s representation without allocating or polling, plus the
+/// DEFTYPE names whose expansions [`record_deftype_expansions`] remembered.
+/// `None` defers to the general TYPEP. Standard type names cannot be
 /// redefined (CLHS 11.1.2.1.2), so these answers never go stale; a same-named
 /// symbol of another package is a different index and is not decided here.
 /// The answers equal TYPEP's and %DECLARATION-TYPEP's, which differ only for
@@ -697,6 +705,28 @@ fn quick_typep_at(object: EgclVal, spec: EgclVal, ty: &StandardTypes, depth: u8)
                 return Some(true);
             }
             return plain_value(object).then_some(false);
+        }
+        let standard = [
+            ty.symbol,
+            ty.cons,
+            ty.list,
+            ty.atom,
+            ty.fixnum,
+            ty.character,
+            ty.integer,
+        ];
+        if !standard.contains(&name) {
+            // A structure class name, or a DEFTYPE whose expansion the
+            // evaluated TYPEP recorded. The general TYPEP expands such a name
+            // first for these objects, so it answers as its expansion does.
+            if let Some(answer) = egcl_stdlib::structure_typep_leaf(object, spec) {
+                return Some(answer);
+            }
+            let expansion = deftype_expansions::lookup(name)?;
+            if !(plain_value(object) || egcl_stdlib::structure_object_leaf(object)) {
+                return None;
+            }
+            return quick_typep_at(object, expansion, ty, depth + 1);
         }
         if !plain_value(object) {
             return None;
