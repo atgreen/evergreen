@@ -1776,6 +1776,7 @@ impl TransferCode {
         args: &[EgclVal],
         env: &mut Env,
     ) -> Result<EgclVal, EgclError> {
+        let _decline_census = super::decline_census::enter_native(self.installed_symbol);
         let function = if self.native_callable_slot.is_some() {
             let selected = funcall_fast::closure_carrier(function).ok_or_else(invalid_capture)?;
             if !self.accepts_explicit_callable(selected) {
