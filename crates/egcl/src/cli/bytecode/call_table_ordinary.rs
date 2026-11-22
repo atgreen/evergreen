@@ -838,7 +838,11 @@ pub(in crate::cli::bytecode) fn private_probe_target(
     code: Rc<TransferCode>,
     native: std::rc::Weak<super::super::NativeCode>,
 ) -> Option<(usize, usize, u64)> {
-    if code.native_callable_slot.is_none() || code.needs_recompile() {
+    // Code that reads its receiver needs the explicit-callable slot; code of
+    // an environment-free body never reads it, so any receiver may enter
+    // (bliss-gg3i1.7.27).
+    let receiver_free = code.receiver_free();
+    if (code.native_callable_slot.is_none() && !receiver_free) || code.needs_recompile() {
         return None;
     }
     let owner = native.upgrade()?;
@@ -850,7 +854,12 @@ pub(in crate::cli::bytecode) fn private_probe_target(
     let revision = code.private_entry_revision();
     let seen = revision.load(Ordering::Acquire);
     let descriptor = code.ordinary_descriptor(seen)?;
-    if descriptor.environment != linkage::ORDINARY_ENV_CLOSURE {
+    let expected = if receiver_free {
+        egcl_rt::call_table::ORDINARY_ENV_NONE
+    } else {
+        linkage::ORDINARY_ENV_CLOSURE
+    };
+    if descriptor.environment != expected {
         return None;
     }
     let address = revision.as_ptr() as usize;
