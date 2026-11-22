@@ -1593,6 +1593,10 @@ fn resolve(name: &str) -> Option<Handler> {
             if let Some(matches) = super::bytecode::quick_typep(*object, *spec) {
                 return Ok(if matches { T } else { NIL });
             }
+            super::bytecode::record_deftype_expansions(env, *spec);
+            if let Some(matches) = super::bytecode::quick_typep(*object, *spec) {
+                return Ok(if matches { T } else { NIL });
+            }
             Ok(
                 if declaration_typep_matches(env, *object, *spec, false, 0)? {
                     T
@@ -3810,7 +3814,14 @@ fn resolve(name: &str) -> Option<Handler> {
             if let Some(matches) = super::bytecode::quick_typep(args[0], args[1]) {
                 return Ok(if matches { T } else { NIL });
             }
-            typep_matches(env, args[0], args[1]).map(|matches| if matches { T } else { NIL })
+            // Recording runs DEFTYPE expanders, which allocate.
+            egcl_rt::rooted!(object = args[0]);
+            egcl_rt::rooted!(spec = args[1]);
+            super::bytecode::record_deftype_expansions(env, *spec);
+            if let Some(matches) = super::bytecode::quick_typep(*object, *spec) {
+                return Ok(if matches { T } else { NIL });
+            }
+            typep_matches(env, *object, *spec).map(|matches| if matches { T } else { NIL })
         }),
         "SUBTYPEP" => Some(|operator, args, env| {
             if !(2..=3).contains(&args.len()) {

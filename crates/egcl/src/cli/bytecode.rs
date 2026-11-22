@@ -139,7 +139,7 @@ mod declined_dispatch_tests;
 #[path = "bytecode/exit_unwind.rs"]
 mod exit_unwind;
 mod leaf_builtins;
-pub(in crate::cli) use leaf_builtins::quick_typep;
+pub(in crate::cli) use leaf_builtins::{quick_typep, record_deftype_expansions};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
 #[cfg(all(target_arch = "x86_64", windows))]

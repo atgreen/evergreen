@@ -4160,6 +4160,13 @@ pub fn structure_object_leaf(object: EgclVal) -> bool {
     current_struct_wrapper(object).is_some()
 }
 
+/// How many names the class registry holds. A cache keyed on what FIND-CLASS
+/// answered compares this to learn that a class was defined since. Does not
+/// allocate.
+pub fn class_registry_size() -> usize {
+    with_state(|st| st.class_registry.len() + st.class_by_name.len())
+}
+
 /// The current structure wrapper of `object` and its [`StructInfo`], or None
 /// when `object` is not an instance, its wrapper is obsolete or absent, or its
 /// class is not a (prefix-laid-out) structure class. Does not allocate.
