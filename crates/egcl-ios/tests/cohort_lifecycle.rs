@@ -71,7 +71,7 @@ fn stopping_waits_for_descendant_cleanup_and_keeps_child_exit_code() {
           do (sleep 0.01))
     (emit-host-marker "child-cleanup" "child")
     ;; Explicit child code is published even if root already returned default 0.
-    (egcl-ext:quit 23)))
+    (egcl-ext:quit :unix-status 23)))
 (defun host-tier-control (n) (+ n 1))
 (dotimes (i 80) (assert (= (host-tier-control i) (+ i 1))))
 (assert (= (egcl-ext:function-tier 'host-tier-control) 0))

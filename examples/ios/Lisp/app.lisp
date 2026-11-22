@@ -7,4 +7,4 @@
                      :if-does-not-exist :create)
   (format out "answer=~D~%" (+ 20 22)))
 ;; Ends this Lisp world; the Swift application keeps running and displays status.
-(egcl-ext:quit 0)
+(egcl-ext:quit)
