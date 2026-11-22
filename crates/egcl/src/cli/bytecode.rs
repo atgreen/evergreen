@@ -139,6 +139,7 @@ mod declined_dispatch_tests;
 #[path = "bytecode/exit_unwind.rs"]
 mod exit_unwind;
 mod leaf_builtins;
+pub(in crate::cli) use leaf_builtins::quick_typep;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 mod native_callable;
 #[cfg(all(target_arch = "x86_64", windows))]
@@ -25553,6 +25554,9 @@ fn struct_inline_layout(
 /// lives in this crate, which depends on egcl-compiler, so the compiler cannot
 /// reach it directly (bliss-x5y.27).
 pub(super) fn install_direct_builtin_hooks() {
+    // Constant TYPEP answers serve the evaluated handlers on every target,
+    // with or without leaf helpers.
+    leaf_builtins::init_standard_types();
     leaf_builtins::install();
     // Raw double-float code boxes escaping values through this veneer.
     #[cfg(all(not(egcl_no_t2), target_arch = "x86_64", target_os = "linux"))]
