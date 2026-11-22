@@ -529,7 +529,7 @@ extern "C" fn structure_typep<const C: bool>(object: u64, name: u64) -> u64 {
 #[path = "leaf_builtins/deftype_expansions.rs"]
 mod deftype_expansions;
 pub(in crate::cli) use deftype_expansions::record as record_deftype_expansions;
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(super) use deftype_expansions::take_hits_for_test as take_deftype_expansion_hits;
 
 /// The standard type names [`quick_typep`] decides, by symbol index.

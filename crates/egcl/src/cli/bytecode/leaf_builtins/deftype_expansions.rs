@@ -139,7 +139,7 @@ thread_local! {
 
 /// How many checks a recorded expansion decided on this thread since the
 /// last call.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 pub(in crate::cli::bytecode) fn take_hits_for_test() -> usize {
     HITS.with(|hits| hits.replace(0))
 }
