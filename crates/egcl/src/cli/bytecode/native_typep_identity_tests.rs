@@ -127,6 +127,7 @@ fn native_typep_calls_public_fallback_for_foreign_type_symbols() {
             let value = values[index][alternative];
             let expected = if alternative == 0 { T } else { NIL };
             take_native_outcalls();
+            super::leaf_builtins::take_deftype_expansion_hits();
             assert_eq!(
                 code.run(&[value], &mut env).unwrap(),
                 expected,
@@ -137,9 +138,14 @@ fn native_typep_calls_public_fallback_for_foreign_type_symbols() {
                 0,
                 "foreign checker must not deopt to the interpreter"
             );
+            // The public TYPEP resolves the alias; once it has recorded the
+            // alias's expansion, the leaf helper in front of that call
+            // answers from it instead. Either way the foreign name never
+            // takes CL:FIXNUM's inline test.
             assert!(
-                take_native_outcalls() > 0,
-                "foreign TYPEP must execute a generated-code public-call boundary: {type_name}"
+                take_native_outcalls() + super::leaf_builtins::take_deftype_expansion_hits() > 0,
+                "foreign TYPEP must reach the public TYPEP or its recorded DEFTYPE expansion: \
+                 {type_name}"
             );
         }
     }
@@ -152,6 +158,7 @@ fn native_typep_calls_public_fallback_for_foreign_type_symbols() {
         let value = if alternative == 0 { small } else { *big };
         let expected = if alternative == 0 { T } else { NIL };
         take_native_outcalls();
+        super::leaf_builtins::take_deftype_expansion_hits();
         assert_eq!(canonical.run(&[value], &mut env).unwrap(), expected);
         assert_eq!(
             canonical.deopt_count(),
@@ -163,5 +170,6 @@ fn native_typep_calls_public_fallback_for_foreign_type_symbols() {
             0,
             "canonical FIXNUM must retain its inline native type test"
         );
+        assert_eq!(super::leaf_builtins::take_deftype_expansion_hits(), 0);
     }
 }

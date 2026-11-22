@@ -124,7 +124,24 @@ impl Expansions {
 /// The remembered expansion of the DEFTYPE named by symbol `name`. Does not
 /// allocate, so a leaf may ask.
 pub(super) fn lookup(name: u32) -> Option<EgclVal> {
-    entry(name).filter(|&expansion| expansion != UNBOUND)
+    let expansion = entry(name).filter(|&expansion| expansion != UNBOUND);
+    #[cfg(test)]
+    if expansion.is_some() {
+        HITS.with(|hits| hits.set(hits.get() + 1));
+    }
+    expansion
+}
+
+#[cfg(test)]
+thread_local! {
+    static HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many checks a recorded expansion decided on this thread since the
+/// last call.
+#[cfg(test)]
+pub(in crate::cli::bytecode) fn take_hits_for_test() -> usize {
+    HITS.with(|hits| hits.replace(0))
 }
 
 fn entry(name: u32) -> Option<EgclVal> {
